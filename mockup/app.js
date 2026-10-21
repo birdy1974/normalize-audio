@@ -1,21 +1,37 @@
-/* Audio Normalizer — UI mock-up
- * Front-end prototype only: no backend, no file access. Library, run progress and
- * Home Assistant values are simulated in the browser so the final UX can be reviewed. */
+/* Audio Normalizer — UI mock-up (v2: audio / video split)
+ * Front-end prototype only: no backend, no file access. Every value is simulated.
+ *
+ * Audio and video are first-class media types. Each has its own library root,
+ * folder selection, schedule, settings, counters, parked queue and Home Assistant sensors.
+ * The run engine is shared; the "Process" switches on the dashboard choose the types. */
 (function () {
   'use strict';
 
-  /* ------------------------------------------------------------------ utilities */
+  /* ------------------------------------------------------------ utilities */
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmt = (n) => Number(n).toLocaleString('en-US');
   const pad2 = (n) => String(n).padStart(2, '0');
+  const round1 = (n) => Math.round(n * 10) / 10;
   const fmtDb = (n) => (n >= 0 ? '+' : '−') + Math.abs(n).toFixed(1) + ' dB';
+  const clone = (o) => JSON.parse(JSON.stringify(o));
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  const ROOT = '/data/library';
-  const AUDIO_EXT = ['mp3', 'mp3', 'mp3', 'flac', 'm4a', 'wav', 'ogg', 'aac', 'wma'];
-  const VIDEO_EXT = ['avi', 'mkv', 'mp4'];
-  const LOSSLESS = ['flac', 'wav'];
-  const TITLES = ['Intro', 'Morning Light', 'Cold Front', 'Blue Hour', 'Night Train', 'Echoes', 'Riverside', 'Long Way Home', 'Static', 'Finale'];
+  const ALL = ['audio', 'video'];
+
+  const MEDIA = {
+    audio: {
+      label: 'Audio', root: '/data/audio', host: '/volume1/music',
+      exts: ['mp3', 'mp3', 'mp3', 'flac', 'm4a', 'wav', 'ogg', 'aac', 'wma'],
+      lossless: ['flac', 'wav'],
+    },
+    video: {
+      label: 'Video', root: '/data/video', host: '/volume1/video',
+      exts: ['avi', 'mkv', 'mp4'],
+      lossless: [],
+    },
+  };
+
   const STATUS_LABEL = { pending: 'to do', ok: 'at target', changed: 'changed', parked: 'parked', skipped: 'skipped', error: 'error' };
+  const TITLES = ['Intro', 'Morning Light', 'Cold Front', 'Blue Hour', 'Night Train', 'Echoes', 'Riverside', 'Long Way Home', 'Static', 'Finale'];
 
   function rng(seed) {
     let s = seed >>> 0;
@@ -32,75 +48,101 @@
     toast.timer = setTimeout(() => t.classList.remove('show'), 2800);
   }
 
-  /* ------------------------------------------------------------ mock library */
-  const TREE_SPEC = [
-    { name: 'Music', open: true, children: [
-      { name: 'Rock', files: 42 },
-      { name: 'Jazz', files: 6, children: [{ name: 'Live 1998', files: 12 }, { name: 'Blue Note', files: 9 }] },
-      { name: 'Classical', files: 25 },
-      { name: 'Compilations', files: 7 } ] },
-    { name: 'Podcasts', open: true, children: [
-      { name: 'Tech Weekly', files: 130 }, { name: 'History Hour', files: 88 }, { name: 'Interviews', files: 16 } ] },
-    { name: 'Audiobooks', children: [{ name: 'Fantasy', files: 35 }, { name: 'Non-fiction', files: 21 }] },
-    { name: 'Home videos', files: 4, video: true, children: [
-      { name: '2019', files: 22 }, { name: '2020', files: 19 }, { name: '2021', files: 11 } ] },
-    { name: 'Old archive (do not touch)', enabled: false, files: 60, children: [{ name: 'Recordings', files: 40 }] },
-  ];
+  /* ---------------------------------------------------------- mock library */
+  const SPEC = {
+    audio: [
+      { name: 'Music', open: true, children: [
+        { name: 'Rock', files: 42 },
+        { name: 'Jazz', files: 6, children: [{ name: 'Live 1998', files: 12 }, { name: 'Blue Note', files: 9 }] },
+        { name: 'Classical', files: 25 },
+        { name: 'Compilations', files: 7 } ] },
+      { name: 'Podcasts', open: true, children: [
+        { name: 'Tech Weekly', files: 130 }, { name: 'History Hour', files: 88 }, { name: 'Interviews', files: 16 } ] },
+      { name: 'Audiobooks', children: [{ name: 'Fantasy', files: 35 }, { name: 'Non-fiction', files: 21 }] },
+      { name: 'Old archive (do not touch)', enabled: false, files: 60, children: [{ name: 'Recordings', files: 40 }] },
+    ],
+    video: [
+      { name: 'Home videos', open: true, children: [
+        { name: '2019', files: 22 }, { name: '2020', files: 19 }, { name: '2021', files: 11 } ] },
+      { name: 'Phone clips', files: 9 },
+      { name: 'Old tapes', enabled: false, files: 30 },
+    ],
+  };
 
   function makeFile(node, k) {
-    const ext = pick(node.isVideo ? VIDEO_EXT : AUDIO_EXT);
-    const lufs = Math.round((-26 + rand() * 17) * 10) / 10;   // measured integrated loudness
+    const ext = pick(MEDIA[node.type].exts);
+    const lufs = Math.round((-26 + rand() * 17) * 10) / 10;   // measured integrated loudness of the audio
     const r = rand();
     const status = r < 0.5 ? 'pending' : r < 0.72 ? 'ok' : r < 0.87 ? 'changed' : r < 0.95 ? 'parked' : r < 0.96 ? 'error' : 'skipped';
     const title = TITLES[k % TITLES.length] + ' ' + (Math.floor(k / TITLES.length) + 1);
     return { id: node.id + '#' + k, name: pad2(k + 1) + ' ' + title + '.' + ext, ext, lufs, status };
   }
 
-  function buildNodes(specs, parentId, parentVideo) {
+  function buildNodes(type, specs, parentRel) {
     return specs.map((spec) => {
-      const id = parentId ? parentId + '/' + spec.name : spec.name;
+      const rel = parentRel ? parentRel + '/' + spec.name : spec.name;
       const node = {
-        id, name: spec.name, enabled: spec.enabled !== false, open: !!spec.open,
-        isVideo: !!spec.video || parentVideo, children: [], files: [],
+        type, id: type + ':' + rel, rel, name: spec.name,
+        enabled: spec.enabled !== false, open: !!spec.open, children: [], files: [],
       };
-      node.children = buildNodes(spec.children || [], id, node.isVideo);
+      node.children = buildNodes(type, spec.children || [], rel);
       for (let k = 0; k < (spec.files || 0); k++) node.files.push(makeFile(node, k));
       return node;
     });
   }
 
-  const SENSOR_DEFS = [
-    { key: 'status', name: 'Normalizer status', unit: '', deviceClass: '', icon: 'mdi:waveform', enabled: true },
-    { key: 'progress_percent', name: 'Progress', unit: '%', deviceClass: '', icon: 'mdi:progress-check', enabled: true },
-    { key: 'directories_enabled', name: 'Directories enabled', unit: 'dirs', deviceClass: '', icon: 'mdi:folder-multiple', enabled: true },
-    { key: 'files_total', name: 'Files in scope', unit: 'files', deviceClass: '', icon: 'mdi:file-music', enabled: true },
-    { key: 'files_pending', name: 'Files to do', unit: 'files', deviceClass: '', icon: 'mdi:file-clock', enabled: true },
-    { key: 'files_checked', name: 'Files checked', unit: 'files', deviceClass: '', icon: 'mdi:file-check', enabled: true },
-    { key: 'files_changed', name: 'Files changed', unit: 'files', deviceClass: '', icon: 'mdi:volume-plus', enabled: true },
-    { key: 'files_parked', name: 'Files parked (review)', unit: 'files', deviceClass: '', icon: 'mdi:file-alert', enabled: true },
-    { key: 'errors', name: 'Errors', unit: 'errors', deviceClass: '', icon: 'mdi:alert-circle', enabled: true },
-    { key: 'current_file', name: 'Current file', unit: '', deviceClass: '', icon: 'mdi:file-music-outline', enabled: false },
-    { key: 'last_run_finished', name: 'Last run finished', unit: '', deviceClass: 'timestamp', icon: 'mdi:history', enabled: false },
-    { key: 'next_schedule_change', name: 'Next schedule change', unit: '', deviceClass: 'timestamp', icon: 'mdi:calendar-clock', enabled: false },
-    { key: 'target_lufs', name: 'Target loudness', unit: 'LUFS', deviceClass: '', icon: 'mdi:tune-vertical', enabled: false },
-  ];
-
-  const DEFAULT_SETTINGS = {
-    target: -16, truePeak: -1, threshold: 6, override: false,
-    lossy: 'gain', videos: true, writeMode: 'inplace', outputDir: '/data/normalized', dryRun: false,
+  /* -------------------------------------------------------------- defaults */
+  const DEFAULTS = {
+    general: { dryRun: false },
+    audio: { target: -16, truePeak: -1, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
+    video: { target: -16, truePeak: -1, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
   };
 
-  function defaultSchedule() {
-    // nights 22:00–06:00 every day, plus weekends all day
-    return DAYS.map((_, d) => Array.from({ length: 24 }, (_, h) => (h >= 22 || h < 6) || d >= 5));
-  }
+  const PRESETS = {
+    nights: (d, h) => h >= 22 || h < 6,
+    weeknights: (d, h) => d < 5 && (h >= 22 || h < 6),
+    weekends: (d) => d >= 5,
+    always: () => true,
+    never: () => false,
+  };
+  const scheduleFrom = (fn) => DAYS.map((_, d) => Array.from({ length: 24 }, (_, h) => !!fn(d, h)));
 
+  const SENSOR_DEFS = [
+    { path: 'status', name: 'Status', unit: '', deviceClass: '', icon: 'mdi:waveform', enabled: true, group: 'Overall' },
+    { path: 'progress_percent', name: 'Progress', unit: '%', deviceClass: '', icon: 'mdi:progress-check', enabled: true, group: 'Overall' },
+    { path: 'errors', name: 'Errors', unit: 'errors', deviceClass: '', icon: 'mdi:alert-circle', enabled: true, group: 'Overall' },
+    { path: 'current_file', name: 'Current file', unit: '', deviceClass: '', icon: 'mdi:file-music-outline', enabled: false, group: 'Overall' },
+    { path: 'last_run_finished', name: 'Last run finished', unit: '', deviceClass: 'timestamp', icon: 'mdi:history', enabled: false, group: 'Overall' },
+  ];
+  ALL.forEach((t) => {
+    const L = MEDIA[t].label;
+    SENSOR_DEFS.push(
+      { path: t + '.directories_enabled', name: L + ' folders enabled', unit: 'folders', deviceClass: '', icon: 'mdi:folder-multiple', enabled: true, group: L },
+      { path: t + '.files_total', name: L + ' files in scope', unit: 'files', deviceClass: '', icon: 'mdi:file-multiple', enabled: true, group: L },
+      { path: t + '.files_pending', name: L + ' files to do', unit: 'files', deviceClass: '', icon: 'mdi:file-clock', enabled: true, group: L },
+      { path: t + '.files_checked', name: L + ' files checked', unit: 'files', deviceClass: '', icon: 'mdi:file-check', enabled: true, group: L },
+      { path: t + '.files_changed', name: L + ' files changed', unit: 'files', deviceClass: '', icon: 'mdi:volume-plus', enabled: true, group: L },
+      { path: t + '.files_parked', name: L + ' files parked', unit: 'files', deviceClass: '', icon: 'mdi:file-alert', enabled: true, group: L },
+      { path: t + '.target_lufs', name: L + ' target loudness', unit: 'LUFS', deviceClass: '', icon: 'mdi:tune-vertical', enabled: false, group: L },
+      { path: t + '.next_schedule_change', name: L + ' next schedule change', unit: '', deviceClass: 'timestamp', icon: 'mdi:calendar-clock', enabled: false, group: L },
+    );
+  });
+
+  /* ----------------------------------------------------------------- state */
   const state = {
-    tree: buildNodes(TREE_SPEC, '', false),
-    selectedDir: 'Music',
-    run: { status: 'stopped', current: null, lastRun: new Date(Date.now() - 19 * 3600e3) },
-    settings: Object.assign({}, DEFAULT_SETTINGS),
-    schedule: defaultSchedule(),
+    trees: { audio: buildNodes('audio', SPEC.audio, ''), video: buildNodes('video', SPEC.video, '') },
+    media: 'audio',                                   // media tab shown on media-specific pages
+    selected: { audio: 'audio:Music', video: 'video:Home videos' },
+    run: {
+      status: 'stopped', current: null,
+      lastRun: new Date(Date.now() - 19 * 3600e3),
+      types: { audio: true, video: true },            // "Process" switches on the dashboard
+    },
+    settings: clone(DEFAULTS),
+    schedule: {
+      audio: scheduleFrom((d, h) => (h >= 22 || h < 6) || d >= 5),   // nights + weekends
+      video: scheduleFrom((d) => d >= 5),                              // weekends only (heavier work)
+    },
     scanEvery: 15,
     onClose: 'finish',
     ha: {
@@ -110,100 +152,104 @@
     log: [],
   };
 
-  function log(level, msg) {
-    state.log.unshift({ t: new Date(), level, msg });
+  function log(level, type, msg) {
+    state.log.unshift({ t: new Date(), level, type, msg });
     state.log = state.log.slice(0, 80);
   }
-  log('info', 'Mock-up loaded — simulated library with ' + fmt(allEntries().length) + ' files');
-  log('info', 'Scan: 2 new files found in Podcasts/Tech Weekly — queued for analysis');
+  log('info', null, 'Mock-up loaded with ' + fmt(entriesOf(ALL).length) + ' files across both libraries');
+  log('info', 'audio', 'Scan: 2 new files in /data/audio/Podcasts/Tech Weekly, queued');
+  log('info', 'video', 'Scan: 1 new file in /data/video/Home videos/2021, queued');
 
-  /* ------------------------------------------------------------- tree helpers */
+  /* ------------------------------------------------------------ tree helpers */
   function walk(nodes, fn) { nodes.forEach((n) => { fn(n); walk(n.children, fn); }); }
-  function allNodes() { const out = []; walk(state.tree, (n) => out.push(n)); return out; }
+  function nodesOf(types) { const out = []; types.forEach((t) => walk(state.trees[t], (n) => out.push(n))); return out; }
   function subtreeNodes(node) { const out = [node]; walk(node.children, (n) => out.push(n)); return out; }
-  function findNode(id) { return allNodes().find((n) => n.id === id); }
+  function findNode(id) { return nodesOf(ALL).find((n) => n.id === id); }
   function subtreeState(node) {
     const flags = subtreeNodes(node).map((n) => n.enabled);
     return flags.every(Boolean) ? 'on' : flags.some(Boolean) ? 'mixed' : 'off';
   }
-  function allEntries() {
+  function entriesOf(types) {
     const out = [];
-    allNodes().forEach((node) => node.files.forEach((file) => out.push({ node, file })));
+    nodesOf(types).forEach((node) => node.files.forEach((file) => out.push({ node, file })));
     return out;
   }
-  function scopeEntries() {
-    const out = [];
-    allNodes().forEach((node) => { if (node.enabled) node.files.forEach((file) => out.push({ node, file })); });
-    return out;
-  }
+  const pathOf = (node, file) => MEDIA[node.type].root + '/' + node.rel + '/' + file.name;
 
   /* -------------------------------------------------------------- statistics */
-  function stats() {
-    const scope = scopeEntries();
-    const count = (st) => scope.filter((e) => e.file.status === st).length;
+  function stats(t) {
+    const all = entriesOf([t]);
+    const scope = all.filter((e) => e.node.enabled);
+    const c = (st) => scope.filter((e) => e.file.status === st).length;
     const total = scope.length;
-    const pending = count('pending');
+    const pending = c('pending');
     const checked = total - pending;
-    const nodes = allNodes();
+    const nodes = nodesOf([t]);
     return {
       dirsTotal: nodes.length,
       dirsEnabled: nodes.filter((n) => n.enabled).length,
-      filesAll: allEntries().length,
+      filesAll: all.length,
       filesTotal: total,
       pending,
       checked,
-      ok: count('ok'),
-      changed: count('changed'),
-      skipped: count('skipped'),
-      errors: count('error'),
-      parked: allEntries().filter((e) => e.file.status === 'parked').length,
-      percent: total ? Math.round((checked / total) * 1000) / 10 : 0,
+      ok: c('ok'),
+      changed: c('changed'),
+      skipped: c('skipped'),
+      errors: c('error'),
+      parked: all.filter((e) => e.file.status === 'parked').length,
+      percent: total ? round1((checked / total) * 100) : 0,
     };
   }
 
-  /* ---------------------------------------------------- normalization model */
-  const gainFor = (file) => state.settings.target - file.lufs;
-  const isLossy = (file, node) => !(node.isVideo || LOSSLESS.includes(file.ext));
+  function runStats() {
+    const types = ALL.filter((t) => state.run.types[t]);
+    const s = types.map(stats);
+    const total = s.reduce((a, x) => a + x.filesTotal, 0);
+    const checked = s.reduce((a, x) => a + x.checked, 0);
+    return { total, checked, percent: total ? round1((checked / total) * 100) : 0 };
+  }
 
-  function methodFor(file, node) {
-    if (node.isVideo) return 'audio re-encode · video copied';
-    if (LOSSLESS.includes(file.ext)) return 'lossless gain';
-    if (state.settings.lossy === 'gain') return 'gain only (no re-encode)';
-    if (state.settings.lossy === 'reencode') return 're-encode, same bitrate';
-    return 'skipped (lossy format)';
+  /* ------------------------------------------------------ normalization model */
+  const gainFor = (t, file) => state.settings[t].target - file.lufs;
+  const isLossy = (t, file) => t === 'audio' && !MEDIA.audio.lossless.includes(file.ext);
+
+  function methodFor(t, file) {
+    if (t === 'video') return 'audio re-encode · video copied';
+    if (MEDIA.audio.lossless.includes(file.ext)) return 'lossless gain';
+    const m = state.settings.audio.lossy;
+    return m === 'gain' ? 'gain only (no re-encode)' : m === 'reencode' ? 're-encode, same bitrate' : 'skipped (lossy format)';
   }
 
   /* ------------------------------------------------------------- schedule */
-  const isAllowed = (d) => state.schedule[(d.getDay() + 6) % 7][d.getHours()];
+  const isAllowed = (t, d) => state.schedule[t][(d.getDay() + 6) % 7][d.getHours()];
 
-  function nextChange(from) {
+  function nextChange(t, from) {
     const base = new Date(from);
     base.setMinutes(0, 0, 0);
-    const inside = isAllowed(from);
+    const inside = isAllowed(t, from);
     for (let i = 1; i <= 24 * 8; i++) {
-      const t = new Date(base.getTime() + i * 3600e3);
-      if (isAllowed(t) !== inside) return t;
+      const x = new Date(base.getTime() + i * 3600e3);
+      if (isAllowed(t, x) !== inside) return x;
     }
     return null;
   }
 
-  const whenLabel = (t) => (t ? DAYS[(t.getDay() + 6) % 7] + ' ' + pad2(t.getHours()) + ':00' : '—');
+  const whenLabel = (x) => (x ? DAYS[(x.getDay() + 6) % 7] + ' ' + pad2(x.getHours()) + ':00' : '—');
 
-  function scheduleInfo() {
+  function scheduleInfo(t) {
+    const sc = state.schedule[t];
     const now = new Date();
-    const inside = isAllowed(now);
-    const anyOn = state.schedule.some((d) => d.some(Boolean));
-    const allOn = state.schedule.every((d) => d.every(Boolean));
-    if (allOn) return { inside: true, text: 'Schedule: always active' };
-    if (!anyOn) return { inside: false, text: 'Schedule: no active hours (manual runs only)' };
-    const t = nextChange(now);
+    const inside = isAllowed(t, now);
+    if (sc.every((d) => d.every(Boolean))) return { inside: true, text: 'Always on' };
+    if (!sc.some((d) => d.some(Boolean))) return { inside: false, text: 'No active hours (manual runs only)' };
+    const next = nextChange(t, now);
     return inside
-      ? { inside, text: 'Inside schedule window · closes ' + whenLabel(t) }
-      : { inside, text: 'Outside schedule window · opens ' + whenLabel(t) };
+      ? { inside, text: 'Window open until ' + whenLabel(next) }
+      : { inside, text: 'Window opens ' + whenLabel(next) };
   }
 
-  function dayRanges(di) {
-    const row = state.schedule[di];
+  function dayRanges(t, di) {
+    const row = state.schedule[t][di];
     const out = [];
     let start = null;
     for (let h = 0; h <= 24; h++) {
@@ -214,65 +260,60 @@
     return out.length ? out.join(', ') : 'off';
   }
 
-  const PRESETS = {
-    nights: (d, h) => h >= 22 || h < 6,
-    weekends: (d) => d >= 5,
-    weeknights: (d, h) => d < 5 && (h >= 22 || h < 6),
-    always: () => true,
-    never: () => false,
-  };
-
-  /* ------------------------------------------------------- run simulation */
+  /* ---------------------------------------------------------- run engine */
   function finishRun() {
     state.run.status = 'stopped';
     state.run.current = null;
     state.run.lastRun = new Date();
-    log('ok', 'Run finished — all files in scope have been checked');
+    log('ok', null, 'Run finished: all files in the selected types have been checked');
     toast('Run finished: all files in scope checked');
+  }
+
+  function processFile(node, file) {
+    const t = node.type;
+    const cfg = state.settings[t];
+    const path = pathOf(node, file);
+    const gain = gainFor(t, file);
+    const abs = Math.abs(gain);
+    state.run.current = path;
+
+    if (t === 'audio' && cfg.lossy === 'skip-lossy' && isLossy(t, file)) {
+      file.status = 'skipped';
+    } else if (rand() < 0.012) {
+      file.status = 'error';
+      log('err', t, 'Could not decode ' + path + ', skipped');
+    } else if (abs < 0.5) {
+      file.status = 'ok';
+    } else if (abs > cfg.threshold && !cfg.override) {
+      file.status = 'parked';
+      log('warn', t, 'Parked ' + file.name + ': change ' + fmtDb(gain) + ' is over the threshold');
+    } else {
+      file.status = 'changed';
+      log('ok', t, (state.settings.general.dryRun ? 'Would normalize ' : 'Normalized ') + file.name + ' (' + fmtDb(gain) + ')');
+    }
   }
 
   function tick() {
     if (state.run.status !== 'running') return;
-    const todo = scopeEntries().filter((e) => e.file.status === 'pending');
+    const types = ALL.filter((t) => state.run.types[t]);
+    const todo = entriesOf(types).filter((e) => e.node.enabled && e.file.status === 'pending');
     if (!todo.length) { finishRun(); refreshLive(); return; }
-    todo.slice(0, 2).forEach(({ node, file }) => {
-      const rel = node.id + '/' + file.name;
-      const gain = gainFor(file);
-      const abs = Math.abs(gain);
-      state.run.current = rel;
-      if (state.settings.lossy === 'skip-lossy' && isLossy(file, node)) {
-        file.status = 'skipped';
-      } else if (rand() < 0.015) {
-        file.status = 'error';
-        log('err', 'Could not decode ' + rel + ' — skipped, see log');
-      } else if (abs < 0.5) {
-        file.status = 'ok';
-      } else if (abs > state.settings.threshold && !state.settings.override) {
-        file.status = 'parked';
-        log('warn', 'Parked ' + rel + ' — change ' + fmtDb(gain) + ' exceeds threshold, review later');
-      } else {
-        file.status = 'changed';
-        log('ok', (state.settings.dryRun ? 'Would normalize ' : 'Normalized ') + rel + ' (' + fmtDb(gain) + ')');
-      }
-    });
+    todo.slice(0, 2).forEach(({ node, file }) => processFile(node, file));
     refreshLive();
   }
 
-  // pages that refresh while a run is active (the directory page is refreshed on navigation only)
-const LIVE_ROUTES = ['dashboard', 'parked'];
+  const LIVE_ROUTES = ['dashboard', 'parked'];
   function refreshLive() {
     if (LIVE_ROUTES.includes(currentRoute())) render();
     else updateNavBadge();
   }
 
-  /* -------------------------------------------------------------- Home Assistant */
-  function apiPayload() {
-    const s = stats();
-    const sched = scheduleInfo();
-    const next = nextChange(new Date());
+  /* -------------------------------------------------------- Home Assistant */
+  function typePayload(t) {
+    const s = stats(t);
+    const next = nextChange(t, new Date());
     return {
-      status: state.run.status,
-      progress_percent: s.percent,
+      in_schedule_window: scheduleInfo(t).inside,
       directories_total: s.dirsTotal,
       directories_enabled: s.dirsEnabled,
       files_total: s.filesTotal,
@@ -280,32 +321,42 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
       files_checked: s.checked,
       files_changed: s.changed,
       files_parked: s.parked,
-      errors: s.errors,
+      target_lufs: state.settings[t].target,
+      next_schedule_change: next ? next.toISOString() : null,
+    };
+  }
+
+  function apiPayload() {
+    const rs = runStats();
+    return {
+      status: state.run.status,
+      progress_percent: rs.percent,
+      errors: stats('audio').errors + stats('video').errors,
       current_file: state.run.current,
       last_run_finished: state.run.lastRun ? state.run.lastRun.toISOString() : null,
-      next_schedule_change: next ? next.toISOString() : null,
-      target_lufs: state.settings.target,
-      in_schedule_window: sched.inside,
+      audio: typePayload('audio'),
+      video: typePayload('video'),
     };
   }
 
   function haYaml() {
-    const enabled = state.ha.sensors.filter((x) => x.enabled);
+    const en = state.ha.sensors.filter((x) => x.enabled);
     let y = 'rest:\n'
       + '  - resource: "http://<NAS-IP>:8080/api/v1/ha/status"\n'
       + '    headers:\n'
       + '      Authorization: "Bearer <YOUR_TOKEN>"\n'
       + '    scan_interval: 60\n'
       + '    sensor:\n';
-    enabled.forEach((x) => {
-      y += '      - name: "Audio normalizer ' + x.name.replace(/^Audio normalizer /i, '') + '"\n'
-        + '        unique_id: audio_normalizer_' + x.key + '\n'
-        + '        value_template: "{{ value_json.' + x.key + ' }}"\n';
+    en.forEach((x) => {
+      const uid = 'audio_normalizer_' + x.path.replace(/\./g, '_');
+      y += '      - name: "' + x.name.replace(/"/g, '') + '"\n'
+        + '        unique_id: ' + uid + '\n'
+        + '        value_template: "{{ value_json.' + x.path + ' }}"\n';
       if (x.unit) y += '        unit_of_measurement: "' + x.unit + '"\n';
       if (x.deviceClass) y += '        device_class: ' + x.deviceClass + '\n';
       if (x.icon) y += '        icon: ' + x.icon + '\n';
     });
-    if (!enabled.length) y += '      []\n';
+    if (!en.length) y += '      []\n';
     return y;
   }
 
@@ -316,92 +367,120 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
     if (y) y.textContent = haYaml();
   }
 
-  /* ------------------------------------------------------------------ pages */
+  /* ----------------------------------------------------------- components */
   const app = () => document.getElementById('app');
 
-  function kpi(label, value, sub) {
-    return '<div class="card kpi"><div class="label">' + label + '</div>'
-      + '<div class="value">' + value + '</div><div class="sub">' + sub + '</div></div>';
+  function segControl() {
+    return '<div class="seg" role="tablist" aria-label="Media type">'
+      + ALL.map((t) => '<button type="button" role="tab" aria-selected="' + (state.media === t) + '"'
+        + ' class="' + (state.media === t ? 'on' : '') + '" data-action="media" data-media="' + t + '">'
+        + MEDIA[t].label + '</button>').join('')
+      + '</div>';
   }
 
-  function statusBadge(st) {
-    return '<span class="st st-' + st + '">' + STATUS_LABEL[st] + '</span>';
+  function pageHead(title, desc, actions, withSeg) {
+    return '<header class="page-head"><div><h1>' + title + '</h1>'
+      + (desc ? '<p class="desc">' + desc + '</p>' : '') + '</div>'
+      + '<div class="head-actions">' + (withSeg ? segControl() : '') + (actions || '') + '</div></header>';
   }
 
-  function writeModeLabel() {
-    const m = state.settings.writeMode;
-    if (m === 'backup') return 'replace in place, <strong>backup kept</strong>';
-    if (m === 'output') return 'separate output folder <code>' + esc(state.settings.outputDir) + '</code>';
-    return 'replace in place (no backup)';
+  function statusLabel(st) { return '<span class="st st-' + st + '">' + STATUS_LABEL[st] + '</span>'; }
+
+  function stat(label, value, sub) {
+    return '<div class="stat"><div class="stat-label">' + label + '</div>'
+      + '<div class="stat-value">' + value + '</div><div class="stat-sub">' + sub + '</div></div>';
   }
 
-  function renderDashboard() {
-    const s = stats();
-    const r = state.run;
-    const sched = scheduleInfo();
-    const label = { running: 'Running', paused: 'Paused', stopped: 'Stopped' }[r.status];
-    const finished = r.status === 'stopped' && s.filesTotal > 0 && s.pending === 0;
-    const outside = r.status === 'running' && !sched.inside && state.schedule.some((d) => d.some(Boolean));
-    const logs = state.log.slice(0, 12).map((e) =>
-      '<li><time>' + pad2(e.t.getHours()) + ':' + pad2(e.t.getMinutes()) + ':' + pad2(e.t.getSeconds()) + '</time>'
-      + '<span class="lv-' + (e.level === 'info' ? 'ok' : e.level) + '">' + esc(e.msg) + '</span></li>').join('');
-
-    app().innerHTML = ''
-      + '<header class="page-head"><div><h1>Dashboard</h1>'
-      + '<p class="muted">Normalization of <code>' + ROOT + '</code> — every enabled folder, sub-folders included.</p></div>'
-      + '<div class="btns">'
-      + '<button class="btn btn-primary" data-action="start"' + (r.status !== 'stopped' ? ' disabled' : '') + '>▶ Start</button>'
-      + '<button class="btn" data-action="pause"' + (r.status === 'stopped' ? ' disabled' : '') + '>'
-      + (r.status === 'paused' ? '⏵ Resume' : '⏸ Pause') + '</button>'
-      + '<button class="btn btn-danger" data-action="stop"' + (r.status === 'stopped' ? ' disabled' : '') + '>■ Stop</button>'
-      + '<a class="btn" href="#/directories">📁 Browse folders</a>'
-      + '</div></header>'
-
-      + '<section class="card">'
-      + '<div class="page-head" style="margin:0"><div>'
-      + '<span class="badge b-' + r.status + '">' + label + '</span>'
-      + (finished ? ' <span class="muted">· all files in scope checked</span>' : '')
-      + '</div><div class="muted">' + esc(sched.text) + '</div></div>'
-      + '<div class="progress" role="progressbar" aria-valuenow="' + s.percent + '" aria-valuemin="0" aria-valuemax="100">'
-      + '<div style="width:' + s.percent + '%"></div></div>'
-      + '<div class="muted"><strong style="color:var(--ink)">' + s.percent + '% complete</strong> · '
-      + fmt(s.checked) + ' of ' + fmt(s.filesTotal) + ' files checked · current file: <code>'
-      + (r.current ? esc(r.current) : '—') + '</code></div>'
-      + (outside ? '<div class="warn-box">Running outside the schedule window — started manually. It stops when you press Stop.</div>' : '')
-      + '</section>'
-
-      + '<section class="kpis">'
-      + kpi('1 · Directories / files in scope', s.dirsEnabled + ' / ' + fmt(s.filesTotal),
-        'of ' + s.dirsTotal + ' directories and ' + fmt(s.filesAll) + ' files in the library')
-      + kpi('2 · Files still to do', fmt(s.pending), 'waiting for analysis and normalization')
-      + kpi('3 · Files checked', fmt(s.checked), fmt(s.ok) + ' already at target · ' + fmt(s.skipped) + ' skipped')
-      + kpi('4 · Files actually changed', fmt(s.changed), 'level adjusted to ' + state.settings.target.toFixed(1) + ' LUFS')
-      + '</section>'
-
-      + '<section class="grid-2">'
-      + '<div class="card"><h2>Needs attention</h2><ul class="attn">'
-      + '<li><span>Parked files (waiting for your review)</span><span><a href="#/parked"><strong>' + s.parked + '</strong> open →</a></span></li>'
-      + '<li><span>Errors in this run</span><span><strong>' + s.errors + '</strong></span></li>'
-      + '<li><span>Last run finished</span><span>' + (r.lastRun ? r.lastRun.toLocaleString('en-GB') : 'never') + '</span></li>'
-      + '<li><span>Large-change override</span><span>' + (state.settings.override ? '<strong>on</strong> — applied without review' : 'off') + '</span></li>'
-      + '<li><span>Write mode</span><span>' + writeModeLabel() + '</span></li>'
-      + '<li><span>Dry run</span><span>' + (state.settings.dryRun ? '<strong>on</strong> — nothing is written' : 'off') + '</span></li>'
-      + '</ul></div>'
-      + '<div class="card"><h2>Recent activity</h2><ul class="log">' + (logs || '<li><span class="muted">No activity yet.</span></li>') + '</ul></div>'
+  /* ------------------------------------------------------------- dashboard */
+  function mediaPanel(t) {
+    const s = stats(t);
+    const info = scheduleInfo(t);
+    return '<section class="card">'
+      + '<div class="card-head"><div><h2>' + MEDIA[t].label + '</h2>'
+      + '<div class="mono sub">' + MEDIA[t].root + '</div></div>'
+      + '<span class="chip' + (info.inside ? '' : ' is-out') + '">' + (info.inside ? 'In window' : 'Outside window') + '</span></div>'
+      + '<div class="stats">'
+      + stat('1 · Folders / files in scope', s.dirsEnabled + ' / ' + fmt(s.filesTotal), 'of ' + s.dirsTotal + ' folders · ' + fmt(s.filesAll) + ' files')
+      + stat('2 · To do', fmt(s.pending), 'waiting for analysis or normalization')
+      + stat('3 · Checked', fmt(s.checked), fmt(s.ok) + ' already at target')
+      + stat('4 · Actually changed', fmt(s.changed), 'level set to ' + state.settings[t].target.toFixed(1) + ' LUFS')
+      + '</div>'
+      + '<p class="small muted" style="margin-top:12px">' + esc(info.text) + '</p>'
       + '</section>';
   }
 
+  function renderDashboard() {
+    const r = state.run;
+    const rs = runStats();
+    const label = { running: 'Running', paused: 'Paused', stopped: 'Stopped' }[r.status];
+    const noTypes = !ALL.some((t) => r.types[t]);
+    const outside = r.status === 'running' ? ALL.filter((t) => r.types[t] && !scheduleInfo(t).inside) : [];
+    const sa = stats('audio');
+    const sv = stats('video');
+    const onoff = (b) => (b ? 'on' : 'off');
+    const writeLabel = (t) => {
+      const cfg = state.settings[t];
+      if (cfg.writeMode === 'backup') return 'in place, backup kept';
+      if (cfg.writeMode === 'output') return 'output folder';
+      return 'in place, no backup';
+    };
+    const logs = state.log.slice(0, 14).map((e) =>
+      '<li><time>' + pad2(e.t.getHours()) + ':' + pad2(e.t.getMinutes()) + ':' + pad2(e.t.getSeconds()) + '</time>'
+      + '<span class="tag-type">' + (e.type ? MEDIA[e.type].label.slice(0, 3).toUpperCase() : '—') + '</span>'
+      + '<span class="lv-' + e.level + '">' + esc(e.msg) + '</span></li>').join('');
+
+    app().innerHTML = pageHead('Dashboard', 'Audio and video are tracked separately: each has its own folders, schedule, settings and counters.', '')
+      + '<section class="card">'
+      + '<div class="run-top"><div class="run-state"><span class="dot dot-' + r.status + '"></span>'
+      + '<strong>' + label + '</strong>'
+      + (r.status === 'stopped' && rs.total && rs.checked === rs.total ? '<span class="muted">· all files checked</span>' : '')
+      + '</div><div class="btns">'
+      + '<button class="btn btn-primary" data-action="start"' + (r.status !== 'stopped' || noTypes ? ' disabled' : '') + '>Start</button>'
+      + '<button class="btn" data-action="pause"' + (r.status === 'stopped' ? ' disabled' : '') + '>' + (r.status === 'paused' ? 'Resume' : 'Pause') + '</button>'
+      + '<button class="btn" data-action="stop"' + (r.status === 'stopped' ? ' disabled' : '') + '>Stop</button>'
+      + '<a class="btn" href="#/directories">Browse folders</a>'
+      + '</div></div>'
+      + '<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + rs.percent + '"><div style="width:' + rs.percent + '%"></div></div>'
+      + '<div class="run-meta"><span><strong style="color:var(--text)">' + rs.percent + '%</strong> complete</span>'
+      + '<span>' + fmt(rs.checked) + ' of ' + fmt(rs.total) + ' files checked</span>'
+      + '<span class="mono">current: ' + (r.current ? esc(r.current) : '—') + '</span></div>'
+      + '<div class="run-types"><span class="muted">Process</span>'
+      + ALL.map((t) => '<label class="inline"><input type="checkbox" data-run-type="' + t + '"'
+        + (r.types[t] ? ' checked' : '') + (r.status !== 'stopped' ? ' disabled' : '') + '> ' + MEDIA[t].label + '</label>').join('')
+      + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '<span class="muted">Switches can be changed while stopped.</span>')
+      + '</div>'
+      + (outside.length ? '<div class="notice">Running outside the schedule of ' + outside.map((t) => MEDIA[t].label).join(' and ')
+        + ' (started manually). Stop the run to return to the schedule.</div>' : '')
+      + '</section>'
+      + '<div class="split-2">' + mediaPanel('audio') + mediaPanel('video') + '</div>'
+      + '<div class="split-2">'
+      + '<section class="card"><h2 style="margin-bottom:12px">Needs attention</h2><dl class="rows">'
+      + '<div><dt>Parked for review</dt><dd><a href="#/parked">Audio ' + sa.parked + ' · Video ' + sv.parked + '</a></dd></div>'
+      + '<div><dt>Errors</dt><dd>' + (sa.errors + sv.errors) + '</dd></div>'
+      + '<div><dt>Last run finished</dt><dd>' + (r.lastRun ? r.lastRun.toLocaleString('en-GB') : 'never') + '</dd></div>'
+      + '<div><dt>Write mode</dt><dd>Audio: ' + writeLabel('audio') + ' · Video: ' + writeLabel('video') + '</dd></div>'
+      + '<div><dt>Large-change override</dt><dd>Audio ' + onoff(state.settings.audio.override) + ' · Video ' + onoff(state.settings.video.override) + '</dd></div>'
+      + '<div><dt>Dry run</dt><dd>' + (state.settings.general.dryRun ? 'on, nothing is written' : 'off') + '</dd></div>'
+      + '</dl></section>'
+      + '<section class="card"><h2 style="margin-bottom:12px">Activity</h2><ul class="log">'
+      + (logs || '<li><span class="muted">No activity yet.</span></li>') + '</ul></section>'
+      + '</div>';
+  }
+
+  /* ----------------------------------------------------------- directories */
   function renderTree(nodes) {
     return nodes.map((n) => {
       const st = subtreeState(n);
       const total = subtreeNodes(n).reduce((a, x) => a + x.files.length, 0);
       const hasKids = n.children.length > 0;
+      const active = state.selected[n.type] === n.id;
       return '<li class="' + (n.enabled ? '' : 'disabled-node') + '">'
         + '<div class="tree-row">'
-        + '<button class="caret' + (hasKids ? '' : ' leaf') + '" data-action="tree-toggle" data-id="' + esc(n.id) + '" aria-label="expand or collapse">'
+        + '<button class="caret' + (hasKids ? '' : ' leaf') + '" data-action="tree-toggle" data-id="' + esc(n.id) + '" aria-label="Expand or collapse ' + esc(n.name) + '">'
         + (n.open ? '▾' : '▸') + '</button>'
-        + '<input type="checkbox" data-check="' + esc(n.id) + '" aria-label="include ' + esc(n.name) + '"' + (st === 'on' ? ' checked' : '') + '>'
-        + '<button class="folder' + (state.selectedDir === n.id ? ' active' : '') + '" data-action="tree-browse" data-id="' + esc(n.id) + '">📁 ' + esc(n.name) + '</button>'
+        + '<input type="checkbox" data-check="' + esc(n.id) + '" aria-label="Include ' + esc(n.name) + '"' + (st === 'on' ? ' checked' : '') + '>'
+        + '<button class="folder' + (active ? ' active' : '') + '" data-action="tree-browse" data-id="' + esc(n.id) + '">'
+        + '<span class="ico" aria-hidden="true"></span>' + esc(n.name) + '</button>'
         + '<span class="count">' + fmt(total) + ' files</span>'
         + '</div>'
         + (hasKids && n.open ? '<ul>' + renderTree(n.children) + '</ul>' : '')
@@ -410,43 +489,41 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
   }
 
   function renderBrowse(node) {
-    const shown = node.files.slice(0, 80);
-    const rows = shown.map((f) => {
-      const g = gainFor(f);
-      return '<tr><td>' + esc(f.name) + '</td><td><code>' + f.ext + '</code></td>'
+    const t = node.type;
+    const rows = node.files.slice(0, 80).map((f) => {
+      const g = gainFor(t, f);
+      return '<tr><td>' + esc(f.name) + '</td><td class="mono">' + f.ext + '</td>'
         + '<td class="num">' + f.lufs.toFixed(1) + ' LUFS</td>'
         + '<td class="num">' + fmtDb(g) + '</td>'
-        + '<td class="dim">' + esc(methodFor(f, node)) + '</td>'
-        + '<td>' + statusBadge(f.status) + '</td></tr>';
+        + '<td class="dim">' + esc(methodFor(t, f)) + '</td>'
+        + '<td>' + statusLabel(f.status) + '</td></tr>';
     }).join('');
     const subs = subtreeNodes(node).length - 1;
-    return '<h2>📁 ' + esc(ROOT + '/' + node.id) + '</h2>'
-      + '<p class="muted">' + node.files.length + ' files directly in this folder · ' + subs + ' sub-folders · '
-      + (node.enabled ? '<span class="st st-ok">enabled</span>' : '<span class="st st-skipped">excluded</span>') + '</p>'
+    return '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
+      + '<div class="sub">' + node.files.length + ' files directly in this folder · ' + subs + ' sub-folders</div></div>'
+      + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div>'
       + (node.files.length
         ? '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level</th>'
           + '<th class="num">Change</th><th>Method</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
-          + (node.files.length > 80 ? '<p class="muted">… and ' + (node.files.length - 80) + ' more files</p>' : '')
-        : '<p class="muted">No audio files directly in this folder — open a sub-folder in the tree.</p>');
+          + (node.files.length > 80 ? '<p class="small muted" style="margin-top:10px">… and ' + (node.files.length - 80) + ' more files</p>' : '')
+        : '<p class="muted">No files directly in this folder. Open a sub-folder in the tree.</p>');
   }
 
   function renderDirectories() {
-    const s = stats();
-    const sel = findNode(state.selectedDir) || state.tree[0];
-    app().innerHTML = ''
-      + '<header class="page-head"><div><h1>Directories</h1>'
-      + '<p class="muted">Base location: <code>' + ROOT + '</code> (mounted from a NAS folder in <code>docker-compose.yml</code>). '
-      + 'Untick a folder to exclude it. Ticking or unticking a folder applies to all its sub-folders.</p></div>'
-      + '<div class="btns">'
-      + '<button class="btn" data-action="select-all">Select all</button>'
-      + '<button class="btn" data-action="select-none">Select none</button>'
-      + '<button class="btn" data-action="expand-all">Expand all</button>'
-      + '<button class="btn" data-action="collapse-all">Collapse all</button>'
-      + '</div></header>'
-      + '<p class="muted"><strong style="color:var(--ink)">' + s.dirsEnabled + ' of ' + s.dirsTotal + '</strong> directories enabled · '
-      + fmt(s.filesTotal) + ' files in scope</p>'
-      + '<div class="split" style="margin-top:12px">'
-      + '<section class="card tree" aria-label="Directory tree"><ul>' + renderTree(state.tree) + '</ul></section>'
+    const t = state.media;
+    const s = stats(t);
+    const sel = findNode(state.selected[t]) || state.trees[t][0];
+    app().innerHTML = pageHead('Directories',
+      'Base location <span class="mono">' + MEDIA[t].root + '</span>, mounted from <span class="mono">' + MEDIA[t].host
+      + '</span> in docker-compose.yml. Untick a folder to exclude it. Ticking or unticking applies to its sub-folders too.',
+      '<button class="btn btn-sm" data-action="select-all">Select all</button>'
+      + '<button class="btn btn-sm" data-action="select-none">Select none</button>'
+      + '<button class="btn btn-sm" data-action="expand-all">Expand all</button>'
+      + '<button class="btn btn-sm" data-action="collapse-all">Collapse all</button>', true)
+      + '<p class="muted" style="margin-bottom:0"><strong style="color:var(--text)">' + s.dirsEnabled + ' of ' + s.dirsTotal
+      + '</strong> folders included · ' + fmt(s.filesTotal) + ' files in scope</p>'
+      + '<div class="split-dirs">'
+      + '<section class="card tree" aria-label="Folder tree"><ul>' + renderTree(state.trees[t]) + '</ul></section>'
       + '<section class="card">' + renderBrowse(sel) + '</section>'
       + '</div>';
     app().querySelectorAll('input[data-check]').forEach((cb) => {
@@ -455,174 +532,207 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
     });
   }
 
+  /* ---------------------------------------------------------------- parked */
   function renderParked() {
-    const list = allEntries().filter((e) => e.file.status === 'parked');
-    const th = state.settings.threshold;
+    const t = state.media;
+    const th = state.settings[t].threshold;
+    const list = entriesOf([t]).filter((e) => e.file.status === 'parked');
     const rows = list.map(({ node, file }) => {
-      const g = gainFor(file);
-      return '<tr><td>' + esc(file.name) + '</td><td class="dim">' + esc(ROOT + '/' + node.id) + '</td>'
+      const g = gainFor(t, file);
+      return '<tr><td>' + esc(file.name) + '</td><td class="dim mono">' + esc(MEDIA[t].root + '/' + node.rel) + '</td>'
         + '<td class="num">' + file.lufs.toFixed(1) + ' LUFS</td>'
-        + '<td class="num ' + (Math.abs(g) > th ? 'warn' : '') + '">' + fmtDb(g) + '</td>'
-        + '<td class="btns"><button class="btn btn-sm btn-primary" data-action="approve" data-file="' + esc(file.id) + '">Apply change</button>'
+        + '<td class="num' + (Math.abs(g) > th ? ' warn' : '') + '">' + fmtDb(g) + '</td>'
+        + '<td class="actions"><button class="btn btn-sm btn-primary" data-action="approve" data-file="' + esc(file.id) + '">Apply change</button>'
         + '<button class="btn btn-sm" data-action="skip" data-file="' + esc(file.id) + '">Skip</button></td></tr>';
     }).join('');
-    app().innerHTML = ''
-      + '<header class="page-head"><div><h1>Parked files</h1>'
-      + '<p class="muted">These files need a level change bigger than the <strong>' + th + ' dB</strong> threshold. '
-      + 'They were <strong>not changed</strong>; the run simply continued with the next file. Review them when convenient.</p></div>'
-      + '<div class="btns"><button class="btn btn-primary" data-action="approve-all"' + (list.length ? '' : ' disabled') + '>Apply all (' + list.length + ')</button>'
-      + '<a class="btn" href="#/settings">Threshold &amp; override →</a></div></header>'
+    app().innerHTML = pageHead('Parked files',
+      MEDIA[t].label + ' changes larger than <strong>' + th + ' dB</strong> are not applied. The run continued with the next file. Review them when convenient.',
+      '<button class="btn btn-primary" data-action="approve-all"' + (list.length ? '' : ' disabled') + '>Apply all (' + list.length + ')</button>'
+      + '<a class="btn" href="#/settings">Threshold</a>', true)
       + '<section class="card">'
       + (list.length
         ? '<div class="table-wrap"><table><thead><tr><th>File</th><th>Folder</th><th class="num">Level</th>'
           + '<th class="num">Change needed</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
-        : '<p class="muted">Nothing is parked. Every checked file is within the threshold.</p>')
+        : '<p class="muted">Nothing is parked in ' + MEDIA[t].label.toLowerCase() + '. Every checked file is within the threshold.</p>')
       + '</section>';
   }
 
+  /* -------------------------------------------------------------- schedule */
   function renderSchedule() {
-    const sc = state.schedule;
+    const t = state.media;
+    const sc = state.schedule[t];
     const hours = Array.from({ length: 24 }, (_, h) => h);
     const head = '<tr><th></th>' + hours.map((h) => '<th>' + pad2(h) + '</th>').join('') + '</tr>';
     const body = DAYS.map((d, di) => '<tr><td class="dayname">' + d + '</td>'
       + hours.map((h) => '<td class="cell' + (sc[di][h] ? ' on' : '') + '" data-d="' + di + '" data-h="' + h
         + '" title="' + d + ' ' + pad2(h) + ':00"></td>').join('') + '</tr>').join('');
-    app().innerHTML = ''
-      + '<header class="page-head"><div><h1>Schedule</h1>'
-      + '<p class="muted">The normalizer only processes files inside the green windows. Click or drag over the grid to change hours. '
-      + 'Times are local (Europe/Amsterdam).</p></div></header>'
+    app().innerHTML = pageHead('Schedule',
+      MEDIA[t].label + ' is processed only inside the blue windows. Click or drag over the grid to change hours. Times are local (Europe/Amsterdam).',
+      '', true)
       + '<section class="card">'
-      + '<div class="btns" style="margin-bottom:12px">'
-      + '<span class="muted" style="margin-right:4px">Presets:</span>'
-      + '<button class="btn btn-sm" data-action="preset" data-preset="nights">Nights 22:00–06:00</button>'
-      + '<button class="btn btn-sm" data-action="preset" data-preset="weeknights">Weeknights only</button>'
-      + '<button class="btn btn-sm" data-action="preset" data-preset="weekends">Weekends all day</button>'
+      + '<div class="btns" style="margin-bottom:14px">'
+      + '<span class="muted small" style="margin-right:4px">Presets</span>'
+      + '<button class="btn btn-sm" data-action="preset" data-preset="nights">Nights 22–06</button>'
+      + '<button class="btn btn-sm" data-action="preset" data-preset="weeknights">Weeknights</button>'
+      + '<button class="btn btn-sm" data-action="preset" data-preset="weekends">Weekends</button>'
       + '<button class="btn btn-sm" data-action="preset" data-preset="always">Always</button>'
       + '<button class="btn btn-sm" data-action="preset" data-preset="never">Never</button>'
       + '</div>'
       + '<div class="sched-wrap"><table class="sched"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'
-      + '<div class="legend"><span><span class="swatch" style="background:#3b82f6"></span>run allowed</span>'
-      + '<span><span class="swatch" style="background:#eef2f7"></span>paused</span>'
-      + '<span id="sched-now" class="muted"></span></div>'
+      + '<div class="legend"><span><span class="swatch" style="background:var(--accent)"></span>processing allowed</span>'
+      + '<span><span class="swatch" style="background:#ececea"></span>paused</span>'
+      + '<span id="sched-now"></span></div>'
       + '</section>'
-      + '<div class="grid-2">'
-      + '<section class="card"><h2>Active windows</h2><ul class="sched-list" id="sched-summary"></ul></section>'
-      + '<section class="card"><h2>Scan &amp; window options</h2>'
+      + '<div class="split-2">'
+      + '<section class="card"><h2 style="margin-bottom:10px">Windows per day</h2><ul class="sched-list" id="sched-summary"></ul></section>'
+      + '<section class="card"><h2 style="margin-bottom:14px">Options (all media types)</h2>'
       + '<div class="field"><label class="lbl" for="scan-every">Look for new or changed files every</label>'
-      + '<div class="input-row" style="max-width:260px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + state.scanEvery + '"><span class="btn" style="cursor:default">minutes</span></div>'
-      + '<p class="help">New files are detected automatically, also after a restart of the app.</p></div>'
-      + '<div class="field"><span class="lbl">When the window closes while a file is being processed</span>'
+      + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + state.scanEvery + '">'
+      + '<span class="muted small">minutes</span></div>'
+      + '<p class="help">New files are found automatically, also after a restart of the app.</p></div>'
+      + '<div class="field"><span class="lbl">When a window closes during a file</span>'
       + '<label class="opt"><input type="radio" name="onclose" value="finish" data-sched="onClose"' + (state.onClose === 'finish' ? ' checked' : '') + '>'
-      + '<span><strong>Finish the current file, then pause</strong><br><span class="muted">Recommended — no half-written files.</span></span></label>'
+      + '<span><strong style="font-weight:500">Finish the current file, then pause</strong><br><span class="muted">Recommended. No half-written files.</span></span></label>'
       + '<label class="opt"><input type="radio" name="onclose" value="now" data-sched="onClose"' + (state.onClose === 'now' ? ' checked' : '') + '>'
-      + '<span><strong>Pause immediately</strong><br><span class="muted">The temporary file is discarded and retried later.</span></span></label></div>'
-      + '</section></div>';
+      + '<span><strong style="font-weight:500">Pause immediately</strong><br><span class="muted">The temporary file is discarded and retried in the next window.</span></span></label>'
+      + '</div></section>'
+      + '</div>';
     updateScheduleInfo();
   }
 
   function updateScheduleInfo() {
+    const t = state.media;
     const list = document.getElementById('sched-summary');
     if (list) {
-      list.innerHTML = DAYS.map((d, i) => '<li><strong>' + d + '</strong> &nbsp;' + dayRanges(i) + '</li>').join('');
+      list.innerHTML = DAYS.map((d, i) => '<li><span class="muted">' + d + '</span><span>' + dayRanges(t, i) + '</span></li>').join('');
     }
     const now = document.getElementById('sched-now');
-    if (now) now.textContent = scheduleInfo().text;
+    if (now) now.textContent = scheduleInfo(t).text;
   }
 
-  function renderSettings() {
-    const s = state.settings;
-    const lossy = [
-      ['gain', 'Gain only — change the level without re-encoding', 'MP3 via mp3gain, AAC via aacgain. Audio data is untouched. Level steps are about 1.5 dB, so the target is hit within ±0.75 dB.', true],
-      ['reencode', 'Re-encode at the same codec and bitrate', 'Exact target level, but every re-encode adds a small generation loss.', false],
-      ['skip-lossy', 'Skip lossy files', 'Only lossless files (FLAC, WAV) are normalized; MP3/AAC/WMA/OGG are left alone.', false],
-    ].map(([v, t, d, def]) => '<label class="opt"><input type="radio" name="lossy" value="' + v + '" data-setting="lossy"'
-      + (s.lossy === v ? ' checked' : '') + '><span><strong>' + t + '</strong>' + (def ? '<span class="tag">default</span>' : '')
-      + '<br><span class="muted">' + d + '</span></span></label>').join('');
-
-    const writeOpts = [
+  /* ---------------------------------------------------------- normalization */
+  function writeOptions(t) {
+    const cfg = state.settings[t];
+    const opts = [
       ['inplace', 'Replace in place (default)', 'After verification the file is replaced. No copy of the original is kept.'],
       ['backup', 'Replace in place, keep a backup', 'The original is copied to /config/backups first. Needs extra disk space.'],
       ['output', 'Write to a separate output folder', 'The library is never touched. Normalized copies go to the folder below.'],
-    ].map(([v, t, d]) => '<label class="opt"><input type="radio" name="writeMode" value="' + v + '" data-setting="writeMode"'
-      + (s.writeMode === v ? ' checked' : '') + '><span><strong>' + t + '</strong><br><span class="muted">' + d + '</span></span></label>').join('');
-    const outField = s.writeMode === 'output'
-      ? '<div class="field" style="margin:4px 0 0 30px"><label class="lbl" for="s-out">Output folder (inside the container)</label>'
-        + '<input class="input" id="s-out" data-setting="outputDir" value="' + esc(s.outputDir) + '">'
-        + '<p class="help">Mount it in docker-compose.yml, e.g. <code>/volume1/music-normalized:/data/normalized</code>.</p></div>'
+    ].map(([v, title, d]) => '<label class="opt"><input type="radio" name="writeMode-' + t + '" value="' + v + '"'
+      + ' data-scope="' + t + '" data-setting="writeMode"' + (cfg.writeMode === v ? ' checked' : '') + '>'
+      + '<span><strong style="font-weight:500">' + title + '</strong><br><span class="muted">' + d + '</span></span></label>').join('');
+    const outField = cfg.writeMode === 'output'
+      ? '<div class="field" style="margin:4px 0 0 28px"><label class="lbl" for="out-' + t + '">Output folder (inside the container)</label>'
+        + '<input class="input" id="out-' + t + '" data-scope="' + t + '" data-setting="outputDir" value="' + esc(cfg.outputDir) + '">'
+        + '<p class="help">Mount it in docker-compose.yml, for example <span class="mono">/volume1/' + t + '-normalized:' + cfg.outputDir + '</span></p></div>'
       : '';
-
-    app().innerHTML = ''
-      + '<header class="page-head"><div><h1>Normalization settings</h1>'
-      + '<p class="muted">Global defaults for every enabled folder. Changes are saved to the app\u2019s config volume.</p></div>'
-      + '<div class="btns"><button class="btn" data-action="settings-reset">Reset to defaults</button>'
-      + '<button class="btn btn-primary" data-action="settings-save">Save settings</button></div></header>'
-      + '<div class="info-box" style="margin:0 0 16px">Web access has no login (local network only, as chosen). '
-      + 'Do not forward the port to the internet. The Home Assistant API is still protected by its access token.</div>'
-      + '<div class="grid-2">'
-      + '<section class="card"><h2>Output level</h2>'
-      + '<div class="field"><label class="lbl" for="s-target">Target loudness (integrated, EBU R128)</label>'
-      + '<div class="slider-row"><input id="s-target" type="range" min="-30" max="-10" step="0.5" value="' + s.target + '" data-setting="target">'
-      + '<div class="val"><span data-out="target">' + s.target.toFixed(1) + '</span> LUFS</div></div>'
-      + '<p class="help">−16 LUFS suits podcasts and speech, −14 suits music streaming, −23 is the EBU broadcast standard.</p></div>'
-      + '<div class="field"><label class="lbl" for="s-tp">True-peak ceiling</label>'
-      + '<div class="slider-row"><input id="s-tp" type="range" min="-6" max="-1" step="0.1" value="' + s.truePeak + '" data-setting="truePeak">'
-      + '<div class="val"><span data-out="truePeak">' + s.truePeak.toFixed(1) + '</span> dBTP</div></div>'
-      + '<p class="help">The gain is capped so that no sample goes above this level, which prevents clipping.</p></div>'
-      + '<div class="field"><label class="lbl" for="s-th">Large-change threshold</label>'
-      + '<div class="slider-row"><input id="s-th" type="range" min="1" max="12" step="0.5" value="' + s.threshold + '" data-setting="threshold">'
-      + '<div class="val"><span data-out="threshold">' + s.threshold.toFixed(1) + '</span> dB</div></div>'
-      + '<p class="help">Changes bigger than this are <em>parked</em> for review instead of being applied.</p></div>'
-      + '<label class="check"><input type="checkbox" data-setting="override"' + (s.override ? ' checked' : '') + '>'
-      + '<span><strong>Override the confirmation for large changes</strong><br><span class="muted">Apply changes above the threshold automatically, without parking the file.</span></span></label>'
-      + (s.override ? '<div class="warn-box">⚠ Large changes will be applied without review. Use this only with backups enabled.</div>' : '')
-      + '</section>'
-      + '<section class="card"><h2>Quality &amp; file handling</h2>'
-      + '<div class="field"><span class="lbl">Lossy formats (MP3, AAC, WMA, OGG, M4A)</span>' + lossy + '</div>'
-      + '<div class="field"><span class="lbl">How changed files are written</span>' + writeOpts + outField + '</div>'
-      + '<label class="check"><input type="checkbox" data-setting="videos"' + (s.videos ? ' checked' : '') + '>'
-      + '<span><strong>Normalize the audio track of video files</strong><br><span class="muted">AVI, MKV, MP4. The video stream is copied, never re-encoded. GPU (VAAPI) video re-encoding is a possible later option.</span></span></label>'
-      + '<label class="check"><input type="checkbox" data-setting="dryRun"' + (s.dryRun ? ' checked' : '') + '>'
-      + '<span><strong>Dry run</strong><br><span class="muted">Analyse and report only. Nothing is written. Recommended for the first run on a real library.</span></span></label>'
-      + '</section></div>';
+    return '<div class="field"><span class="lbl">How changed files are written</span>' + opts + outField + '</div>';
   }
 
+  function levelCard(t) {
+    const cfg = state.settings[t];
+    return '<section class="card"><div class="card-head"><div><h2>Level</h2><div class="sub">Applies to ' + MEDIA[t].label.toLowerCase() + ' files</div></div></div>'
+      + '<div class="field"><label class="lbl" for="target-' + t + '">Target loudness (integrated, EBU R128)</label>'
+      + '<div class="slider-row"><input id="target-' + t + '" type="range" min="-30" max="-10" step="0.5" value="' + cfg.target + '" data-scope="' + t + '" data-setting="target">'
+      + '<div class="val"><span data-out="' + t + '.target">' + cfg.target.toFixed(1) + '</span> LUFS</div></div>'
+      + '<p class="help">−16 LUFS suits podcasts and speech, −14 suits music streaming, −23 is the EBU broadcast standard.</p></div>'
+      + '<div class="field"><label class="lbl" for="tp-' + t + '">True-peak ceiling</label>'
+      + '<div class="slider-row"><input id="tp-' + t + '" type="range" min="-6" max="-1" step="0.1" value="' + cfg.truePeak + '" data-scope="' + t + '" data-setting="truePeak">'
+      + '<div class="val"><span data-out="' + t + '.truePeak">' + cfg.truePeak.toFixed(1) + '</span> dBTP</div></div>'
+      + '<p class="help">The gain is capped so that no sample exceeds this level, which prevents clipping.</p></div>'
+      + '<div class="field"><label class="lbl" for="th-' + t + '">Large-change threshold</label>'
+      + '<div class="slider-row"><input id="th-' + t + '" type="range" min="1" max="12" step="0.5" value="' + cfg.threshold + '" data-scope="' + t + '" data-setting="threshold">'
+      + '<div class="val"><span data-out="' + t + '.threshold">' + cfg.threshold.toFixed(1) + '</span> dB</div></div>'
+      + '<p class="help">Changes bigger than this are parked for review instead of being applied.</p></div>'
+      + '<label class="check"><input type="checkbox" data-scope="' + t + '" data-setting="override"' + (cfg.override ? ' checked' : '') + '>'
+      + '<span><strong>Override the confirmation for large changes</strong><br><span class="muted">Apply changes above the threshold automatically, without parking them.</span></span></label>'
+      + (cfg.override ? '<div class="notice">Large ' + MEDIA[t].label.toLowerCase() + ' changes will be applied without review.</div>' : '')
+      + '</section>';
+  }
+
+  function outputCard(t) {
+    if (t === 'audio') {
+      const cfg = state.settings.audio;
+      const lossy = [
+        ['gain', 'Gain only, no re-encode', 'MP3 via mp3gain, AAC via aacgain. The audio data is untouched; level steps are about 1.5 dB, so the target is hit within ±0.75 dB.', true],
+        ['reencode', 'Re-encode at the same codec and bitrate', 'Exact target level, but each re-encode adds a small generation loss.', false],
+        ['skip-lossy', 'Skip lossy files', 'Only lossless files (FLAC, WAV) are normalized. MP3, AAC, WMA and OGG are left alone.', false],
+      ].map(([v, title, d, def]) => '<label class="opt"><input type="radio" name="lossy" value="' + v + '" data-scope="audio" data-setting="lossy"'
+        + (cfg.lossy === v ? ' checked' : '') + '><span><strong style="font-weight:500">' + title + '</strong>'
+        + (def ? '<span class="tag">default</span>' : '') + '<br><span class="muted">' + d + '</span></span></label>').join('');
+      return '<section class="card"><div class="card-head"><div><h2>Output</h2><div class="sub">Audio files</div></div></div>'
+        + '<div class="field"><span class="lbl">Lossy formats (MP3, AAC, WMA, OGG, M4A)</span>' + lossy + '</div>'
+        + writeOptions('audio') + '</section>';
+    }
+    const planned = '<label class="opt"><input type="radio" name="video-stream" checked disabled>'
+      + '<span><strong style="font-weight:500">Copy the video stream</strong><br><span class="muted">Used in this version. The video is never decoded or re-encoded.</span></span></label>'
+      + '<label class="opt"><input type="radio" name="video-stream" disabled>'
+      + '<span><strong style="font-weight:500">Re-encode video on the GPU (VAAPI)</strong><span class="tag">planned</span><br><span class="muted">Possible later, as a separate option. Not available yet.</span></span></label>';
+    return '<section class="card"><div class="card-head"><div><h2>Output</h2><div class="sub">Video files (AVI, MKV, MP4)</div></div></div>'
+      + '<div class="field"><span class="lbl">Video stream</span>' + planned + '</div>'
+      + '<div class="notice info" style="margin:0 0 20px">The audio track is re-encoded with its original codec and bitrate, so the video is never touched.</div>'
+      + writeOptions('video') + '</section>';
+  }
+
+  function renderSettings() {
+    const t = state.media;
+    const g = state.settings.general;
+    app().innerHTML = pageHead('Normalization',
+      'Settings for each media type. Level and output are separate for audio and video. Save applies to the config volume (not persisted in this mock-up).',
+      '<button class="btn" data-action="settings-reset">Reset ' + MEDIA[t].label.toLowerCase() + '</button>'
+      + '<button class="btn btn-primary" data-action="settings-save">Save</button>', true)
+      + '<section class="card"><div class="check-list">'
+      + '<label class="check" style="padding-top:0"><input type="checkbox" data-scope="general" data-setting="dryRun"' + (g.dryRun ? ' checked' : '') + '>'
+      + '<span><strong>Dry run</strong><br><span class="muted">Analyse and report only. Nothing is written. Recommended for the first run on a real library.</span></span></label>'
+      + '<p class="small muted" style="padding-top:12px;border-top:1px solid var(--line)">Web access has no login (local network only, as chosen). '
+      + 'Do not forward the port to the internet. The Home Assistant API still requires its access token.</p>'
+      + '</div></section>'
+      + '<div class="split-2">' + levelCard(t) + outputCard(t) + '</div>';
+  }
+
+  /* ------------------------------------------------------------- Home Assistant */
   function renderHA() {
     const h = state.ha;
-    app().innerHTML = ''
-      + '<header class="page-head"><div><h1>Home Assistant</h1>'
-      + '<p class="muted">Publishes the normalizer status as a local, token-protected API. Home Assistant reads it with RESTful sensors.</p></div>'
-      + '<div class="btns"><button class="btn btn-primary" data-action="ha-save">Save</button></div></header>'
-      + '<div class="grid-2" style="margin-top:0">'
-      + '<section class="card"><h2>Connection</h2>'
-      + '<label class="check"><input type="checkbox" data-ha="enabled"' + (h.enabled ? ' checked' : '') + '>'
+    let lastGroup = null;
+    const sensorRows = h.sensors.map((x, i) => {
+      const head = x.group !== lastGroup ? '<tr><td colspan="5" class="group-row">' + esc(x.group) + '</td></tr>' : '';
+      lastGroup = x.group;
+      return head + '<tr><td><input type="checkbox" data-sensor="' + i + '" data-field="enabled"' + (x.enabled ? ' checked' : '') + ' aria-label="Enable ' + esc(x.name) + '"></td>'
+        + '<td><input class="input" data-sensor="' + i + '" data-field="name" value="' + esc(x.name) + '"></td>'
+        + '<td class="mono dim">' + x.path + '</td>'
+        + '<td>' + (x.unit ? esc(x.unit) : '<span class="dim">—</span>') + '</td>'
+        + '<td>' + (x.deviceClass || '<span class="dim">—</span>') + '</td></tr>';
+    }).join('');
+
+    app().innerHTML = pageHead('Home Assistant',
+      'Publishes the normalizer status as a local, token-protected API. Home Assistant reads it with RESTful sensors.',
+      '<button class="btn btn-primary" data-action="ha-save">Save</button>')
+      + '<div class="split-2" style="margin-top:0">'
+      + '<section class="card"><h2 style="margin-bottom:14px">Connection</h2>'
+      + '<label class="check" style="padding-top:0"><input type="checkbox" data-ha="enabled"' + (h.enabled ? ' checked' : '') + '>'
       + '<span><strong>Enable the Home Assistant API</strong><br><span class="muted">Requests without a valid token are refused.</span></span></label>'
       + '<div class="field" style="margin-top:14px"><label class="lbl" for="ha-url">Home Assistant URL</label>'
       + '<input class="input" id="ha-url" data-ha="url" value="' + esc(h.url) + '"></div>'
       + '<div class="field"><label class="lbl" for="ha-token">Long-lived access token</label>'
       + '<div class="input-row"><input class="input" id="ha-token" data-ha="token" autocomplete="off" type="' + (h.showToken ? 'text' : 'password') + '" value="' + esc(h.token) + '">'
       + '<button class="btn" data-action="ha-show">' + (h.showToken ? 'Hide' : 'Show') + '</button></div>'
-      + '<p class="help">Create it in Home Assistant: Profile → Security → Long-lived access tokens. Stored in the config volume, never shown in logs.</p></div>'
+      + '<p class="help">Create it in Home Assistant under Profile, then Security, then Long-lived access tokens. Stored in the config volume and never written to logs.</p></div>'
       + '<div class="btns"><button class="btn" data-action="ha-test">Test connection</button>'
-      + '<span class="muted">' + esc(h.testMsg) + '</span></div>'
+      + '<span class="muted small">' + esc(h.testMsg) + '</span></div>'
       + '</section>'
-      + '<section class="card"><h2>Local API endpoint</h2>'
+      + '<section class="card"><h2 style="margin-bottom:14px">Local API endpoint</h2>'
       + '<pre>GET http://&lt;NAS-IP&gt;:8080/api/v1/ha/status\nAuthorization: Bearer &lt;token&gt;</pre>'
-      + '<h2 style="margin-top:16px">Current payload</h2><pre id="ha-json"></pre></section>'
+      + '<h2 style="margin:18px 0 10px">Current payload</h2><pre id="ha-json"></pre></section>'
       + '</div>'
-      + '<section class="card" style="margin-top:16px"><h2>Sensor definitions</h2>'
-      + '<p class="muted">Pick which values become sensors in Home Assistant and how they are named.</p>'
-      + '<div class="table-wrap"><table><thead><tr><th>On</th><th>Sensor name</th><th>JSON key</th><th>Unit</th><th>Device class</th></tr></thead><tbody>'
-      + h.sensors.map((x, i) => '<tr><td><input type="checkbox" data-sensor="' + i + '" data-field="enabled"' + (x.enabled ? ' checked' : '') + '></td>'
-        + '<td><input class="input" data-sensor="' + i + '" data-field="name" value="' + esc(x.name) + '"></td>'
-        + '<td><code>' + x.key + '</code></td><td>' + (x.unit ? esc(x.unit) : '<span class="dim">—</span>') + '</td>'
-        + '<td>' + (x.deviceClass || '<span class="dim">—</span>') + '</td></tr>').join('')
-      + '</tbody></table></div></section>'
-      + '<section class="card" style="margin-top:16px"><h2>Generated <code>configuration.yaml</code> snippet</h2>'
+      + '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Sensors</h2>'
+      + '<div class="sub">Choose which values become Home Assistant sensors and how they are named.</div></div></div>'
+      + '<div class="table-wrap"><table><thead><tr><th>On</th><th>Sensor name</th><th>Source in payload</th><th>Unit</th><th>Device class</th></tr></thead>'
+      + '<tbody>' + sensorRows + '</tbody></table></div></section>'
+      + '<section class="card" style="margin-top:16px"><h2 style="margin-bottom:12px">Generated configuration.yaml</h2>'
       + '<pre id="ha-yaml"></pre></section>';
     refreshHaPreview();
   }
 
-  /* ----------------------------------------------------------------- routing */
+  /* -------------------------------------------------------------- routing */
   const ROUTES = {
     dashboard: renderDashboard,
     directories: renderDirectories,
@@ -638,7 +748,7 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
   }
 
   function updateNavBadge() {
-    document.getElementById('parkedBadge').textContent = stats().parked;
+    document.getElementById('parkedBadge').textContent = stats('audio').parked + stats('video').parked;
   }
 
   function render() {
@@ -651,52 +761,58 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
     ROUTES[route]();
   }
 
-  /* ------------------------------------------------------------- interaction */
+  /* --------------------------------------------------------- interaction */
   document.addEventListener('click', (e) => {
     const el = e.target.closest('[data-action]');
     if (!el || el.disabled) return;
     const a = el.dataset.action;
     const r = state.run;
+    const t = state.media;
 
-    if (a === 'start' && r.status === 'stopped') {
-      r.status = 'running';
-      log('info', 'Run started manually');
+    if (a === 'media') {
+      state.media = el.dataset.media;
+    } else if (a === 'start') {
+      if (r.status === 'stopped' && ALL.some((x) => r.types[x])) {
+        r.status = 'running';
+        log('info', null, 'Run started manually');
+      }
     } else if (a === 'pause') {
       r.status = r.status === 'running' ? 'paused' : 'running';
-      log('info', r.status === 'paused' ? 'Run paused' : 'Run resumed');
+      log('info', null, r.status === 'paused' ? 'Run paused' : 'Run resumed');
     } else if (a === 'stop') {
       r.status = 'stopped';
       r.current = null;
-      log('info', 'Run stopped by user');
+      log('info', null, 'Run stopped by user');
     } else if (a === 'tree-toggle') {
       const n = findNode(el.dataset.id); if (n) n.open = !n.open;
     } else if (a === 'tree-browse') {
-      state.selectedDir = el.dataset.id;
+      const n = findNode(el.dataset.id);
+      if (n) state.selected[n.type] = n.id;
     } else if (a === 'select-all' || a === 'select-none') {
-      allNodes().forEach((n) => { n.enabled = a === 'select-all'; });
+      nodesOf([t]).forEach((n) => { n.enabled = a === 'select-all'; });
     } else if (a === 'expand-all' || a === 'collapse-all') {
-      allNodes().forEach((n) => { n.open = a === 'expand-all'; });
+      nodesOf([t]).forEach((n) => { n.open = a === 'expand-all'; });
     } else if (a === 'approve' || a === 'skip') {
-      const entry = allEntries().find((x) => x.file.id === el.dataset.file);
+      const entry = entriesOf(ALL).find((x) => x.file.id === el.dataset.file);
       if (entry) {
         entry.file.status = a === 'approve' ? 'changed' : 'skipped';
-        log(a === 'approve' ? 'ok' : 'info', (a === 'approve' ? 'Change applied: ' : 'Skipped: ') + entry.node.id + '/' + entry.file.name);
+        log(a === 'approve' ? 'ok' : 'info', entry.node.type, (a === 'approve' ? 'Change applied: ' : 'Skipped: ') + entry.file.name);
       }
     } else if (a === 'approve-all') {
-      allEntries().forEach((x) => { if (x.file.status === 'parked') x.file.status = 'changed'; });
-      log('ok', 'All parked files approved and applied');
+      entriesOf([t]).forEach((x) => { if (x.file.status === 'parked') x.file.status = 'changed'; });
+      log('ok', t, 'All parked ' + MEDIA[t].label.toLowerCase() + ' files approved and applied');
     } else if (a === 'preset') {
       const fn = PRESETS[el.dataset.preset];
-      state.schedule = DAYS.map((_, d) => Array.from({ length: 24 }, (_, h) => !!fn(d, h)));
+      state.schedule[t] = scheduleFrom(fn);
     } else if (a === 'settings-save') {
       toast('Settings saved (mock-up: not persisted)');
       return;
     } else if (a === 'settings-reset') {
-      state.settings = Object.assign({}, DEFAULT_SETTINGS);
+      state.settings[t] = clone(DEFAULTS[t]);
     } else if (a === 'ha-show') {
       state.ha.showToken = !state.ha.showToken;
     } else if (a === 'ha-test') {
-      state.ha.testMsg = '✔ Connected to Home Assistant 2026.10 (simulated)';
+      state.ha.testMsg = 'Connected to Home Assistant 2026.10 (simulated)';
     } else if (a === 'ha-save') {
       toast('Home Assistant settings saved (mock-up: not persisted)');
       return;
@@ -705,51 +821,56 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
   });
 
   function onField(e) {
-    const t = e.target;
+    const el = e.target;
 
-    if (t.dataset.check !== undefined) {
-      const n = findNode(t.dataset.check);
-      if (n) subtreeNodes(n).forEach((x) => { x.enabled = t.checked; });
+    if (el.dataset.check !== undefined) {
+      const n = findNode(el.dataset.check);
+      if (n) subtreeNodes(n).forEach((x) => { x.enabled = el.checked; });
       if (e.type === 'change') render();
       return;
     }
 
-    if (t.dataset.setting) {
-      const key = t.dataset.setting;
-      if (t.type === 'radio' && !t.checked) return;
-      if (t.type === 'range') {
-        const v = parseFloat(t.value);
-        state.settings[key] = v;
-        const out = document.querySelector('[data-out="' + key + '"]');
+    if (el.dataset.runType) {
+      if (e.type === 'change') { state.run.types[el.dataset.runType] = el.checked; render(); }
+      return;
+    }
+
+    if (el.dataset.setting) {
+      if (el.type === 'radio' && !el.checked) return;
+      const bucket = state.settings[el.dataset.scope];
+      const key = el.dataset.setting;
+      if (el.type === 'range') {
+        const v = parseFloat(el.value);
+        bucket[key] = v;
+        const out = document.querySelector('[data-out="' + el.dataset.scope + '.' + key + '"]');
         if (out) out.textContent = v.toFixed(1);
         return;
       }
-      state.settings[key] = t.type === 'checkbox' ? t.checked : t.value;
+      bucket[key] = el.type === 'checkbox' ? el.checked : el.value;
       if (e.type === 'change') render();
       return;
     }
 
-    if (t.dataset.ha) {
-      state.ha[t.dataset.ha] = t.type === 'checkbox' ? t.checked : t.value;
+    if (el.dataset.ha) {
+      state.ha[el.dataset.ha] = el.type === 'checkbox' ? el.checked : el.value;
       refreshHaPreview();
       return;
     }
 
-    if (t.dataset.sensor !== undefined) {
-      const x = state.ha.sensors[Number(t.dataset.sensor)];
-      if (x) x[t.dataset.field] = t.type === 'checkbox' ? t.checked : t.value;
+    if (el.dataset.sensor !== undefined) {
+      const x = state.ha.sensors[Number(el.dataset.sensor)];
+      if (x) x[el.dataset.field] = el.type === 'checkbox' ? el.checked : el.value;
       refreshHaPreview();
       return;
     }
 
-    if (t.dataset.sched) {
-      if (t.type === 'radio' && !t.checked) return;
-      if (t.dataset.sched === 'scanEvery') {
-        state.scanEvery = Math.min(1440, Math.max(1, Math.round(Number(t.value)) || 1));
+    if (el.dataset.sched) {
+      if (el.type === 'radio' && !el.checked) return;
+      if (el.dataset.sched === 'scanEvery') {
+        state.scanEvery = Math.min(1440, Math.max(1, Math.round(Number(el.value)) || 1));
       } else {
-        state.onClose = t.value;
+        state.onClose = el.value;
       }
-      return;
     }
   }
   document.addEventListener('input', onField);
@@ -759,14 +880,14 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
   let painting = null;
   function paintCell(cell) {
     const d = Number(cell.dataset.d), h = Number(cell.dataset.h);
-    state.schedule[d][h] = painting;
+    state.schedule[state.media][d][h] = painting;
     cell.classList.toggle('on', painting);
   }
   app().addEventListener('pointerdown', (e) => {
     const cell = e.target.closest('.cell');
     if (!cell) return;
     e.preventDefault();
-    painting = !state.schedule[Number(cell.dataset.d)][Number(cell.dataset.h)];
+    painting = !state.schedule[state.media][Number(cell.dataset.d)][Number(cell.dataset.h)];
     paintCell(cell);
   });
   app().addEventListener('pointerover', (e) => {
@@ -780,7 +901,7 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
     updateScheduleInfo();
   });
 
-  /* ------------------------------------------------------------------- start */
+  /* ---------------------------------------------------------------- start */
   window.addEventListener('hashchange', render);
   setInterval(tick, 900);
   render();

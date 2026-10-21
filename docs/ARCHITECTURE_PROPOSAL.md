@@ -116,6 +116,41 @@ The exact tool mapping is a prototype task; the table is the target behaviour.
 
 ---
 
+### 2.4 Audio / video split (prepared in the mock-up)
+
+Audio and video are a first-class dimension of the data model, not a side feature. Each media type has its own:
+
+| Item | Audio | Video |
+|---|---|---|
+| Library mount (compose) | `/volume1/music` → `/data/audio` | `/volume1/video` → `/data/video` |
+| Folder selection (tree) | own enable/disable state | own enable/disable state |
+| Schedule (7×24 grid) | own windows | own windows |
+| Settings | target, true peak, threshold, override, lossy strategy, write mode | target, true peak, threshold, override, write mode; video stream option (copy now, GPU later) |
+| Counters and parked queue | own | own |
+| Home Assistant sensors | `audio.*` | `video.*` |
+
+Shared across both types: scanner, fingerprint database, job queue, run state machine (Start / Pause / Stop), scan interval, window-close behaviour, dry run, logs.
+
+Code structure to match:
+
+```
+app/core/media/
+├── base.py        # MediaType: mount, extensions, scanner settings, pipeline
+├── audio.py       # pipeline: ebur128 analysis, gain-only / re-encode / skip strategies
+└── video.py       # pipeline: audio-track normalization, video stream copied
+```
+
+Database: every file row carries `media_type` and the directory table carries `media_type`, so parked queues, counters and HA values are always filtered by type. A future VAAPI video re-encode is added as a new strategy in `video.py` without changing the rest of the app.
+
+Compose sketch (two mounts, one container):
+
+```yaml
+volumes:
+  - /volume1/music:/data/audio:rw
+  - /volume1/video:/data/video:rw
+  - /volume1/docker/audio-normalizer/config:/config:rw
+```
+
 ## 3. Feature mapping to requirements
 
 | Requirement | Solution |
@@ -127,8 +162,8 @@ The exact tool mapping is a prototype task; the table is the target behaviour.
 | New files detected, persistent | Periodic scan + SQLite fingerprints; state survives restarts. |
 | Warning + park large changes, no waiting | Files above the threshold get status `parked`; the run continues; review page. |
 | Override confirmation for large changes | Toggle in settings (applies large changes automatically). |
-| Home Assistant sensors | REST API: status, progress %, files in scope, pending, checked, changed, parked, errors, current file, last run, next schedule change, target LUFS. |
-| Dashboard (4 numbers) | Directories/files in scope · files to do · files checked · files actually changed. |
+| Home Assistant sensors | REST API, grouped by media type: status, progress %, errors, and per type: folders, files in scope, pending, checked, changed, parked, target LUFS, next schedule change. |
+| Dashboard (4 numbers) | Per media type: folders/files in scope · files to do · files checked · files actually changed. |
 | Start / stop / browse | Run controls on dashboard; tree browser on Directories page. |
 | Base location set by user | Compose volume mount; shown in UI, not changeable in the browser (safety). |
 | Write behaviour | Settings: in place (default) · in place with backup · separate output folder (Q2). |
@@ -140,27 +175,43 @@ The exact tool mapping is a prototype task; the table is the target behaviour.
 
 Endpoint: `GET http://<NAS-IP>:8080/api/v1/ha/status` with header `Authorization: Bearer <token>`.
 
-Example payload (values come from the mock-up state):
+Example payload (structure taken from the mock-up; values are sample numbers):
 
 ```json
 {
   "status": "running",
-  "progress_percent": 42.5,
-  "directories_total": 15,
-  "directories_enabled": 9,
-  "files_total": 547,
-  "files_pending": 270,
-  "files_checked": 277,
-  "files_changed": 118,
-  "files_parked": 14,
-  "errors": 3,
-  "current_file": "Podcasts/Tech Weekly/07 Blue Hour 1.mp3",
-  "last_run_finished": "2026-10-20T06:00:12Z",
-  "next_schedule_change": "2026-10-21T22:00:00Z",
-  "target_lufs": -16.0,
-  "in_schedule_window": true
+  "progress_percent": 52.6,
+  "errors": 8,
+  "current_file": "/data/audio/Music/Rock/04 Cold Front 1.mp3",
+  "last_run_finished": "2026-10-20T23:05:15Z",
+  "audio": {
+    "in_schedule_window": false,
+    "directories_total": 16,
+    "directories_enabled": 15,
+    "files_total": 431,
+    "files_pending": 201,
+    "files_checked": 230,
+    "files_changed": 74,
+    "files_parked": 35,
+    "target_lufs": -16.0,
+    "next_schedule_change": "2026-10-21T22:00:00Z"
+  },
+  "video": {
+    "in_schedule_window": false,
+    "directories_total": 6,
+    "directories_enabled": 5,
+    "files_total": 61,
+    "files_pending": 32,
+    "files_checked": 29,
+    "files_changed": 12,
+    "files_parked": 8,
+    "target_lufs": -16.0,
+    "next_schedule_change": "2026-10-24T00:00:00Z"
+  }
 }
 ```
+
+Sensors use dotted paths, for example `audio.files_total` → `{{ value_json.audio.files_total }}`. The mock-up's Home Assistant page groups sensors into Overall, Audio and Video.
 
 Home Assistant side: RESTful sensors (generated YAML snippet is shown on the Home Assistant page of the mock-up). Decided for v1: **REST only** (Q4). MQTT discovery or a HACS custom integration are not planned for v1.
 
@@ -193,7 +244,7 @@ Also interpreted as stated: dashboard item 3 "files checked" = files analysed; i
 ## 6. Delivery plan (after confirmation)
 
 1. **Prototype (on the DS918+):** measure ffmpeg analysis speed; check `/dev/dri` and `vainfo`; verify gain-only MP3/AAC path and lossless FLAC path with sample files. Output: short report.
-2. **Core engine:** scanner, analyser, normalizer, scheduler, SQLite state, unit tests with generated audio.
+2. **Core engine:** scanner, analyser, normalizer, scheduler, SQLite state with `media_type` on directories and files, unit tests with generated audio.
 3. **API + web UI:** build from the approved mock-up. No login (Q5), so network exposure must be documented clearly in the install guide.
 4. **Home Assistant endpoint** and sensor definitions.
 5. **Docker image** (amd64) and `docker-compose.yml`; install guide for Container Manager.
