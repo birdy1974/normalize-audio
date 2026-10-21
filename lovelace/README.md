@@ -71,6 +71,7 @@ Full-width layout tip: put the card in a *Panel* or a *Grid* section with one co
 | `show_audio` | `true` | Show the audio block |
 | `show_video` | `true` | Show the video block |
 | `show_details` | `true` | Show target, next schedule change, current file and last run |
+| `fields` | all values | Optional list of values to show, e.g. `audio.files_total`. The Home Assistant page generates this list from the enabled sensors. |
 
 ## Troubleshooting
 

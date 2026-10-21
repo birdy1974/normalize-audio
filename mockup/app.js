@@ -75,7 +75,7 @@
     const r = rand();
     const status = r < 0.5 ? 'pending' : r < 0.72 ? 'ok' : r < 0.87 ? 'changed' : r < 0.95 ? 'parked' : r < 0.96 ? 'error' : 'skipped';
     const title = TITLES[k % TITLES.length] + ' ' + (Math.floor(k / TITLES.length) + 1);
-    return { id: node.id + '#' + k, name: pad2(k + 1) + ' ' + title + '.' + ext, ext, lufs, status };
+    return { id: node.id + '#' + k, name: pad2(k + 1) + ' ' + title + '.' + ext, ext, lufs, status, adjust: 0 };
   }
 
   function buildNodes(type, specs, parentRel) {
@@ -150,6 +150,7 @@
       showToken: false, testMsg: '', sensors: SENSOR_DEFS.map((s) => Object.assign({}, s)),
     },
     log: [],
+    parkSel: [],                                     // selected parked file ids
   };
 
   function log(level, type, msg) {
@@ -370,19 +371,26 @@
     return y;
   }
 
-  const CARD_YAML = 'type: custom:audio-normalizer-card\nentity: sensor.audio_normalizer\ntitle: Audio Normalizer\nshow_audio: true\nshow_video: true\nshow_details: true\n';
+  function enabledPaths() { return state.ha.sensors.filter((x) => x.enabled).map((x) => x.path); }
+  function cardConfig() {
+    return { entity: 'sensor.audio_normalizer', title: 'Audio Normalizer', show_audio: true, show_video: true, show_details: true, fields: enabledPaths() };
+  }
+  function cardYaml() {
+    const f = enabledPaths();
+    return 'type: custom:audio-normalizer-card\nentity: sensor.audio_normalizer\ntitle: Audio Normalizer\nshow_audio: true\nshow_video: true\nshow_details: true\n'
+      + (f.length ? 'fields:\n' + f.map((x) => '  - ' + x + '\n').join('') : 'fields: []\n');
+  }
 
   function refreshHaPreview() {
     const j = document.getElementById('ha-json');
     if (j) j.textContent = JSON.stringify(apiPayload(), null, 2);
     const y = document.getElementById('ha-yaml');
     if (y) y.textContent = haYaml();
+    const cy = document.getElementById('ha-card-yaml');
+    if (cy) cy.textContent = cardYaml();
     const card = document.getElementById('card-preview');
     if (card && typeof card.setConfig === 'function') {
-      if (!card._mockReady) {
-        card.setConfig({ entity: 'sensor.audio_normalizer', title: 'Audio Normalizer', show_audio: true, show_video: true, show_details: true });
-        card._mockReady = true;
-      }
+      card.setConfig(cardConfig());
       const p = apiPayload();
       card.hass = { states: { 'sensor.audio_normalizer': { state: p.status, attributes: p } } };
     }
@@ -483,7 +491,8 @@
       + '<div><dt>Large-change override</dt><dd>Audio ' + onoff(state.settings.audio.override) + ' · Video ' + onoff(state.settings.video.override) + '</dd></div>'
       + '<div><dt>Dry run</dt><dd>' + (state.settings.general.dryRun ? 'on, nothing is written' : 'off') + '</dd></div>'
       + '</dl></section>'
-      + '<section class="card"><h2 style="margin-bottom:12px">Activity</h2><ul class="log">'
+      + '<section class="card"><div class="card-head"><h2>Activity</h2>'
+      + '<button class="btn btn-sm" data-action="clear-log"' + (state.log.length ? '' : ' disabled') + '>Clear list</button></div><ul class="log">'
       + (logs || '<li><span class="muted">No activity yet.</span></li>') + '</ul></section>'
       + '</div>';
   }
@@ -501,7 +510,7 @@
         + (n.open ? '▾' : '▸') + '</button>'
         + '<input type="checkbox" data-check="' + esc(n.id) + '" aria-label="Include ' + esc(n.name) + '"' + (st === 'on' ? ' checked' : '') + '>'
         + '<button class="folder' + (active ? ' active' : '') + '" data-action="tree-browse" data-id="' + esc(n.id) + '">'
-        + '<span class="ico" aria-hidden="true"></span>' + esc(n.name) + '</button>'
+        + esc(n.name) + '</button>'
         + '<span class="count">' + fmt(total) + ' files</span>'
         + '</div>'
         + (hasKids && n.open ? '<ul>' + renderTree(n.children) + '</ul>' : '')
@@ -554,26 +563,53 @@
   }
 
   /* ---------------------------------------------------------------- parked */
+  function parkedIds(t) {
+    return entriesOf([t]).filter((e) => e.file.status === 'parked').map((e) => e.file.id);
+  }
+  const clampAdjust = (v) => Math.max(-12, Math.min(12, Math.round(v * 10) / 10));
+  const effGain = (t, file) => gainFor(t, file) + (file.adjust || 0);
+
   function renderParked() {
     const t = state.media;
     const th = state.settings[t].threshold;
     const list = entriesOf([t]).filter((e) => e.file.status === 'parked');
+    const ids = list.map((e) => e.file.id);
+    state.parkSel = state.parkSel.filter((id) => ids.includes(id));
+    const sel = state.parkSel;
     const rows = list.map(({ node, file }) => {
-      const g = gainFor(t, file);
-      return '<tr><td>' + esc(file.name) + '</td><td class="dim mono">' + esc(MEDIA[t].root + '/' + node.rel) + '</td>'
+      const g = effGain(t, file);
+      const on = sel.includes(file.id);
+      const fid = esc(file.id);
+      return '<tr' + (on ? ' class="row-sel"' : '') + '>'
+        + '<td class="pick"><input type="checkbox" data-park-check="' + fid + '" aria-label="Select ' + esc(file.name) + '"' + (on ? ' checked' : '') + '></td>'
+        + '<td>' + esc(file.name) + '</td><td class="dim mono">' + esc(MEDIA[t].root + '/' + node.rel) + '</td>'
         + '<td class="num">' + file.lufs.toFixed(1) + ' LUFS</td>'
-        + '<td class="num' + (Math.abs(g) > th ? ' warn' : '') + '">' + fmtDb(g) + '</td>'
-        + '<td class="actions"><button class="btn btn-sm btn-primary" data-action="approve" data-file="' + esc(file.id) + '">Apply change</button>'
-        + '<button class="btn btn-sm" data-action="skip" data-file="' + esc(file.id) + '">Skip</button></td></tr>';
+        + '<td class="num"><div class="stepper">'
+        + '<button class="btn btn-sm" data-action="adjust-file" data-file="' + fid + '" data-step="-0.5" aria-label="Reduce change by 0.5 dB">−</button>'
+        + '<span class="step-val' + (Math.abs(g) > th ? ' warn' : '') + '">' + fmtDb(g) + '</span>'
+        + '<button class="btn btn-sm" data-action="adjust-file" data-file="' + fid + '" data-step="0.5" aria-label="Increase change by 0.5 dB">+</button>'
+        + '</div></td>'
+        + '<td class="actions"><button class="btn btn-sm btn-primary" data-action="approve" data-file="' + fid + '">Apply change</button>'
+        + '<button class="btn btn-sm" data-action="skip" data-file="' + fid + '">Skip</button></td></tr>';
     }).join('');
+    const allOn = list.length > 0 && sel.length === list.length;
+    const bulk = sel.length
+      ? '<div class="bulk-bar"><span><strong>' + sel.length + '</strong> selected</span>'
+        + '<span class="bulk-steps"><button class="btn btn-sm" data-action="bulk-adjust" data-step="-0.5">− 0.5 dB</button>'
+        + '<button class="btn btn-sm" data-action="bulk-adjust" data-step="0.5">+ 0.5 dB</button></span>'
+        + '<span class="grow"></span>'
+        + '<button class="btn btn-sm btn-primary" data-action="apply-selected">Apply selected</button>'
+        + '<button class="btn btn-sm" data-action="clear-selection">Clear selection</button></div>'
+      : '';
     app().innerHTML = pageHead('Parked files',
-      MEDIA[t].label + ' changes larger than <strong>' + th + ' dB</strong> are not applied. The run continued with the next file. Review them when convenient.',
+      MEDIA[t].label + ' changes larger than <strong>' + th + ' dB</strong> are not applied. The run continued with the next file. Adjust a change with − and + (0.5 dB steps), then apply it.',
       '<button class="btn btn-primary" data-action="approve-all"' + (list.length ? '' : ' disabled') + '>Apply all (' + list.length + ')</button>'
       + '<a class="btn" href="#/settings">Threshold</a>', true)
       + '<section class="card">'
       + (list.length
-        ? '<div class="table-wrap"><table><thead><tr><th>File</th><th>Folder</th><th class="num">Level</th>'
-          + '<th class="num">Change needed</th><th>Decision</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        ? bulk + '<div class="table-wrap"><table><thead><tr>'
+          + '<th class="pick"><input type="checkbox" data-park-all aria-label="Select all parked files"' + (allOn ? ' checked' : '') + '></th>'
+          + '<th>File</th><th>Folder</th><th class="num">Level</th><th class="num">Change needed</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
         : '<p class="muted">Nothing is parked in ' + MEDIA[t].label.toLowerCase() + '. Every checked file is within the threshold.</p>')
       + '</section>';
   }
@@ -588,7 +624,7 @@
       + hours.map((h) => '<td class="cell' + (sc[di][h] ? ' on' : '') + '" data-d="' + di + '" data-h="' + h
         + '" title="' + d + ' ' + pad2(h) + ':00"></td>').join('') + '</tr>').join('');
     app().innerHTML = pageHead('Schedule',
-      MEDIA[t].label + ' is processed only inside the blue windows. Click or drag over the grid to change hours. Times are local (Europe/Amsterdam).',
+      MEDIA[t].label + ' is processed only inside the green windows. Click or drag over the grid to change hours. Times are local (Europe/Amsterdam).',
       '', true)
       + '<section class="card">'
       + '<div class="btns" style="margin-bottom:14px">'
@@ -604,20 +640,7 @@
       + '<span><span class="swatch" style="background:#dcdcd8"></span>paused</span>'
       + '<span id="sched-now"></span></div>'
       + '</section>'
-      + '<div class="split-2">'
-      + '<section class="card"><h2 style="margin-bottom:10px">Windows per day</h2><ul class="sched-list" id="sched-summary"></ul></section>'
-      + '<section class="card"><h2 style="margin-bottom:14px">Options (all media types)</h2>'
-      + '<div class="field"><label class="lbl" for="scan-every">Look for new or changed files every</label>'
-      + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + state.scanEvery + '">'
-      + '<span class="muted small">minutes</span></div>'
-      + '<p class="help">New files are found automatically, also after a restart of the app.</p></div>'
-      + '<div class="field"><span class="lbl">When a window closes during a file</span>'
-      + '<label class="opt"><input type="radio" name="onclose" value="finish" data-sched="onClose"' + (state.onClose === 'finish' ? ' checked' : '') + '>'
-      + '<span><strong style="font-weight:500">Finish the current file, then pause</strong><br><span class="muted">Recommended. No half-written files.</span></span></label>'
-      + '<label class="opt"><input type="radio" name="onclose" value="now" data-sched="onClose"' + (state.onClose === 'now' ? ' checked' : '') + '>'
-      + '<span><strong style="font-weight:500">Pause immediately</strong><br><span class="muted">The temporary file is discarded and retried in the next window.</span></span></label>'
-      + '</div></section>'
-      + '</div>';
+      + '<section class="card"><h2 style="margin-bottom:10px">Windows per day</h2><ul class="sched-list" id="sched-summary"></ul></section>';
     updateScheduleInfo();
   }
 
@@ -694,10 +717,26 @@
       + writeOptions('video') + '</section>';
   }
 
+  function scheduleOptions() {
+    return '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Scheduling</h2>'
+      + '<div class="sub">Applies to audio and video. The time windows are set on the Schedule tab.</div></div></div>'
+      + '<div class="split-2" style="margin-top:0">'
+      + '<div class="field" style="margin:0"><label class="lbl" for="scan-every">Look for new or changed files every</label>'
+      + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + state.scanEvery + '">'
+      + '<span class="muted small">minutes</span></div>'
+      + '<p class="help">New files are found automatically, also after a restart of the app.</p></div>'
+      + '<div class="field" style="margin:0"><span class="lbl">When a window closes during a file</span>'
+      + '<label class="opt"><input type="radio" name="onclose" value="finish" data-sched="onClose"' + (state.onClose === 'finish' ? ' checked' : '') + '>'
+      + '<span><strong style="font-weight:500">Finish the current file, then pause</strong><br><span class="muted">Recommended. No half-written files.</span></span></label>'
+      + '<label class="opt"><input type="radio" name="onclose" value="now" data-sched="onClose"' + (state.onClose === 'now' ? ' checked' : '') + '>'
+      + '<span><strong style="font-weight:500">Pause immediately</strong><br><span class="muted">The temporary file is discarded and retried in the next window.</span></span></label>'
+      + '</div></div></section>';
+  }
+
   function renderSettings() {
     const t = state.media;
     const g = state.settings.general;
-    app().innerHTML = pageHead('Normalization',
+    app().innerHTML = pageHead('Settings',
       'Settings for each media type. Level and output are separate for audio and video. Save applies to the config volume (not persisted in this mock-up).',
       '<button class="btn" data-action="settings-reset">Reset ' + MEDIA[t].label.toLowerCase() + '</button>'
       + '<button class="btn btn-primary" data-action="settings-save">Save</button>', true)
@@ -707,6 +746,7 @@
       + '<p class="small muted" style="padding-top:12px;border-top:1px solid var(--line)">Web access has no login (local network only, as chosen). '
       + 'Do not forward the port to the internet. The Home Assistant API still requires its access token.</p>'
       + '</div></section>'
+      + scheduleOptions()
       + '<div class="split-2">' + levelCard(t) + outputCard(t) + '</div>';
   }
 
@@ -755,12 +795,12 @@
       + '<li>Settings → Dashboards → Resources → add <span class="mono">/local/audio-normalizer-card.js</span>, type <em>JavaScript module</em></li>'
       + '<li>Edit a dashboard → add card → Audio Normalizer, or paste this YAML:</li>'
       + '</ol>'
-      + '<pre style="margin-top:10px">' + esc(CARD_YAML) + '</pre>'
+      + '<pre id="ha-card-yaml" style="margin-top:10px"></pre>'
       + '<p class="help">Also on GitHub: <span class="mono">lovelace/audio-normalizer-card.js</span>. Details and troubleshooting: <span class="mono">lovelace/README.md</span>.</p>'
       + '</div>'
-      + '<div><h2 style="margin-bottom:10px">Preview (live, from the simulated payload)</h2>'
+      + '<div><h2 style="margin-bottom:10px">Preview (shows the enabled sensors)</h2>'
       + '<div class="preview-stage"><audio-normalizer-card id="card-preview"></audio-normalizer-card></div>'
-      + '<p class="help">The preview uses the same file you download. It updates as you start, pause or change settings.</p></div>'
+      + '<p class="help">The preview uses the same file you download. It shows only the sensors enabled below and updates when you change them.</p></div>'
       + '</div></section>'
 
       + '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Sensors</h2>'
@@ -844,6 +884,24 @@
     } else if (a === 'preset') {
       const fn = PRESETS[el.dataset.preset];
       state.schedule[t] = scheduleFrom(fn);
+    } else if (a === 'clear-log') {
+      state.log = [];
+    } else if (a === 'adjust-file') {
+      const entry = entriesOf(ALL).find((x) => x.file.id === el.dataset.file);
+      if (entry) entry.file.adjust = clampAdjust((entry.file.adjust || 0) + Number(el.dataset.step));
+    } else if (a === 'bulk-adjust') {
+      entriesOf(ALL).forEach((x) => {
+        if (state.parkSel.includes(x.file.id)) x.file.adjust = clampAdjust((x.file.adjust || 0) + Number(el.dataset.step));
+      });
+    } else if (a === 'apply-selected') {
+      let n = 0;
+      entriesOf(ALL).forEach((x) => {
+        if (state.parkSel.includes(x.file.id) && x.file.status === 'parked') { x.file.status = 'changed'; n += 1; }
+      });
+      state.parkSel = [];
+      if (n) log('ok', t, 'Applied ' + n + ' selected ' + MEDIA[t].label.toLowerCase() + ' file' + (n === 1 ? '' : 's'));
+    } else if (a === 'clear-selection') {
+      state.parkSel = [];
     } else if (a === 'settings-save') {
       toast('Settings saved (mock-up: not persisted)');
       return;
@@ -867,6 +925,19 @@
       const n = findNode(el.dataset.check);
       if (n) subtreeNodes(n).forEach((x) => { x.enabled = el.checked; });
       if (e.type === 'change') render();
+      return;
+    }
+
+    if (el.dataset.parkCheck !== undefined || el.dataset.parkAll !== undefined) {
+      if (e.type === 'change') {
+        if (el.dataset.parkAll !== undefined) {
+          state.parkSel = el.checked ? parkedIds(state.media) : [];
+        } else {
+          const id = el.dataset.parkCheck;
+          state.parkSel = el.checked ? state.parkSel.concat(id) : state.parkSel.filter((x) => x !== id);
+        }
+        render();
+      }
       return;
     }
 
@@ -941,8 +1012,36 @@
     updateScheduleInfo();
   });
 
+  /* ------------------------------------------------------------------- menu */
+  const MENU_KEY = 'audio-normalizer-menu';
+  const menu = (() => {
+    try { return Object.assign({ collapsed: false, pinned: true }, JSON.parse(localStorage.getItem(MENU_KEY)) || {}); }
+    catch (err) { return { collapsed: false, pinned: true }; }
+  })();
+  function applyMenu() {
+    const shell = document.querySelector('.app');
+    shell.classList.toggle('is-rail', menu.collapsed);
+    shell.classList.toggle('auto-rail', !menu.pinned);
+    const c = document.getElementById('menu-collapse');
+    const p = document.getElementById('menu-pin');
+    c.setAttribute('aria-label', menu.collapsed ? 'Expand menu' : 'Collapse menu');
+    c.title = menu.collapsed ? 'Expand menu' : 'Collapse menu';
+    p.setAttribute('aria-pressed', String(menu.pinned));
+    p.setAttribute('aria-label', menu.pinned ? 'Unpin menu' : 'Pin menu');
+    p.title = menu.pinned ? 'Pinned: menu stays as it is. Click to unpin.' : 'Unpinned: menu shrinks to icons and opens on hover. Click to pin.';
+    try { localStorage.setItem(MENU_KEY, JSON.stringify(menu)); } catch (err) { /* private mode */ }
+  }
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('#menu-collapse, #menu-pin');
+    if (!b) return;
+    if (b.id === 'menu-collapse') menu.collapsed = !menu.collapsed;
+    else menu.pinned = !menu.pinned;
+    applyMenu();
+  });
+
   /* ---------------------------------------------------------------- start */
   window.addEventListener('hashchange', render);
   setInterval(tick, 900);
+  applyMenu();
   render();
 })();

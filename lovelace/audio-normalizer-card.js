@@ -1,13 +1,13 @@
 /*!
- * Audio Normalizer — Lovelace card  (v1.0.0)
+ * Audio Normalizer — Lovelace card  (v1.1.0)
  *
- * Shows every value published by the audio-normalizer status sensor:
+ * Shows the values published by the audio-normalizer status entity:
  * run status, progress, audio and video counters, parked files, errors,
- * current file, last run, target loudness and next schedule change.
+ * target loudness, next schedule change, current file and last run.
  *
- * It reads ONE entity (default sensor.audio_normalizer). The entity is created
- * by the REST sensor snippet from the Audio Normalizer web page; its attributes
- * hold the complete payload.
+ * It reads ONE entity (default sensor.audio_normalizer). Its attributes hold
+ * the payload. The optional `fields` list (generated from the enabled sensors on
+ * the Home Assistant page) limits the card to the values you chose.
  *
  * Usage in a dashboard (raw YAML):
  *   type: custom:audio-normalizer-card
@@ -16,6 +16,9 @@
  *   show_audio: true
  *   show_video: true
  *   show_details: true
+ *   fields:                       # optional; omit to show everything
+ *     - audio.files_total
+ *     - progress_percent
  *
  * Install: see lovelace/README.md
  * No external dependencies. Follows the Home Assistant theme variables.
@@ -23,7 +26,7 @@
 (function () {
   'use strict';
 
-  const CARD_VERSION = '1.0.0';
+  const CARD_VERSION = '1.1.0';
   const CARD_TAG = 'audio-normalizer-card';
   const DEFAULTS = {
     entity: 'sensor.audio_normalizer',
@@ -31,6 +34,7 @@
     show_audio: true,
     show_video: true,
     show_details: true,
+    fields: null,
   };
 
   const esc = (s) => String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, (c) => (
@@ -49,8 +53,8 @@
     :host { display: block; }
     .card {
       background: var(--ha-card-background, var(--card-background-color, #fbfbfa));
-      color: var(--primary-text-color, #1b1b1b);
-      border: 1px solid var(--divider-color, #d3d3cf);
+      color: var(--primary-text-color, #1c1d1c);
+      border: 1px solid var(--divider-color, #d9d9d5);
       border-radius: 6px;
       padding: 16px;
       font-family: var(--paper-font-body1_-_font-family, system-ui, -apple-system, Segoe UI, Roboto, sans-serif);
@@ -61,34 +65,35 @@
     *, *::before, *::after { box-sizing: border-box; }
     .head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
     .title { font-size: 16px; font-weight: 600; }
-    .status { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary-text-color, #6b6b67); }
-    .status::before { content: ""; width: 8px; height: 8px; background: #9d9e99; border-radius: 50%; }
-    .status.s-running { color: var(--primary-text-color, #1b1b1b); }
+    .status { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary-text-color, #6c6d69); }
+    .status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #9d9e99; }
+    .status.s-running { color: #2f7a6b; }
     .status.s-running::before { background: #2f7a6b; }
-    .status.s-paused::before { background: transparent; border: 1.5px solid #8a5d10; }
+    .status.s-paused { color: #8a5d10; }
+    .status.s-paused::before { background: #8a5d10; }
     .bar { height: 6px; background: var(--divider-color, #dcdcd8); border-radius: 999px; overflow: hidden; }
     .bar > div { height: 100%; background: #2f7a6b; border-radius: 999px; transition: width .5s linear; }
-    .meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--secondary-text-color, #6b6b67); margin: 8px 0 16px; }
-    .meta b { color: var(--primary-text-color, #1b1b1b); font-weight: 600; }
+    .meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--secondary-text-color, #6c6d69); margin: 8px 0 16px; }
+    .meta b { color: var(--primary-text-color, #1c1d1c); font-weight: 600; }
     .blocks { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
-    .block { border: 1px solid var(--divider-color, #d3d3cf); border-radius: 4px; padding: 12px; }
-    .block-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+    .block { border: 1px solid var(--divider-color, #d9d9d5); border-radius: 4px; padding: 12px; min-width: 0; }
+    .block-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
     .block-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
-    .win { font-size: 12px; color: var(--secondary-text-color, #6b6b67); }
-    .tiles { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); border-top: 1px solid var(--divider-color, #d3d3cf); border-left: 1px solid var(--divider-color, #d3d3cf); }
-    .tile { padding: 8px; border-right: 1px solid var(--divider-color, #d3d3cf); border-bottom: 1px solid var(--divider-color, #d3d3cf); min-width: 0; }
-    .tl { font-size: 11px; color: var(--secondary-text-color, #6b6b67); line-height: 1.3; overflow-wrap: anywhere; }
+    .win { font-size: 12px; color: var(--secondary-text-color, #6c6d69); }
+    .tiles { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); border-top: 1px solid var(--divider-color, #d9d9d5); border-left: 1px solid var(--divider-color, #d9d9d5); border-radius: 4px; overflow: hidden; }
+    .tile { padding: 8px; border-right: 1px solid var(--divider-color, #d9d9d5); border-bottom: 1px solid var(--divider-color, #d9d9d5); min-width: 0; }
+    .tl { font-size: 11px; color: var(--secondary-text-color, #6c6d69); line-height: 1.3; overflow-wrap: anywhere; }
     .tv { font-size: 18px; line-height: 1.25; font-weight: 600; font-variant-numeric: tabular-nums; }
     .rows { margin: 10px 0 0; }
-    .rows > div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--divider-color, #d3d3cf); font-size: 13px; }
-    .rows dt { color: var(--secondary-text-color, #6b6b67); }
+    .rows > div { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--divider-color, #d9d9d5); font-size: 13px; }
+    .rows dt { color: var(--secondary-text-color, #6c6d69); }
     .rows dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-    .foot { margin-top: 14px; display: grid; gap: 6px; font-size: 13px; border-top: 1px solid var(--divider-color, #d3d3cf); padding-top: 12px; }
+    .foot { margin-top: 14px; display: grid; gap: 6px; font-size: 13px; border-top: 1px solid var(--divider-color, #d9d9d5); padding-top: 12px; }
     .foot > div { display: flex; justify-content: space-between; gap: 12px; }
-    .foot dt { color: var(--secondary-text-color, #6b6b67); }
+    .foot dt { color: var(--secondary-text-color, #6c6d69); }
     .foot dd { margin: 0; text-align: right; min-width: 0; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .msg { padding: 12px; border: 1px dashed var(--divider-color, #b4b4af); font-size: 13px; line-height: 1.5; }
+    .msg { padding: 12px; border: 1px dashed var(--divider-color, #b9b9b4); border-radius: 4px; font-size: 13px; line-height: 1.5; }
     code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
   `;
 
@@ -102,6 +107,7 @@
 
     setConfig(config) {
       this._config = Object.assign({}, DEFAULTS, config || {});
+      if (this._config.fields !== null && !Array.isArray(this._config.fields)) this._config.fields = null;
       this._render();
     }
 
@@ -114,52 +120,78 @@
 
     static getStubConfig() { return Object.assign({}, DEFAULTS); }
 
+    /* true if the value is shown: everything when `fields` is not set */
+    _want(c, key) {
+      return !c.fields || c.fields.indexOf(key) !== -1;
+    }
+
     _tile(label, value) {
       return '<div class="tile"><div class="tl">' + esc(label) + '</div><div class="tv">' + value + '</div></div>';
     }
 
-    _block(title, d, c) {
+    _block(title, t, d, c) {
+      const w = (k) => this._want(c, t + '.' + k);
+      const tiles = [];
+      if (w('directories_enabled') || w('directories_total')) {
+        tiles.push(this._tile('Folders on', num(d.directories_enabled) + ' / ' + num(d.directories_total)));
+      }
+      if (w('files_total')) tiles.push(this._tile('Files in scope', num(d.files_total)));
+      if (w('files_pending')) tiles.push(this._tile('To do', num(d.files_pending)));
+      if (w('files_checked')) tiles.push(this._tile('Checked', num(d.files_checked)));
+      if (w('files_changed')) tiles.push(this._tile('Changed', num(d.files_changed)));
+      if (w('files_parked')) tiles.push(this._tile('Parked', num(d.files_parked)));
+
+      const rows = [];
+      if (c.show_details && w('target_lufs')) rows.push(['Target loudness', lufs(d.target_lufs)]);
+      if (c.show_details && w('next_schedule_change')) rows.push(['Next schedule change', when(d.next_schedule_change)]);
+
+      const showWindow = w('in_schedule_window');
+      if (!tiles.length && !rows.length && !showWindow) return '';
+
       return '<section class="block">'
         + '<div class="block-head"><span class="block-title">' + esc(title) + '</span>'
-        + '<span class="win">' + (d.in_schedule_window ? 'In window' : 'Outside window') + '</span></div>'
-        + '<div class="tiles">'
-        + this._tile('Folders on', num(d.directories_enabled) + ' / ' + num(d.directories_total))
-        + this._tile('Files in scope', num(d.files_total))
-        + this._tile('To do', num(d.files_pending))
-        + this._tile('Checked', num(d.files_checked))
-        + this._tile('Changed', num(d.files_changed))
-        + this._tile('Parked', num(d.files_parked))
+        + (showWindow ? '<span class="win">' + (d.in_schedule_window ? 'In window' : 'Outside window') + '</span>' : '')
         + '</div>'
-        + (c.show_details
-          ? '<dl class="rows"><div><dt>Target loudness</dt><dd>' + lufs(d.target_lufs) + '</dd></div>'
-            + '<div><dt>Next schedule change</dt><dd>' + when(d.next_schedule_change) + '</dd></div></dl>'
+        + (tiles.length ? '<div class="tiles">' + tiles.join('') + '</div>' : '')
+        + (rows.length
+          ? '<dl class="rows">' + rows.map((r) => '<div><dt>' + esc(r[0]) + '</dt><dd>' + r[1] + '</dd></div>').join('') + '</dl>'
           : '')
         + '</section>';
     }
 
     _body(st, c) {
       const a = st.attributes || {};
+      const top = (k) => this._want(c, k);
       const audio = a.audio || {};
       const video = a.video || {};
       const status = String(st.state || '');
       const pct = Math.min(100, Math.max(0, Number(a.progress_percent) || 0));
 
       const blocks = [];
-      if (c.show_audio) blocks.push(this._block('Audio', audio, c));
-      if (c.show_video) blocks.push(this._block('Video', video, c));
+      if (c.show_audio) { const b = this._block('Audio', 'audio', audio, c); if (b) blocks.push(b); }
+      if (c.show_video) { const b = this._block('Video', 'video', video, c); if (b) blocks.push(b); }
+
+      const meta = [];
+      if (top('progress_percent')) meta.push('<span><b>' + pct.toFixed(1) + '%</b> complete</span>');
+      if (top('errors')) meta.push('<span>Errors <b>' + num(a.errors) + '</b></span>');
+
+      const foot = [];
+      if (c.show_details && top('current_file')) {
+        foot.push('<div><dt>Current file</dt><dd class="mono" title="' + esc(a.current_file || '') + '">' + esc(a.current_file || '—') + '</dd></div>');
+      }
+      if (c.show_details && top('last_run_finished')) {
+        foot.push('<div><dt>Last run finished</dt><dd>' + when(a.last_run_finished) + '</dd></div>');
+      }
 
       return '<div class="head"><div class="title">' + esc(c.title) + '</div>'
-        + '<div class="status s-' + esc(status) + '">' + esc(cap(status)) + '</div></div>'
-        + '<div class="bar" role="progressbar" aria-valuenow="' + pct + '" aria-valuemin="0" aria-valuemax="100"><div style="width:' + pct + '%"></div></div>'
-        + '<div class="meta"><span><b>' + pct.toFixed(1) + '%</b> complete</span>'
-        + '<span>Errors <b>' + num(a.errors) + '</b></span></div>'
-        + '<div class="blocks">' + blocks.join('') + '</div>'
-        + (c.show_details
-          ? '<dl class="foot">'
-            + '<div><dt>Current file</dt><dd class="mono" title="' + esc(a.current_file || '') + '">' + esc(a.current_file || '—') + '</dd></div>'
-            + '<div><dt>Last run finished</dt><dd>' + when(a.last_run_finished) + '</dd></div>'
-            + '</dl>'
-          : '');
+        + (top('status') ? '<div class="status s-' + esc(status) + '">' + esc(cap(status)) + '</div>' : '')
+        + '</div>'
+        + (top('progress_percent')
+          ? '<div class="bar" role="progressbar" aria-valuenow="' + pct + '" aria-valuemin="0" aria-valuemax="100"><div style="width:' + pct + '%"></div></div>'
+          : '')
+        + (meta.length ? '<div class="meta">' + meta.join('') + '</div>' : '<div style="height:8px"></div>')
+        + (blocks.length ? '<div class="blocks">' + blocks.join('') + '</div>' : '')
+        + (foot.length ? '<dl class="foot">' + foot.join('') + '</dl>' : '');
     }
 
     _render() {
@@ -197,5 +229,5 @@
     });
   }
 
-  console.info('%c AUDIO-NORMALIZER-CARD %c v' + CARD_VERSION + ' ', 'color:#fff;background:#2e2e2e', 'color:#2e2e2e;background:#e7e7e5');
+  console.info('%c AUDIO-NORMALIZER-CARD %c v' + CARD_VERSION + ' ', 'color:#fff;background:#2f7a6b', 'color:#2f3130;background:#ebebe9');
 })();
