@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio Normalizer — UI mock-up</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">🔊 Audio Normalizer</div>
+      <nav id="nav">
+        <a href="#/dashboard" data-route="dashboard">Dashboard</a>
+        <a href="#/directories" data-route="directories">Directories</a>
+        <a href="#/parked" data-route="parked">Parked files <span class="pill" id="parkedBadge">0</span></a>
+        <a href="#/schedule" data-route="schedule">Schedule</a>
+        <a href="#/settings" data-route="settings">Normalization</a>
+        <a href="#/homeassistant" data-route="homeassistant">Home Assistant</a>
+      </nav>
+      <div class="sidebar-foot">v0.0 · UI mock-up · no backend</div>
+    </aside>
+    <div class="content">
+      <div class="ribbon">MOCK-UP — all data is simulated in your browser. Nothing is read from or written to disk.</div>
+      <main id="app" aria-live="polite"></main>
+    </div>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>
