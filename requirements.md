@@ -20,6 +20,7 @@ functionality:
 
 
 web page:
+
 base location of audio files can be set by user (provide mount in docker compose file)
 user enable/disable directories (including select all / select none), also show windows like directory treestructure.
 provide start / stop / browse function
