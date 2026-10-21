@@ -466,7 +466,7 @@
       + '<span>' + fmt(rs.checked) + ' of ' + fmt(rs.total) + ' files checked</span>'
       + '<span class="mono">current: ' + (r.current ? esc(r.current) : '—') + '</span></div>'
       + '<div class="run-types"><span class="muted">Process</span>'
-      + ALL.map((t) => '<label class="inline"><input type="checkbox" data-run-type="' + t + '"'
+      + ALL.map((t) => '<label class="inline"><input class="switch" type="checkbox" data-run-type="' + t + '"'
         + (r.types[t] ? ' checked' : '') + (r.status !== 'stopped' ? ' disabled' : '') + '> ' + MEDIA[t].label + '</label>').join('')
       + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '<span class="muted">Switches can be changed while stopped.</span>')
       + '</div>'
@@ -600,7 +600,7 @@
       + '<button class="btn btn-sm" data-action="preset" data-preset="never">Never</button>'
       + '</div>'
       + '<div class="sched-wrap"><table class="sched"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'
-      + '<div class="legend"><span><span class="swatch" style="background:#2e2e2e"></span>processing allowed</span>'
+      + '<div class="legend"><span><span class="swatch" style="background:var(--accent)"></span>processing allowed</span>'
       + '<span><span class="swatch" style="background:#dcdcd8"></span>paused</span>'
       + '<span id="sched-now"></span></div>'
       + '</section>'
@@ -664,7 +664,7 @@
       + '<div class="slider-row"><input id="th-' + t + '" type="range" min="1" max="12" step="0.5" value="' + cfg.threshold + '" data-scope="' + t + '" data-setting="threshold">'
       + '<div class="val"><span data-out="' + t + '.threshold">' + cfg.threshold.toFixed(1) + '</span> dB</div></div>'
       + '<p class="help">Changes bigger than this are parked for review instead of being applied.</p></div>'
-      + '<label class="check"><input type="checkbox" data-scope="' + t + '" data-setting="override"' + (cfg.override ? ' checked' : '') + '>'
+      + '<label class="check"><input class="switch" type="checkbox" data-scope="' + t + '" data-setting="override"' + (cfg.override ? ' checked' : '') + '>'
       + '<span><strong>Override the confirmation for large changes</strong><br><span class="muted">Apply changes above the threshold automatically, without parking them.</span></span></label>'
       + (cfg.override ? '<div class="notice">Large ' + MEDIA[t].label.toLowerCase() + ' changes will be applied without review.</div>' : '')
       + '</section>';
@@ -702,7 +702,7 @@
       '<button class="btn" data-action="settings-reset">Reset ' + MEDIA[t].label.toLowerCase() + '</button>'
       + '<button class="btn btn-primary" data-action="settings-save">Save</button>', true)
       + '<section class="card"><div class="check-list">'
-      + '<label class="check" style="padding-top:0"><input type="checkbox" data-scope="general" data-setting="dryRun"' + (g.dryRun ? ' checked' : '') + '>'
+      + '<label class="check" style="padding-top:0"><input class="switch" type="checkbox" data-scope="general" data-setting="dryRun"' + (g.dryRun ? ' checked' : '') + '>'
       + '<span><strong>Dry run</strong><br><span class="muted">Analyse and report only. Nothing is written. Recommended for the first run on a real library.</span></span></label>'
       + '<p class="small muted" style="padding-top:12px;border-top:1px solid var(--line)">Web access has no login (local network only, as chosen). '
       + 'Do not forward the port to the internet. The Home Assistant API still requires its access token.</p>'
@@ -729,7 +729,7 @@
       '<button class="btn btn-primary" data-action="ha-save">Save</button>')
       + '<div class="split-2" style="margin-top:0">'
       + '<section class="card"><h2 style="margin-bottom:14px">Connection</h2>'
-      + '<label class="check" style="padding-top:0"><input type="checkbox" data-ha="enabled"' + (h.enabled ? ' checked' : '') + '>'
+      + '<label class="check" style="padding-top:0"><input class="switch" type="checkbox" data-ha="enabled"' + (h.enabled ? ' checked' : '') + '>'
       + '<span><strong>Enable the Home Assistant API</strong><br><span class="muted">Requests without a valid token are refused.</span></span></label>'
       + '<div class="field" style="margin-top:14px"><label class="lbl" for="ha-url">Home Assistant URL</label>'
       + '<input class="input" id="ha-url" data-ha="url" value="' + esc(h.url) + '"></div>'
