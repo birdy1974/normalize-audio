@@ -78,3 +78,7 @@ Full-width layout tip: put the card in a *Panel* or a *Grid* section with one co
 - **"Entity was not found"**: the REST sensor is missing or has a different entity name. Check *Developer tools → States* for `audio_normalizer`.
 - **"The entity is unavailable"**: the container cannot be reached, or the token is wrong. Check the REST sensor under *Settings → Devices & services → REST*.
 - **Card does not appear in the picker**: clear the browser cache after adding the resource.
+
+## Version
+
+This is card version 1.1.0. Version 1.1.0 adds the `fields` option (see the table above). Version 1.0.0 showed all values and had no `fields` option.

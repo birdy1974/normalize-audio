@@ -161,6 +161,8 @@ volumes:
 | Schedule (days, weeks, times) | Weekly 7×24 grid with presets; "finish current file" or "pause now" at window end. |
 | New files detected, persistent | Periodic scan + SQLite fingerprints; state survives restarts. |
 | Warning + park large changes, no waiting | Files above the threshold get status `parked`; the run continues; review page. |
+| Review of parked files (mock-up v4.1) | Each parked file shows the original and the new change needed; adjust it by ±0.1 dB (buttons or a −12…+12 dB slider), or several at once via multi-select; then apply or skip. Changes are stored as an offset from the measured gain. |
+| Helptips instead of help text (mock-up v4.1) | Descriptions appear as an information icon with a popup on hover/focus; the page keeps only its intro text and status messages. |
 | Override confirmation for large changes | Toggle in settings (applies large changes automatically). |
 | Home Assistant sensors | REST API, grouped by media type: status, progress %, errors, and per type: folders, files in scope, pending, checked, changed, parked, target LUFS, next schedule change. |
 | Dashboard (4 numbers) | Per media type: folders/files in scope · files to do · files checked · files actually changed. |
