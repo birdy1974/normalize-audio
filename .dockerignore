@@ -1,0 +1,17 @@
+.git
+.gitignore
+.pytest_cache
+**/__pycache__
+**/*.pyc
+*.db
+*.db-journal
+tests
+docs
+mockup
+lovelace
+requirements-dev.txt
+requirements.md
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore

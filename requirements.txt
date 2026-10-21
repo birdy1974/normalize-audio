@@ -1,0 +1,6 @@
+# Runtime dependencies (Python 3.12). Versions are the ones the test suite ran against.
+fastapi==0.159.1
+starlette==1.9.0
+pydantic==2.14.1
+uvicorn==0.54.0
+httpx==0.28.1

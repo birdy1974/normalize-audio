@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Local state and generated data (the app keeps its state in /config, outside the repository)
+*.db
+*.db-journal
+/config/
+/data/

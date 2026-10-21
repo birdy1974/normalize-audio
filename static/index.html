@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio Normalizer</title>
+  <link rel="stylesheet" href="/static/styles.css?v=5">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-top">
+        <div class="brand"><span class="logo" aria-hidden="true"></span><span class="brand-text">Audio Normalizer</span></div>
+        <div class="menu-tools">
+          <button type="button" class="icon-btn" id="menu-collapse" aria-label="Collapse menu" title="Collapse menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+          </button>
+          <button type="button" class="icon-btn" id="menu-pin" aria-pressed="true" aria-label="Pin menu" title="Pinned: menu stays as it is">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6l-1 6 3 3H7l3-3z"/><path d="M12 12v9"/></svg>
+          </button>
+        </div>
+      </div>
+      <nav id="nav" aria-label="Main">
+        <a href="#/dashboard" data-route="dashboard" title="Dashboard"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span class="nav-text">Dashboard</span></span></a>
+        <a href="#/directories" data-route="directories" title="Directories"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="nav-text">Directories</span></span></a>
+        <a href="#/parked" data-route="parked" title="Parked files"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><span class="nav-text">Parked files <span class="count-badge" id="parkedBadge">0</span></span></span></a>
+        <a href="#/schedule" data-route="schedule" title="Schedule"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg><span class="nav-text">Schedule</span></span></a>
+        <a href="#/settings" data-route="settings" title="Settings"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></svg><span class="nav-text">Settings</span></span></a>
+        <a href="#/homeassistant" data-route="homeassistant" title="Home Assistant"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span class="nav-text">Home Assistant</span></span></a>
+      </nav>
+      <div class="sidebar-foot">Audio Normalizer · local network only</div>
+    </aside>
+    <main class="content">
+      <div id="app" aria-live="polite"></div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/static/audio-normalizer-card.js?v=5"></script>
+  <script src="/static/app.js?v=5"></script>
+</body>
+</html>
