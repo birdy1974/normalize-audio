@@ -339,6 +339,9 @@
     };
   }
 
+  const MAIN_ATTRS = ['progress_percent', 'errors', 'current_file', 'last_run_finished', 'audio', 'video'];
+  const MAIN_NAME = 'Audio Normalizer';
+
   function haYaml() {
     const en = state.ha.sensors.filter((x) => x.enabled);
     let y = 'rest:\n'
@@ -346,25 +349,43 @@
       + '    headers:\n'
       + '      Authorization: "Bearer <YOUR_TOKEN>"\n'
       + '    scan_interval: 60\n'
-      + '    sensor:\n';
+      + '    sensor:\n'
+      + '      # main entity: state = run status, attributes = full payload (used by the Lovelace card)\n'
+      + '      - name: "' + MAIN_NAME + '"\n'
+      + '        unique_id: audio_normalizer_main\n'
+      + '        value_template: "{{ value_json.status }}"\n'
+      + '        json_attributes:\n'
+      + MAIN_ATTRS.map((k) => '          - ' + k + '\n').join('')
+      + '        icon: mdi:waveform\n';
     en.forEach((x) => {
       const uid = 'audio_normalizer_' + x.path.replace(/\./g, '_');
-      y += '      - name: "' + x.name.replace(/"/g, '') + '"\n'
+      y += '      # optional single sensor\n'
+        + '      - name: "' + x.name.replace(/"/g, '') + '"\n'
         + '        unique_id: ' + uid + '\n'
         + '        value_template: "{{ value_json.' + x.path + ' }}"\n';
       if (x.unit) y += '        unit_of_measurement: "' + x.unit + '"\n';
       if (x.deviceClass) y += '        device_class: ' + x.deviceClass + '\n';
       if (x.icon) y += '        icon: ' + x.icon + '\n';
     });
-    if (!en.length) y += '      []\n';
     return y;
   }
+
+  const CARD_YAML = 'type: custom:audio-normalizer-card\nentity: sensor.audio_normalizer\ntitle: Audio Normalizer\nshow_audio: true\nshow_video: true\nshow_details: true\n';
 
   function refreshHaPreview() {
     const j = document.getElementById('ha-json');
     if (j) j.textContent = JSON.stringify(apiPayload(), null, 2);
     const y = document.getElementById('ha-yaml');
     if (y) y.textContent = haYaml();
+    const card = document.getElementById('card-preview');
+    if (card && typeof card.setConfig === 'function') {
+      if (!card._mockReady) {
+        card.setConfig({ entity: 'sensor.audio_normalizer', title: 'Audio Normalizer', show_audio: true, show_video: true, show_details: true });
+        card._mockReady = true;
+      }
+      const p = apiPayload();
+      card.hass = { states: { 'sensor.audio_normalizer': { state: p.status, attributes: p } } };
+    }
   }
 
   /* ----------------------------------------------------------- components */
@@ -579,8 +600,8 @@
       + '<button class="btn btn-sm" data-action="preset" data-preset="never">Never</button>'
       + '</div>'
       + '<div class="sched-wrap"><table class="sched"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'
-      + '<div class="legend"><span><span class="swatch" style="background:var(--accent)"></span>processing allowed</span>'
-      + '<span><span class="swatch" style="background:#ececea"></span>paused</span>'
+      + '<div class="legend"><span><span class="swatch" style="background:#2e2e2e"></span>processing allowed</span>'
+      + '<span><span class="swatch" style="background:#dcdcd8"></span>paused</span>'
       + '<span id="sched-now"></span></div>'
       + '</section>'
       + '<div class="split-2">'
@@ -704,7 +725,7 @@
     }).join('');
 
     app().innerHTML = pageHead('Home Assistant',
-      'Publishes the normalizer status as a local, token-protected API. Home Assistant reads it with RESTful sensors.',
+      'Publishes the normalizer status as a local, token-protected API. Home Assistant reads it with RESTful sensors, and the Lovelace card shows every value.',
       '<button class="btn btn-primary" data-action="ha-save">Save</button>')
       + '<div class="split-2" style="margin-top:0">'
       + '<section class="card"><h2 style="margin-bottom:14px">Connection</h2>'
@@ -723,8 +744,27 @@
       + '<pre>GET http://&lt;NAS-IP&gt;:8080/api/v1/ha/status\nAuthorization: Bearer &lt;token&gt;</pre>'
       + '<h2 style="margin:18px 0 10px">Current payload</h2><pre id="ha-json"></pre></section>'
       + '</div>'
+
+      + '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Lovelace card</h2>'
+      + '<div class="sub">One file that shows every parameter on a Home Assistant dashboard. No extra software.</div></div>'
+      + '<a class="btn btn-primary" href="lovelace/audio-normalizer-card.js" download="audio-normalizer-card.js">Download card (.js)</a></div>'
+      + '<div class="lovelace-wrap">'
+      + '<div><h2 style="margin-bottom:10px">Install in 3 steps</h2>'
+      + '<ol class="steps">'
+      + '<li>Copy the file to <span class="mono">/config/www/audio-normalizer-card.js</span></li>'
+      + '<li>Settings → Dashboards → Resources → add <span class="mono">/local/audio-normalizer-card.js</span>, type <em>JavaScript module</em></li>'
+      + '<li>Edit a dashboard → add card → Audio Normalizer, or paste this YAML:</li>'
+      + '</ol>'
+      + '<pre style="margin-top:10px">' + esc(CARD_YAML) + '</pre>'
+      + '<p class="help">Also on GitHub: <span class="mono">lovelace/audio-normalizer-card.js</span>. Details and troubleshooting: <span class="mono">lovelace/README.md</span>.</p>'
+      + '</div>'
+      + '<div><h2 style="margin-bottom:10px">Preview (live, from the simulated payload)</h2>'
+      + '<div class="preview-stage"><audio-normalizer-card id="card-preview"></audio-normalizer-card></div>'
+      + '<p class="help">The preview uses the same file you download. It updates as you start, pause or change settings.</p></div>'
+      + '</div></section>'
+
       + '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Sensors</h2>'
-      + '<div class="sub">Choose which values become Home Assistant sensors and how they are named.</div></div></div>'
+      + '<div class="sub">Optional single sensors in addition to the main entity. The main entity is always created and feeds the card.</div></div></div>'
       + '<div class="table-wrap"><table><thead><tr><th>On</th><th>Sensor name</th><th>Source in payload</th><th>Unit</th><th>Device class</th></tr></thead>'
       + '<tbody>' + sensorRows + '</tbody></table></div></section>'
       + '<section class="card" style="margin-top:16px"><h2 style="margin-bottom:12px">Generated configuration.yaml</h2>'

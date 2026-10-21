@@ -1,6 +1,6 @@
 # audio-normalizer — architecture proposal
 
-Status: **decisions Q1–Q6 recorded (see §5).** Next gate: review the UI mock-up. Backend implementation starts after your sign-off on the mock-up. Q7–Q8 defaults are assumed. No backend code has been written yet.
+Status: **decisions Q1–Q6 recorded (see §5).** Mock-up v3 (grey, square, side menu at all widths, Lovelace card) is ready for review. Next gate: review the UI mock-up. Backend implementation starts after your sign-off on the mock-up. Q7–Q8 defaults are assumed. No backend code has been written yet.
 The UI mock-up lives in [`mockup/`](../mockup/README.md).
 
 Target: Synology DS918+ (Intel Celeron J3455, Apollo Lake, Intel HD Graphics 500, x86_64) running Docker / Container Manager.
@@ -214,6 +214,8 @@ Example payload (structure taken from the mock-up; values are sample numbers):
 Sensors use dotted paths, for example `audio.files_total` → `{{ value_json.audio.files_total }}`. The mock-up's Home Assistant page groups sensors into Overall, Audio and Video.
 
 Home Assistant side: RESTful sensors (generated YAML snippet is shown on the Home Assistant page of the mock-up). Decided for v1: **REST only** (Q4). MQTT discovery or a HACS custom integration are not planned for v1.
+
+**Main entity and Lovelace card.** The generated YAML creates one main REST sensor, `sensor.audio_normalizer`. Its state is the run status, and its attributes hold the complete payload above (`json_attributes`). The optional single sensors are added on top of it. A custom Lovelace card, `lovelace/audio-normalizer-card.js`, reads only this one entity and shows every parameter: run status, progress, audio and video counters, parked files, target loudness, next schedule change, errors, current file and last run. The card is a single file with no dependencies, follows the Home Assistant theme, and is downloaded from the mock-up or taken from the repository. Home Assistant needs it in `/config/www/` and loads it as `/local/audio-normalizer-card.js`; a raw GitHub URL does not work as a module resource (see `lovelace/README.md`).
 
 Security: the endpoint is protected by the bearer token. The web UI itself has no login (Q5), so keep the port on the local network and do not forward it to the internet.
 

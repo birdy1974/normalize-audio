@@ -23,10 +23,13 @@ python3 -m http.server 8080
 | Parked files | Audio / Video tabs. Files whose level change is above the threshold. They are not changed; the run continued. Apply or skip each one. |
 | Schedule | Audio / Video tabs, each with its own weekly 7×24 grid (click or drag), presets, the resulting windows per day, scan interval and behaviour at window close. |
 | Normalization | Audio / Video tabs. Global dry run, then per type: target loudness slider (LUFS), true-peak ceiling, large-change threshold, override for large changes, lossy-format strategy (gain-only default, re-encode, skip lossy), write mode (in place default, in place with backup, separate output folder), video audio and dry-run. |
-| Home Assistant | Connection and access token, local API endpoint with a live JSON payload (`audio` and `video` blocks), sensor definitions grouped by type, and generated `configuration.yaml` snippet. |
+| Home Assistant | Connection and access token, local API endpoint with a live JSON payload, the **Lovelace card** (download, 3 install steps, YAML, live preview of the same file), sensor definitions grouped by type, and generated `configuration.yaml` snippet with the main `sensor.audio_normalizer` entity. |
 
 ## Notes
 
+- Style: greyscale only (no accent colour), square corners everywhere, custom square checkboxes, radios and sliders. The side menu stays on the left at every width; on narrow screens it becomes a narrow rail.
+- `lovelace/` in the repository is linked here as `mockup/lovelace`, so the Download button and the live card preview use the same file as the repository.
+- Preview of the card: `index.html` loads `lovelace/audio-normalizer-card.js` and feeds it the simulated payload.
 - Library contents, statuses and timings are random but deterministic (seeded).
 - "Run" advances about two files per second while it is running, for the media types selected with the Process switches.
 - Save buttons only show a message; settings are not persisted in the mock-up.
