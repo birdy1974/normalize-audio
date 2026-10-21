@@ -87,7 +87,7 @@
 
   const DEFAULT_SETTINGS = {
     target: -16, truePeak: -1, threshold: 6, override: false,
-    lossy: 'gain', videos: true, backup: true, dryRun: false,
+    lossy: 'gain', videos: true, writeMode: 'inplace', outputDir: '/data/normalized', dryRun: false,
   };
 
   function defaultSchedule() {
@@ -328,6 +328,13 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
     return '<span class="st st-' + st + '">' + STATUS_LABEL[st] + '</span>';
   }
 
+  function writeModeLabel() {
+    const m = state.settings.writeMode;
+    if (m === 'backup') return 'replace in place, <strong>backup kept</strong>';
+    if (m === 'output') return 'separate output folder <code>' + esc(state.settings.outputDir) + '</code>';
+    return 'replace in place (no backup)';
+  }
+
   function renderDashboard() {
     const s = stats();
     const r = state.run;
@@ -377,6 +384,7 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
       + '<li><span>Errors in this run</span><span><strong>' + s.errors + '</strong></span></li>'
       + '<li><span>Last run finished</span><span>' + (r.lastRun ? r.lastRun.toLocaleString('en-GB') : 'never') + '</span></li>'
       + '<li><span>Large-change override</span><span>' + (state.settings.override ? '<strong>on</strong> — applied without review' : 'off') + '</span></li>'
+      + '<li><span>Write mode</span><span>' + writeModeLabel() + '</span></li>'
       + '<li><span>Dry run</span><span>' + (state.settings.dryRun ? '<strong>on</strong> — nothing is written' : 'off') + '</span></li>'
       + '</ul></div>'
       + '<div class="card"><h2>Recent activity</h2><ul class="log">' + (logs || '<li><span class="muted">No activity yet.</span></li>') + '</ul></div>'
@@ -527,15 +535,29 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
       ['gain', 'Gain only — change the level without re-encoding', 'MP3 via mp3gain, AAC via aacgain. Audio data is untouched. Level steps are about 1.5 dB, so the target is hit within ±0.75 dB.', true],
       ['reencode', 'Re-encode at the same codec and bitrate', 'Exact target level, but every re-encode adds a small generation loss.', false],
       ['skip-lossy', 'Skip lossy files', 'Only lossless files (FLAC, WAV) are normalized; MP3/AAC/WMA/OGG are left alone.', false],
-    ].map(([v, t, d, rec]) => '<label class="opt"><input type="radio" name="lossy" value="' + v + '" data-setting="lossy"'
-      + (s.lossy === v ? ' checked' : '') + '><span><strong>' + t + '</strong>' + (rec ? '<span class="tag">recommended</span>' : '')
+    ].map(([v, t, d, def]) => '<label class="opt"><input type="radio" name="lossy" value="' + v + '" data-setting="lossy"'
+      + (s.lossy === v ? ' checked' : '') + '><span><strong>' + t + '</strong>' + (def ? '<span class="tag">default</span>' : '')
       + '<br><span class="muted">' + d + '</span></span></label>').join('');
+
+    const writeOpts = [
+      ['inplace', 'Replace in place (default)', 'After verification the file is replaced. No copy of the original is kept.'],
+      ['backup', 'Replace in place, keep a backup', 'The original is copied to /config/backups first. Needs extra disk space.'],
+      ['output', 'Write to a separate output folder', 'The library is never touched. Normalized copies go to the folder below.'],
+    ].map(([v, t, d]) => '<label class="opt"><input type="radio" name="writeMode" value="' + v + '" data-setting="writeMode"'
+      + (s.writeMode === v ? ' checked' : '') + '><span><strong>' + t + '</strong><br><span class="muted">' + d + '</span></span></label>').join('');
+    const outField = s.writeMode === 'output'
+      ? '<div class="field" style="margin:4px 0 0 30px"><label class="lbl" for="s-out">Output folder (inside the container)</label>'
+        + '<input class="input" id="s-out" data-setting="outputDir" value="' + esc(s.outputDir) + '">'
+        + '<p class="help">Mount it in docker-compose.yml, e.g. <code>/volume1/music-normalized:/data/normalized</code>.</p></div>'
+      : '';
 
     app().innerHTML = ''
       + '<header class="page-head"><div><h1>Normalization settings</h1>'
       + '<p class="muted">Global defaults for every enabled folder. Changes are saved to the app\u2019s config volume.</p></div>'
       + '<div class="btns"><button class="btn" data-action="settings-reset">Reset to defaults</button>'
       + '<button class="btn btn-primary" data-action="settings-save">Save settings</button></div></header>'
+      + '<div class="info-box" style="margin:0 0 16px">Web access has no login (local network only, as chosen). '
+      + 'Do not forward the port to the internet. The Home Assistant API is still protected by its access token.</div>'
       + '<div class="grid-2">'
       + '<section class="card"><h2>Output level</h2>'
       + '<div class="field"><label class="lbl" for="s-target">Target loudness (integrated, EBU R128)</label>'
@@ -556,10 +578,9 @@ const LIVE_ROUTES = ['dashboard', 'parked'];
       + '</section>'
       + '<section class="card"><h2>Quality &amp; file handling</h2>'
       + '<div class="field"><span class="lbl">Lossy formats (MP3, AAC, WMA, OGG, M4A)</span>' + lossy + '</div>'
+      + '<div class="field"><span class="lbl">How changed files are written</span>' + writeOpts + outField + '</div>'
       + '<label class="check"><input type="checkbox" data-setting="videos"' + (s.videos ? ' checked' : '') + '>'
-      + '<span><strong>Normalize the audio track of video files</strong><br><span class="muted">AVI, MKV, MP4. The video stream is copied, never re-encoded.</span></span></label>'
-      + '<label class="check"><input type="checkbox" data-setting="backup"' + (s.backup ? ' checked' : '') + '>'
-      + '<span><strong>Keep a backup of the original file</strong><br><span class="muted">Stored in <code>/config/backups</code> before the file is replaced.</span></span></label>'
+      + '<span><strong>Normalize the audio track of video files</strong><br><span class="muted">AVI, MKV, MP4. The video stream is copied, never re-encoded. GPU (VAAPI) video re-encoding is a possible later option.</span></span></label>'
       + '<label class="check"><input type="checkbox" data-setting="dryRun"' + (s.dryRun ? ' checked' : '') + '>'
       + '<span><strong>Dry run</strong><br><span class="muted">Analyse and report only. Nothing is written. Recommended for the first run on a real library.</span></span></label>'
       + '</section></div>';

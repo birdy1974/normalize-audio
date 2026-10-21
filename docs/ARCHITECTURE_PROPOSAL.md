@@ -1,6 +1,6 @@
 # audio-normalizer — architecture proposal
 
-Status: **proposal, awaiting confirmation.** No backend code has been written yet.
+Status: **decisions Q1–Q6 recorded (see §5).** Next gate: review the UI mock-up. Backend implementation starts after your sign-off on the mock-up. Q7–Q8 defaults are assumed. No backend code has been written yet.
 The UI mock-up lives in [`mockup/`](../mockup/README.md).
 
 Target: Synology DS918+ (Intel Celeron J3455, Apollo Lake, Intel HD Graphics 500, x86_64) running Docker / Container Manager.
@@ -42,7 +42,7 @@ Changing the level and changing the quality are different things:
 - **Lossy formats** (MP3, AAC, OGG, WMA) can only be changed without quality loss by editing the codec's global gain field (`mp3gain`, `aacgain`), in steps of about 1.5 dB. Re-encoding a lossy file always adds a small generation loss.
 - **`loudnorm` in dynamic mode** changes dynamics. For this app the linear mode (`loudnorm=linear=true`) or a plain gain (`volume=…dB`) must be used instead.
 
-This is the main product decision — see question Q1 below.
+This is the main product decision — see Q1 in §5.
 
 ---
 
@@ -77,7 +77,7 @@ audio-normalizer/
 |---|---|---|
 | Backend | **Python 3.12 + FastAPI** | Good ffmpeg / audio tooling, one process, easy to test. |
 | Audio engine | **ffmpeg** (`ebur128`, `volume`, copy-video mapping) | Handles every container requested (mp3, flac, avi, mkv, m4a, ogg, wav, wma). |
-| Lossy gain | **mp3gain / aacgain** (only if Q1 = gain-only) | Lossless gain change for MP3/AAC. |
+| Lossy gain | **mp3gain / aacgain** (default lossy strategy, Q1) | Lossless gain change for MP3/AAC. |
 | State | **SQLite** in `/config` | Survives restarts; stores per-file fingerprint (path, size, mtime, hash), status, gain, history. |
 | Scheduler | Own weekly-window logic (not cron) | Simple "days + hours" grid in the UI; no external daemon. |
 | Frontend | Vanilla JS (as in the mock-up) | No build step, small image, easy to maintain on a NAS. |
@@ -91,7 +91,10 @@ audio-normalizer/
    - |gain| < 0.5 dB → `ok` (no change).
    - |gain| > threshold (default 6 dB) and override off → **`parked`** (not changed; the run continues with the next file).
    - otherwise → `changed`.
-4. **Apply** — write to a temporary file in the same folder, verify with ffprobe (duration, stream count, codec unchanged), copy timestamps and permissions, then atomic rename. Optional backup of the original first.
+4. **Apply** — write to a temporary file, verify with ffprobe (duration, stream count, codec unchanged), copy timestamps and permissions, then atomic rename. Write mode is a user setting (Q2, confirmed), default **in place, no backup**:
+   - *Replace in place* (default): temp file in the same folder, then atomic rename over the original.
+   - *Replace in place, keep backup*: original copied to `/config/backups` first (needs extra disk space).
+   - *Separate output folder*: normalized copy written to a second mounted folder; the library is never modified.
 5. **Record** — update the database; the new fingerprint prevents re-processing after restart.
 
 Crash safety: temp files are named with a fixed prefix and removed at startup; unfinished jobs are re-queued.
@@ -101,13 +104,15 @@ Crash safety: temp files are named with a fixed prefix and removed at startup; u
 | Input | Default method | Quality impact |
 |---|---|---|
 | FLAC, WAV, ALAC | Re-encode losslessly at the same bit depth | None (gain only) |
-| MP3 | `mp3gain` (global gain field) | None (1.5 dB steps → target accuracy ±0.75 dB) |
+| MP3 | `mp3gain` (global gain field) — **default** | None (1.5 dB steps → target accuracy ±0.75 dB) |
 | AAC / M4A | `aacgain` | None (same 1.5 dB steps) |
 | OGG / Opus | Opus/Vorbis gain header (R128_TRACK_GAIN) | None — to be verified in the prototype |
-| WMA | Re-encode at same bitrate | Small generation loss (alternative: skip, see Q1) |
+| WMA | Re-encode at same bitrate | Small generation loss (or skip, see Q1) |
 | AVI / MKV / MP4 | Audio re-encoded, **video stream copied** | Audio only; video untouched |
 
 The exact tool mapping is a prototype task; the table is the target behaviour.
+
+**Lossy strategy is a user setting** (Q1, confirmed): *Gain only* (default) · *Re-encode at same bitrate* · *Skip lossy files*. Lossless files are always handled by lossless gain.
 
 ---
 
@@ -117,7 +122,7 @@ The exact tool mapping is a prototype task; the table is the target behaviour.
 |---|---|
 | Normalize all files incl. sub-directories | Recursive scanner over enabled directories (tree in UI). |
 | Same sound level for all files | Target loudness (LUFS) slider; every file is brought to it. |
-| Quality not changed | Gain-only / lossless strategies (see §1.3 and Q1). |
+| Quality not changed | Default gain-only strategy for lossy files; lossless gain for FLAC/WAV; user can choose re-encode or skip (see §1.3, Q1). |
 | Schedule (days, weeks, times) | Weekly 7×24 grid with presets; "finish current file" or "pause now" at window end. |
 | New files detected, persistent | Periodic scan + SQLite fingerprints; state survives restarts. |
 | Warning + park large changes, no waiting | Files above the threshold get status `parked`; the run continues; review page. |
@@ -126,6 +131,7 @@ The exact tool mapping is a prototype task; the table is the target behaviour.
 | Dashboard (4 numbers) | Directories/files in scope · files to do · files checked · files actually changed. |
 | Start / stop / browse | Run controls on dashboard; tree browser on Directories page. |
 | Base location set by user | Compose volume mount; shown in UI, not changeable in the browser (safety). |
+| Write behaviour | Settings: in place (default) · in place with backup · separate output folder (Q2). |
 | Docker on DS918+ | `docker-compose.yml` for Container Manager; `/dev/dri` optional. |
 
 ---
@@ -156,36 +162,42 @@ Example payload (values come from the mock-up state):
 }
 ```
 
-Home Assistant side: RESTful sensors (generated YAML snippet is shown in the mock-up's settings page). Optional later: MQTT discovery or a HACS custom integration (see Q5).
+Home Assistant side: RESTful sensors (generated YAML snippet is shown on the Home Assistant page of the mock-up). Decided for v1: **REST only** (Q4). MQTT discovery or a HACS custom integration are not planned for v1.
+
+Security: the endpoint is protected by the bearer token. The web UI itself has no login (Q5), so keep the port on the local network and do not forward it to the internet.
 
 ---
 
-## 5. Open questions
+## 5. Decisions
 
-The mock-up assumes the defaults below. They are asked explicitly in the chat before implementation.
+Answers from the confirmation round:
+
+| # | Question | Decision |
+|---|---|---|
+| Q1 | Lossy files (MP3, AAC, WMA, OGG): how to change the level? | **User-selectable in Settings** — *Gain only* (default), *Re-encode at same bitrate*, *Skip lossy files*. |
+| Q2 | Write mode? | **User-selectable in Settings** — *Replace in place* (**default, no backup**), *Replace in place with backup*, *Separate output folder*. |
+| Q3 | Video files and VAAPI? | Audio track normalized, video copied. **No VAAPI in v1.** GPU video re-encoding is an optional later feature. |
+| Q4 | Home Assistant connection? | **REST endpoint only** (bearer token, RESTful sensors). |
+| Q5 | Web page access? | **No login — local network only.** The port must not be exposed to the internet. |
+| Q6 | Schedule window closes during a file? | **Finish the current file, then pause** (default). |
+
+Still open — defaults assumed unless you object:
 
 | # | Question | Default assumed |
 |---|---|---|
-| Q1 | How should lossy files (MP3, AAC, WMA, OGG) be changed? | Gain-only (no re-encode) |
-| Q2 | Write mode: replace files in place, or write to a separate output folder? | In place, atomic replace, optional backup |
-| Q3 | Video files (AVI/MKV/MP4): normalize their audio only? Use VAAPI? | Audio only, video copied, no VAAPI in v1 |
-| Q4 | Home Assistant: REST polling only, or also MQTT discovery / custom integration? | REST |
-| Q5 | Web UI access: LAN only without login, or username/password? | Username/password |
-| Q6 | Schedule window end: finish the current file, or pause immediately? | Finish current file |
-| Q7 | Preserve file timestamps (mtime) after changing a file? | Yes |
-| Q8 | Backend language: Python (FastAPI) or Node.js? | Python |
+| Q7 | Keep the original file's modification time after normalizing? | Yes |
+| Q8 | Backend language? | Python 3.12 + FastAPI |
 
-Also to confirm: the 4th dashboard item "how many files are actually checked" is read as **files actually changed** (level adjusted). The 3rd item ("files checked") is read as **files analysed**.
-
----
+Also interpreted as stated: dashboard item 3 "files checked" = files analysed; item 4 "files actually checked" = **files actually changed** (level adjusted).
 
 ## 6. Delivery plan (after confirmation)
 
 1. **Prototype (on the DS918+):** measure ffmpeg analysis speed; check `/dev/dri` and `vainfo`; verify gain-only MP3/AAC path and lossless FLAC path with sample files. Output: short report.
 2. **Core engine:** scanner, analyser, normalizer, scheduler, SQLite state, unit tests with generated audio.
-3. **API + web UI:** build from the approved mock-up; authentication per Q5.
+3. **API + web UI:** build from the approved mock-up. No login (Q5), so network exposure must be documented clearly in the install guide.
 4. **Home Assistant endpoint** and sensor definitions.
 5. **Docker image** (amd64) and `docker-compose.yml`; install guide for Container Manager.
 6. **Hardening:** dry-run mode, logs, health check, backup/restore of the config volume.
+7. **Later (optional):** GPU video re-encoding with VAAPI (Q3), once the audio engine is stable.
 
 Dry-run mode (analyse and report, never write) is recommended as the first thing to run on a real library.

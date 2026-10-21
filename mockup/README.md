@@ -22,7 +22,7 @@ python3 -m http.server 8080
 | Directories | Tree of the base location with per-folder checkboxes, tri-state parents, Select all / Select none, expand / collapse, and a file browser for the selected folder. |
 | Parked files | Files whose level change is above the threshold. They are not changed; the run continued. Apply or skip each one. |
 | Schedule | Weekly 7×24 grid (click or drag), presets, the resulting windows per day, scan interval and behaviour at window close. |
-| Normalization | Target loudness slider (LUFS), true-peak ceiling, large-change threshold, override for large changes, lossy-format strategy, video audio, backup and dry-run. |
+| Normalization | Target loudness slider (LUFS), true-peak ceiling, large-change threshold, override for large changes, lossy-format strategy (gain-only default, re-encode, skip lossy), write mode (in place default, in place with backup, separate output folder), video audio and dry-run. |
 | Home Assistant | Connection and access token, local API endpoint with a live JSON payload, sensor definitions, and generated `configuration.yaml` snippet. |
 
 ## Notes
