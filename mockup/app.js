@@ -40,6 +40,12 @@
   const rand = rng(20261021);
   const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 
+  const INFO_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.6v.4"/></svg>';
+  function tip(text) {
+    return '<span class="tip" tabindex="0" aria-label="' + esc(text) + '">' + INFO_ICON
+      + '<span class="tip-body" role="tooltip">' + esc(text) + '</span></span>';
+  }
+
   function toast(msg) {
     const t = document.getElementById('toast');
     t.textContent = msg;
@@ -473,10 +479,10 @@
       + '<div class="run-meta"><span><strong style="color:var(--text)">' + rs.percent + '%</strong> complete</span>'
       + '<span>' + fmt(rs.checked) + ' of ' + fmt(rs.total) + ' files checked</span>'
       + '<span class="mono">current: ' + (r.current ? esc(r.current) : '—') + '</span></div>'
-      + '<div class="run-types"><span class="muted">Process</span>'
+      + '<div class="run-types"><span class="muted">Process</span>' + tip('Switches can be changed while the run is stopped. A switched-off type is not processed.')
       + ALL.map((t) => '<label class="inline"><input class="switch" type="checkbox" data-run-type="' + t + '"'
         + (r.types[t] ? ' checked' : '') + (r.status !== 'stopped' ? ' disabled' : '') + '> ' + MEDIA[t].label + '</label>').join('')
-      + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '<span class="muted">Switches can be changed while stopped.</span>')
+      + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '')
       + '</div>'
       + (outside.length ? '<div class="notice">Running outside the schedule of ' + outside.map((t) => MEDIA[t].label).join(' and ')
         + ' (started manually). Stop the run to return to the schedule.</div>' : '')
@@ -566,8 +572,13 @@
   function parkedIds(t) {
     return entriesOf([t]).filter((e) => e.file.status === 'parked').map((e) => e.file.id);
   }
-  const clampAdjust = (v) => Math.max(-12, Math.min(12, Math.round(v * 10) / 10));
-  const effGain = (t, file) => gainFor(t, file) + (file.adjust || 0);
+  const PARK_RANGE = 12;                                   // dB, both ways
+  const tenth = (v) => Math.round(v * 10) / 10;
+  const effGain = (t, file) => tenth(gainFor(t, file) + (file.adjust || 0));
+  function setNewValue(t, file, v) {
+    const nv = Math.max(-PARK_RANGE, Math.min(PARK_RANGE, tenth(v)));
+    file.adjust = tenth(nv - gainFor(t, file));
+  }
 
   function renderParked() {
     const t = state.media;
@@ -577,17 +588,27 @@
     state.parkSel = state.parkSel.filter((id) => ids.includes(id));
     const sel = state.parkSel;
     const rows = list.map(({ node, file }) => {
+      const orig = gainFor(t, file);
       const g = effGain(t, file);
       const on = sel.includes(file.id);
       const fid = esc(file.id);
+      const segs = node.rel.split('/').filter(Boolean);
+      const folder = segs.slice(-2).join('/') || node.name;
+      const full = MEDIA[t].root + '/' + node.rel;
+      const warn = Math.abs(g) > th;
       return '<tr' + (on ? ' class="row-sel"' : '') + '>'
         + '<td class="pick"><input type="checkbox" data-park-check="' + fid + '" aria-label="Select ' + esc(file.name) + '"' + (on ? ' checked' : '') + '></td>'
-        + '<td>' + esc(file.name) + '</td><td class="dim mono">' + esc(MEDIA[t].root + '/' + node.rel) + '</td>'
+        + '<td class="file-cell">' + esc(file.name) + '</td>'
+        + '<td class="dim mono folder-cell" title="' + esc(full) + '">' + esc(folder) + '</td>'
         + '<td class="num">' + file.lufs.toFixed(1) + ' LUFS</td>'
-        + '<td class="num"><div class="stepper">'
-        + '<button class="btn btn-sm" data-action="adjust-file" data-file="' + fid + '" data-step="-0.5" aria-label="Reduce change by 0.5 dB">−</button>'
-        + '<span class="step-val' + (Math.abs(g) > th ? ' warn' : '') + '">' + fmtDb(g) + '</span>'
-        + '<button class="btn btn-sm" data-action="adjust-file" data-file="' + fid + '" data-step="0.5" aria-label="Increase change by 0.5 dB">+</button>'
+        + '<td class="chg"><div class="chg-vals">'
+        + '<span class="chg-orig" title="Original change">' + fmtDb(orig) + '</span>'
+        + '<span class="chg-arrow" aria-hidden="true">→</span>'
+        + '<strong class="chg-new' + (warn ? ' warn' : '') + '" data-park-new="' + fid + '">' + fmtDb(g) + '</strong></div>'
+        + '<div class="chg-ctl">'
+        + '<button class="btn btn-sm" data-action="adjust-file" data-file="' + fid + '" data-step="-0.1" aria-label="Decrease change by 0.1 dB">−</button>'
+        + '<input class="mini" type="range" min="-12" max="12" step="0.1" value="' + g + '" data-park-slider="' + fid + '" aria-label="Change for ' + esc(file.name) + '">'
+        + '<button class="btn btn-sm" data-action="adjust-file" data-file="' + fid + '" data-step="0.1" aria-label="Increase change by 0.1 dB">+</button>'
         + '</div></td>'
         + '<td class="actions"><button class="btn btn-sm btn-primary" data-action="approve" data-file="' + fid + '">Apply change</button>'
         + '<button class="btn btn-sm" data-action="skip" data-file="' + fid + '">Skip</button></td></tr>';
@@ -595,21 +616,23 @@
     const allOn = list.length > 0 && sel.length === list.length;
     const bulk = sel.length
       ? '<div class="bulk-bar"><span><strong>' + sel.length + '</strong> selected</span>'
-        + '<span class="bulk-steps"><button class="btn btn-sm" data-action="bulk-adjust" data-step="-0.5">− 0.5 dB</button>'
-        + '<button class="btn btn-sm" data-action="bulk-adjust" data-step="0.5">+ 0.5 dB</button></span>'
+        + '<span class="bulk-steps"><button class="btn btn-sm" data-action="bulk-adjust" data-step="-0.1">− 0.1 dB</button>'
+        + '<button class="btn btn-sm" data-action="bulk-adjust" data-step="0.1">+ 0.1 dB</button></span>'
         + '<span class="grow"></span>'
         + '<button class="btn btn-sm btn-primary" data-action="apply-selected">Apply selected</button>'
         + '<button class="btn btn-sm" data-action="clear-selection">Clear selection</button></div>'
       : '';
     app().innerHTML = pageHead('Parked files',
-      MEDIA[t].label + ' changes larger than <strong>' + th + ' dB</strong> are not applied. The run continued with the next file. Adjust a change with − and + (0.5 dB steps), then apply it.',
+      MEDIA[t].label + ' changes larger than <strong>' + th + ' dB</strong> are not applied. The run continued with the next file. Adjust a change, then apply it.',
       '<button class="btn btn-primary" data-action="approve-all"' + (list.length ? '' : ' disabled') + '>Apply all (' + list.length + ')</button>'
       + '<a class="btn" href="#/settings">Threshold</a>', true)
       + '<section class="card">'
       + (list.length
-        ? bulk + '<div class="table-wrap"><table><thead><tr>'
+        ? bulk + '<div class="table-wrap"><table class="parked"><colgroup>'
+          + '<col class="c-pick"><col class="c-file"><col class="c-folder"><col class="c-level"><col class="c-change"><col class="c-act">'
+          + '</colgroup><thead><tr>'
           + '<th class="pick"><input type="checkbox" data-park-all aria-label="Select all parked files"' + (allOn ? ' checked' : '') + '></th>'
-          + '<th>File</th><th>Folder</th><th class="num">Level</th><th class="num">Change needed</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+          + '<th>File</th><th>Folder</th><th class="num">Level</th><th>Change needed <span class="dim">(original → new)</span></th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
         : '<p class="muted">Nothing is parked in ' + MEDIA[t].label.toLowerCase() + '. Every checked file is within the threshold.</p>')
       + '</section>';
   }
@@ -663,11 +686,11 @@
       ['output', 'Write to a separate output folder', 'The library is never touched. Normalized copies go to the folder below.'],
     ].map(([v, title, d]) => '<label class="opt"><input type="radio" name="writeMode-' + t + '" value="' + v + '"'
       + ' data-scope="' + t + '" data-setting="writeMode"' + (cfg.writeMode === v ? ' checked' : '') + '>'
-      + '<span><strong style="font-weight:500">' + title + '</strong><br><span class="muted">' + d + '</span></span></label>').join('');
+      + '<span><strong style="font-weight:500">' + title + '</strong>' + tip(d) + '</span></label>').join('');
     const outField = cfg.writeMode === 'output'
-      ? '<div class="field" style="margin:4px 0 0 28px"><label class="lbl" for="out-' + t + '">Output folder (inside the container)</label>'
+      ? '<div class="field" style="margin:4px 0 0 28px"><label class="lbl" for="out-' + t + '">Output folder (inside the container)' + tip('Mount it in docker-compose.yml, for example /volume1/' + t + '-normalized:' + cfg.outputDir) + '</label>'
         + '<input class="input" id="out-' + t + '" data-scope="' + t + '" data-setting="outputDir" value="' + esc(cfg.outputDir) + '">'
-        + '<p class="help">Mount it in docker-compose.yml, for example <span class="mono">/volume1/' + t + '-normalized:' + cfg.outputDir + '</span></p></div>'
+        + '</div>'
       : '';
     return '<div class="field"><span class="lbl">How changed files are written</span>' + opts + outField + '</div>';
   }
@@ -675,20 +698,20 @@
   function levelCard(t) {
     const cfg = state.settings[t];
     return '<section class="card"><div class="card-head"><div><h2>Level</h2><div class="sub">Applies to ' + MEDIA[t].label.toLowerCase() + ' files</div></div></div>'
-      + '<div class="field"><label class="lbl" for="target-' + t + '">Target loudness (integrated, EBU R128)</label>'
+      + '<div class="field"><label class="lbl" for="target-' + t + '">Target loudness (integrated, EBU R128)' + tip('−16 LUFS suits podcasts and speech, −14 suits music streaming, −23 is the EBU broadcast standard.') + '</label>'
       + '<div class="slider-row"><input id="target-' + t + '" type="range" min="-30" max="-10" step="0.5" value="' + cfg.target + '" data-scope="' + t + '" data-setting="target">'
       + '<div class="val"><span data-out="' + t + '.target">' + cfg.target.toFixed(1) + '</span> LUFS</div></div>'
-      + '<p class="help">−16 LUFS suits podcasts and speech, −14 suits music streaming, −23 is the EBU broadcast standard.</p></div>'
-      + '<div class="field"><label class="lbl" for="tp-' + t + '">True-peak ceiling</label>'
+      + '</div>'
+      + '<div class="field"><label class="lbl" for="tp-' + t + '">True-peak ceiling' + tip('The gain is capped so that no sample exceeds this level, which prevents clipping.') + '</label>'
       + '<div class="slider-row"><input id="tp-' + t + '" type="range" min="-6" max="-1" step="0.1" value="' + cfg.truePeak + '" data-scope="' + t + '" data-setting="truePeak">'
       + '<div class="val"><span data-out="' + t + '.truePeak">' + cfg.truePeak.toFixed(1) + '</span> dBTP</div></div>'
-      + '<p class="help">The gain is capped so that no sample exceeds this level, which prevents clipping.</p></div>'
-      + '<div class="field"><label class="lbl" for="th-' + t + '">Large-change threshold</label>'
+      + '</div>'
+      + '<div class="field"><label class="lbl" for="th-' + t + '">Large-change threshold' + tip('Changes bigger than this are parked for review instead of being applied.') + '</label>'
       + '<div class="slider-row"><input id="th-' + t + '" type="range" min="1" max="12" step="0.5" value="' + cfg.threshold + '" data-scope="' + t + '" data-setting="threshold">'
       + '<div class="val"><span data-out="' + t + '.threshold">' + cfg.threshold.toFixed(1) + '</span> dB</div></div>'
-      + '<p class="help">Changes bigger than this are parked for review instead of being applied.</p></div>'
+      + '</div>'
       + '<label class="check"><input class="switch" type="checkbox" data-scope="' + t + '" data-setting="override"' + (cfg.override ? ' checked' : '') + '>'
-      + '<span><strong>Override the confirmation for large changes</strong><br><span class="muted">Apply changes above the threshold automatically, without parking them.</span></span></label>'
+      + '<span><strong>Override the confirmation for large changes</strong>' + tip('Apply changes above the threshold automatically, without parking them.') + '</span></label>'
       + (cfg.override ? '<div class="notice">Large ' + MEDIA[t].label.toLowerCase() + ' changes will be applied without review.</div>' : '')
       + '</section>';
   }
@@ -702,15 +725,15 @@
         ['skip-lossy', 'Skip lossy files', 'Only lossless files (FLAC, WAV) are normalized. MP3, AAC, WMA and OGG are left alone.', false],
       ].map(([v, title, d, def]) => '<label class="opt"><input type="radio" name="lossy" value="' + v + '" data-scope="audio" data-setting="lossy"'
         + (cfg.lossy === v ? ' checked' : '') + '><span><strong style="font-weight:500">' + title + '</strong>'
-        + (def ? '<span class="tag">default</span>' : '') + '<br><span class="muted">' + d + '</span></span></label>').join('');
+        + (def ? '<span class="tag">default</span>' : '') + tip(d) + '</span></label>').join('');
       return '<section class="card"><div class="card-head"><div><h2>Output</h2><div class="sub">Audio files</div></div></div>'
         + '<div class="field"><span class="lbl">Lossy formats (MP3, AAC, WMA, OGG, M4A)</span>' + lossy + '</div>'
         + writeOptions('audio') + '</section>';
     }
     const planned = '<label class="opt"><input type="radio" name="video-stream" checked disabled>'
-      + '<span><strong style="font-weight:500">Copy the video stream</strong><br><span class="muted">Used in this version. The video is never decoded or re-encoded.</span></span></label>'
+      + '<span><strong style="font-weight:500">Copy the video stream</strong>' + tip('Used in this version. The video is never decoded or re-encoded.') + '</span></label>'
       + '<label class="opt"><input type="radio" name="video-stream" disabled>'
-      + '<span><strong style="font-weight:500">Re-encode video on the GPU (VAAPI)</strong><span class="tag">planned</span><br><span class="muted">Possible later, as a separate option. Not available yet.</span></span></label>';
+      + '<span><strong style="font-weight:500">Re-encode video on the GPU (VAAPI)</strong><span class="tag">planned</span>' + tip('Possible later, as a separate option. Not available yet.') + '</span></label>';
     return '<section class="card"><div class="card-head"><div><h2>Output</h2><div class="sub">Video files (AVI, MKV, MP4)</div></div></div>'
       + '<div class="field"><span class="lbl">Video stream</span>' + planned + '</div>'
       + '<div class="notice info" style="margin:0 0 20px">The audio track is re-encoded with its original codec and bitrate, so the video is never touched.</div>'
@@ -721,15 +744,15 @@
     return '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Scheduling</h2>'
       + '<div class="sub">Applies to audio and video. The time windows are set on the Schedule tab.</div></div></div>'
       + '<div class="split-2" style="margin-top:0">'
-      + '<div class="field" style="margin:0"><label class="lbl" for="scan-every">Look for new or changed files every</label>'
+      + '<div class="field" style="margin:0"><label class="lbl" for="scan-every">Look for new or changed files every' + tip('New files are found automatically, also after a restart of the app.') + '</label>'
       + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + state.scanEvery + '">'
       + '<span class="muted small">minutes</span></div>'
-      + '<p class="help">New files are found automatically, also after a restart of the app.</p></div>'
+      + '</div>'
       + '<div class="field" style="margin:0"><span class="lbl">When a window closes during a file</span>'
       + '<label class="opt"><input type="radio" name="onclose" value="finish" data-sched="onClose"' + (state.onClose === 'finish' ? ' checked' : '') + '>'
-      + '<span><strong style="font-weight:500">Finish the current file, then pause</strong><br><span class="muted">Recommended. No half-written files.</span></span></label>'
+      + '<span><strong style="font-weight:500">Finish the current file, then pause</strong>' + tip('Recommended. No half-written files.') + '</span></label>'
       + '<label class="opt"><input type="radio" name="onclose" value="now" data-sched="onClose"' + (state.onClose === 'now' ? ' checked' : '') + '>'
-      + '<span><strong style="font-weight:500">Pause immediately</strong><br><span class="muted">The temporary file is discarded and retried in the next window.</span></span></label>'
+      + '<span><strong style="font-weight:500">Pause immediately</strong>' + tip('The temporary file is discarded and retried in the next window.') + '</span></label>'
       + '</div></div></section>';
   }
 
@@ -742,7 +765,7 @@
       + '<button class="btn btn-primary" data-action="settings-save">Save</button>', true)
       + '<section class="card"><div class="check-list">'
       + '<label class="check" style="padding-top:0"><input class="switch" type="checkbox" data-scope="general" data-setting="dryRun"' + (g.dryRun ? ' checked' : '') + '>'
-      + '<span><strong>Dry run</strong><br><span class="muted">Analyse and report only. Nothing is written. Recommended for the first run on a real library.</span></span></label>'
+      + '<span><strong>Dry run</strong>' + tip('Analyse and report only. Nothing is written. Recommended for the first run on a real library.') + '</span></label>'
       + '<p class="small muted" style="padding-top:12px;border-top:1px solid var(--line)">Web access has no login (local network only, as chosen). '
       + 'Do not forward the port to the internet. The Home Assistant API still requires its access token.</p>'
       + '</div></section>'
@@ -770,13 +793,13 @@
       + '<div class="split-2" style="margin-top:0">'
       + '<section class="card"><h2 style="margin-bottom:14px">Connection</h2>'
       + '<label class="check" style="padding-top:0"><input class="switch" type="checkbox" data-ha="enabled"' + (h.enabled ? ' checked' : '') + '>'
-      + '<span><strong>Enable the Home Assistant API</strong><br><span class="muted">Requests without a valid token are refused.</span></span></label>'
+      + '<span><strong>Enable the Home Assistant API</strong>' + tip('Requests without a valid token are refused.') + '</span></label>'
       + '<div class="field" style="margin-top:14px"><label class="lbl" for="ha-url">Home Assistant URL</label>'
       + '<input class="input" id="ha-url" data-ha="url" value="' + esc(h.url) + '"></div>'
-      + '<div class="field"><label class="lbl" for="ha-token">Long-lived access token</label>'
+      + '<div class="field"><label class="lbl" for="ha-token">Long-lived access token' + tip('Create it in Home Assistant under Profile, then Security, then Long-lived access tokens. Stored in the config volume and never written to logs.') + '</label>'
       + '<div class="input-row"><input class="input" id="ha-token" data-ha="token" autocomplete="off" type="' + (h.showToken ? 'text' : 'password') + '" value="' + esc(h.token) + '">'
       + '<button class="btn" data-action="ha-show">' + (h.showToken ? 'Hide' : 'Show') + '</button></div>'
-      + '<p class="help">Create it in Home Assistant under Profile, then Security, then Long-lived access tokens. Stored in the config volume and never written to logs.</p></div>'
+      + '</div>'
       + '<div class="btns"><button class="btn" data-action="ha-test">Test connection</button>'
       + '<span class="muted small">' + esc(h.testMsg) + '</span></div>'
       + '</section>'
@@ -789,18 +812,17 @@
       + '<div class="sub">One file that shows every parameter on a Home Assistant dashboard. No extra software.</div></div>'
       + '<a class="btn btn-primary" href="lovelace/audio-normalizer-card.js" download="audio-normalizer-card.js">Download card (.js)</a></div>'
       + '<div class="lovelace-wrap">'
-      + '<div><h2 style="margin-bottom:10px">Install in 3 steps</h2>'
+      + '<div><h2 style="margin-bottom:10px">Install in 3 steps' + tip('Also on GitHub: lovelace/audio-normalizer-card.js. Details and troubleshooting: lovelace/README.md.') + '</h2>'
       + '<ol class="steps">'
       + '<li>Copy the file to <span class="mono">/config/www/audio-normalizer-card.js</span></li>'
       + '<li>Settings → Dashboards → Resources → add <span class="mono">/local/audio-normalizer-card.js</span>, type <em>JavaScript module</em></li>'
       + '<li>Edit a dashboard → add card → Audio Normalizer, or paste this YAML:</li>'
       + '</ol>'
       + '<pre id="ha-card-yaml" style="margin-top:10px"></pre>'
-      + '<p class="help">Also on GitHub: <span class="mono">lovelace/audio-normalizer-card.js</span>. Details and troubleshooting: <span class="mono">lovelace/README.md</span>.</p>'
       + '</div>'
-      + '<div><h2 style="margin-bottom:10px">Preview (shows the enabled sensors)</h2>'
+      + '<div><h2 style="margin-bottom:10px">Preview (shows the enabled sensors)' + tip('The preview uses the same file you download. It shows only the sensors enabled below and updates when you change them.') + '</h2>'
       + '<div class="preview-stage"><audio-normalizer-card id="card-preview"></audio-normalizer-card></div>'
-      + '<p class="help">The preview uses the same file you download. It shows only the sensors enabled below and updates when you change them.</p></div>'
+      + '</div>'
       + '</div></section>'
 
       + '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Sensors</h2>'
@@ -876,7 +898,7 @@
       const entry = entriesOf(ALL).find((x) => x.file.id === el.dataset.file);
       if (entry) {
         entry.file.status = a === 'approve' ? 'changed' : 'skipped';
-        log(a === 'approve' ? 'ok' : 'info', entry.node.type, (a === 'approve' ? 'Change applied: ' : 'Skipped: ') + entry.file.name);
+        log(a === 'approve' ? 'ok' : 'info', entry.node.type, (a === 'approve' ? 'Change applied: ' : 'Skipped: ') + entry.file.name + (a === 'approve' ? ' (' + fmtDb(effGain(entry.node.type, entry.file)) + ')' : ''));
       }
     } else if (a === 'approve-all') {
       entriesOf([t]).forEach((x) => { if (x.file.status === 'parked') x.file.status = 'changed'; });
@@ -888,10 +910,10 @@
       state.log = [];
     } else if (a === 'adjust-file') {
       const entry = entriesOf(ALL).find((x) => x.file.id === el.dataset.file);
-      if (entry) entry.file.adjust = clampAdjust((entry.file.adjust || 0) + Number(el.dataset.step));
+      if (entry) setNewValue(entry.node.type, entry.file, effGain(entry.node.type, entry.file) + Number(el.dataset.step));
     } else if (a === 'bulk-adjust') {
       entriesOf(ALL).forEach((x) => {
-        if (state.parkSel.includes(x.file.id)) x.file.adjust = clampAdjust((x.file.adjust || 0) + Number(el.dataset.step));
+        if (state.parkSel.includes(x.file.id)) setNewValue(x.node.type, x.file, effGain(x.node.type, x.file) + Number(el.dataset.step));
       });
     } else if (a === 'apply-selected') {
       let n = 0;
@@ -924,6 +946,17 @@
     if (el.dataset.check !== undefined) {
       const n = findNode(el.dataset.check);
       if (n) subtreeNodes(n).forEach((x) => { x.enabled = el.checked; });
+      if (e.type === 'change') render();
+      return;
+    }
+
+    if (el.dataset.parkSlider !== undefined) {
+      const entry = entriesOf(ALL).find((x) => x.file.id === el.dataset.parkSlider);
+      if (entry) {
+        setNewValue(entry.node.type, entry.file, Number(el.value));
+        const out = document.querySelector('[data-park-new="' + el.dataset.parkSlider + '"]');
+        if (out) out.textContent = fmtDb(effGain(entry.node.type, entry.file));
+      }
       if (e.type === 'change') render();
       return;
     }
@@ -1010,6 +1043,11 @@
     if (painting === null) return;
     painting = null;
     updateScheduleInfo();
+  });
+
+  /* the info icon must not toggle the checkbox or radio of its label */
+  document.addEventListener('click', (e) => {
+    if (e.target.closest && e.target.closest('.tip')) e.preventDefault();
   });
 
   /* ------------------------------------------------------------------- menu */

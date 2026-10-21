@@ -370,6 +370,47 @@ tr.row-sel td { background: var(--accent-tint); }
 .bulk-steps { display: inline-flex; gap: 6px; }
 .card-head .btn { flex: none; }
 
+/* ---------- parked files: columns, original -> new change, mini slider ---------- */
+table.parked { table-layout: fixed; min-width: 920px; }
+table.parked col.c-pick { width: 40px; }
+table.parked col.c-folder { width: 170px; }
+table.parked col.c-level { width: 96px; }
+table.parked col.c-change { width: 240px; }
+table.parked col.c-act { width: 175px; }
+table.parked td.file-cell { overflow-wrap: anywhere; }
+table.parked td.folder-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.chg-vals { display: flex; align-items: center; gap: 6px; font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.chg-orig { color: var(--muted); }
+.chg-arrow { color: var(--faint); }
+.chg-new { font-weight: 700; color: var(--text); }
+.chg-new.warn { color: var(--warn); }
+.chg-ctl { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.chg-ctl .btn-sm { width: 26px; padding: 0; justify-content: center; font-size: 14px; line-height: 1; flex: none; }
+input.mini { width: 120px; flex: none; }
+th.pick, td.pick { width: 40px; }
+tr.row-sel td { background: var(--accent-tint); }
+
+/* ---------- info icon with helptip (replaces inline help text) ---------- */
+.tip {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; margin-left: 6px; vertical-align: middle;
+  color: var(--faint); cursor: help; border-radius: 50%;
+  font-weight: 400; text-transform: none; letter-spacing: 0;
+}
+.tip svg { width: 15px; height: 15px; }
+.tip:hover, .tip:focus-visible { color: var(--accent); outline: none; }
+.tip-body {
+  display: none; position: absolute; z-index: 60;
+  bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: 280px;
+  background: var(--ink); color: #fff;
+  font-size: 12px; font-weight: 400; line-height: 1.45;
+  padding: 8px 10px; border-radius: var(--r-s);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18);
+  text-align: left; white-space: normal; pointer-events: none;
+}
+.tip:hover .tip-body, .tip:focus-visible .tip-body { display: block; }
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; bottom: 20px; right: 20px;
