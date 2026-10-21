@@ -1,0 +1,33 @@
+# audio-normalizer for Synology Container Manager (or `docker compose up -d` on any Docker host).
+# Edit the paths and the user below for your NAS, then start the project.
+services:
+  audio-normalizer:
+    build: .
+    image: audio-normalizer:0.1.0
+    container_name: audio-normalizer
+    restart: unless-stopped
+
+    # Run as the owner of the shared folders so that changed files keep their owner.
+    # Replace 1026:100 with your own uid:gid (`id <user>` in the NAS shell).
+    user: "1026:100"
+
+    # LAN only. The web UI has no login: do not forward this port on the router.
+    ports:
+      - "8080:8080"
+
+    environment:
+      - TZ=Europe/Amsterdam     # time zone for the schedule windows
+      - CONCURRENCY=1           # files processed at the same time (1 on the DS918+, max 2)
+
+    volumes:
+      # Base locations: everything below these folders is scanned (subfolders included).
+      - /volume1/music:/data/audio
+      - /volume1/video:/data/video
+      # Database, backups and tokens. Keep it on the NAS so the state survives updates.
+      - /volume1/docker/audio-normalizer:/config
+      # Only needed for "separate output folder" mode (Settings > Output):
+      # - /volume1/music-normalized:/data/normalized-audio
+
+    # Intel Quick Sync / VAAPI is planned for video re-encoding later. Not used in this version.
+    # devices:
+    #   - /dev/dri:/dev/dri

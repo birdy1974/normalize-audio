@@ -163,6 +163,8 @@ volumes:
 | Warning + park large changes, no waiting | Files above the threshold get status `parked`; the run continues; review page. |
 | Review of parked files (mock-up v4.1) | Each parked file shows the original and the new change needed; adjust it by ±0.1 dB (buttons or a −12…+12 dB slider), or several at once via multi-select; then apply or skip. Changes are stored as an offset from the measured gain. |
 | Baseline from a file (mock-up v4.2) | Directories: Check level on a file shows its integrated loudness and true peak (measured, file unchanged); Use as target sets the target level. Settings, Level links to this. |
+| Parked files sorted by change (mock-up v4.2) | Sort select: file order, change needed lowest or highest first, size of change largest first. The list is sorted by the server (`/api/parked?sort=`). |
+| Green range sliders (mock-up v4.2) | The part of the track left of the thumb is filled green, on every slider. |
 | Helptips instead of help text (mock-up v4.1) | Descriptions appear as an information icon with a popup on hover/focus; the page keeps only its intro text and status messages. |
 | Override confirmation for large changes | Toggle in settings (applies large changes automatically). |
 | Home Assistant sensors | REST API, grouped by media type: status, progress %, errors, and per type: folders, files in scope, pending, checked, changed, parked, target LUFS, next schedule change. |
