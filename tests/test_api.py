@@ -219,3 +219,44 @@ def test_adjust_keeps_the_original_value_reachable(client, cfg):
     assert client.post(f"/api/parked/{fid}/adjust", json={"value": 80}).status_code == 200
     row = next(f for f in client.get("/api/parked").json()["files"] if f["name"] == "a.flac")
     assert row["effective"] == 25.8
+
+
+def _sensor(view: dict, path: str) -> dict:
+    return next(x for x in view["sensors"] if x["path"] == path)
+
+
+def test_sensor_names_can_be_aligned_with_home_assistant(client):
+    before = _sensor(client.get("/api/ha").json(), "audio.files_pending")
+    assert before["name"] == before["default_name"] == "Audio files to do"
+    # disable it first: a name change must not switch the sensor back on
+    client.put("/api/ha", json={"sensors": [{"path": "audio.files_pending", "enabled": False}]})
+    r = client.put("/api/ha", json={"sensors": [{"path": "audio.files_pending", "name": "  Podcast   queue  "}]})
+    assert r.status_code == 200
+    s = _sensor(r.json(), "audio.files_pending")
+    assert s["name"] == "Podcast queue"                       # whitespace collapsed
+    assert s["default_name"] == "Audio files to do"
+    assert s["enabled"] is False
+    assert "Podcast queue" not in r.json()["yaml"]            # disabled sensors are not in the YAML
+    assert "audio.files_pending" not in r.json()["enabled_paths"]
+    r = client.put("/api/ha", json={"sensors": [{"path": "audio.files_pending", "enabled": True}]})
+    assert '- name: "Podcast queue"' in r.json()["yaml"]
+    assert "unique_id: audio_normalizer_audio_files_pending" in r.json()["yaml"]   # id does not follow the name
+    client.put("/api/ha", json={"sensors": [{"path": "audio.files_pending", "enabled": False}]})
+    # reset to the default name
+    r = client.put("/api/ha", json={"sensors": [{"path": "audio.files_pending", "name": s["default_name"]}]})
+    assert _sensor(r.json(), "audio.files_pending")["name"] == "Audio files to do"
+
+
+def test_sensor_name_validation_and_yaml_quoting(client):
+    path = "video.files_parked"
+    assert client.put("/api/ha", json={"sensors": [{"path": path, "name": "   "}]}).status_code == 400
+    assert client.put("/api/ha", json={"sensors": [{"path": path, "name": "x" * 81}]}).status_code == 400
+    assert client.put("/api/ha", json={"sensors": [{"path": path, "name": "bad\x07name"}]}).status_code == 400
+    # a rejected name leaves the stored one unchanged
+    assert _sensor(client.get("/api/ha").json(), path)["name"] == "Video files parked"
+    # quotes are escaped instead of being removed
+    r = client.put("/api/ha", json={"sensors": [{"path": path, "enabled": True, "name": 'Files "parked"'}]})
+    assert r.status_code == 200
+    assert '- name: "Files \\"parked\\""' in r.json()["yaml"]
+    # unknown paths are ignored
+    assert client.put("/api/ha", json={"sensors": [{"path": "evil.path", "name": "x"}]}).status_code == 200

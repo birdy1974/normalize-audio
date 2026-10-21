@@ -171,14 +171,38 @@ def get_ha(db: Database) -> dict:
         "sensors": copy.deepcopy(DEFAULT_SENSORS),
     }
     out.update({k: v for k, v in stored.items() if k in out})
-    known = {s["path"]: s for s in DEFAULT_SENSORS}
-    # keep the sensor list in the default order; only the enabled flag can be changed by the user
-    enabled_by_path = {s.get("path"): bool(s.get("enabled")) for s in stored.get("sensors", []) if isinstance(s, dict)}
-    out["sensors"] = [dict(s, enabled=enabled_by_path.get(s["path"], s["enabled"])) for s in known.values()]
+    # keep the sensor list in the default order; the user can change the enabled flag and the name
+    saved = {s.get("path"): s for s in stored.get("sensors", []) if isinstance(s, dict)}
+    out["sensors"] = []
+    for default in DEFAULT_SENSORS:
+        item = saved.get(default["path"], {})
+        name = item.get("name")
+        enabled = item.get("enabled")
+        out["sensors"].append(dict(
+            default,
+            name=name if isinstance(name, str) and name else default["name"],
+            default_name=default["name"],
+            enabled=bool(enabled) if enabled is not None else default["enabled"],
+        ))
     if not out["endpointToken"]:
         out["endpointToken"] = secrets.token_urlsafe(32)
         db.set_json("ha", {**stored, "endpointToken": out["endpointToken"]})
     return out
+
+
+MAX_SENSOR_NAME = 80
+
+
+def clean_sensor_name(value) -> str:
+    """A sensor name as Home Assistant shows it: one line, no control characters, at most 80 characters."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        raise ValueError("a sensor name cannot be empty")
+    if len(text) > MAX_SENSOR_NAME:
+        raise ValueError(f"a sensor name can have at most {MAX_SENSOR_NAME} characters")
+    if not text.isprintable():
+        raise ValueError("a sensor name can only contain printable characters")
+    return text
 
 
 def save_ha(db: Database, patch: dict) -> dict:
@@ -191,8 +215,17 @@ def save_ha(db: Database, patch: dict) -> dict:
     if "token" in patch and patch["token"] is not None:
         current["token"] = str(patch["token"]).strip()
     if "sensors" in patch:
-        enabled = {s["path"]: bool(s["enabled"]) for s in patch["sensors"] if s.get("path") in {d["path"] for d in DEFAULT_SENSORS}}
-        current["sensors"] = [dict(s, enabled=enabled.get(s["path"], s["enabled"])) for s in current["sensors"]]
+        known = {d["path"] for d in DEFAULT_SENSORS}
+        by_path = {s["path"]: s for s in current["sensors"]}
+        for item in patch["sensors"]:
+            path = item.get("path")
+            if path not in known:
+                continue                       # unknown sensors are ignored
+            if "enabled" in item:
+                by_path[path]["enabled"] = bool(item["enabled"])
+            if "name" in item:
+                by_path[path]["name"] = clean_sensor_name(item["name"])
+        current["sensors"] = list(by_path.values())
     db.set_json("ha", {k: current[k] for k in ("url", "token", "endpointToken", "sensors")})
     return get_ha(db)
 

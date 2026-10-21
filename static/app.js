@@ -289,6 +289,7 @@
       + stat('2 · To do', fmt(m.files_pending), 'waiting for analysis or normalization')
       + stat('3 · Checked', fmt(m.files_checked), 'files with a measured level')
       + stat('4 · Actually changed', fmt(m.files_changed), 'level set to ' + Number(m.target).toFixed(1) + ' LUFS')
+      + stat('5 · Parked', fmt(m.files_parked), '<a href="#/parked">waiting for your decision</a>')
       + '</div>'
       + '<p class="small muted" style="margin-top:12px">' + esc(scheduleText(t)) + '</p>'
       + '</section>';
@@ -713,14 +714,25 @@
   }
 
   /* ------------------------------------------------------- Home Assistant */
+  /* the entity ID Home Assistant derives from a name when it first creates the sensor (preview only) */
+  function entityIdFor(name) {
+    const slug = String(name).toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    return 'sensor.' + (slug || 'sensor');
+  }
+
   function sensorRows(list) {
     let lastGroup = null;
     return list.map((x) => {
-      const head = x.group !== lastGroup ? '<tr><td colspan="5" class="group-row">' + esc(x.group) + '</td></tr>' : '';
+      const head = x.group !== lastGroup ? '<tr><td colspan="6" class="group-row">' + esc(x.group) + '</td></tr>' : '';
       lastGroup = x.group;
-      return head + '<tr><td><input type="checkbox" data-sensor="' + esc(x.path) + '"' + (x.enabled ? ' checked' : '') + ' aria-label="Enable ' + esc(x.name) + '"></td>'
-        + '<td>' + esc(x.name) + '</td>'
+      const reset = x.name !== x.default_name
+        ? '<button class="btn btn-sm" data-action="sensor-reset" data-path="' + esc(x.path) + '">Default</button>' : '';
+      return head + '<tr><td><input type="checkbox" data-sensor="' + esc(x.path) + '"' + (x.enabled ? ' checked' : '') + ' aria-label="Enable ' + esc(x.default_name) + '"></td>'
+        + '<td><div class="input-row"><input class="input" data-sensor-name="' + esc(x.path) + '" value="' + esc(x.name) + '" maxlength="80"'
+        + ' aria-label="Name of ' + esc(x.default_name) + ' in Home Assistant">' + reset + '</div></td>'
         + '<td class="mono dim">' + esc(x.path) + '</td>'
+        + '<td class="mono">' + esc(entityIdFor(x.name)) + '</td>'
         + '<td>' + (x.unit ? esc(x.unit) : '<span class="dim">—</span>') + '</td>'
         + '<td>' + (x.deviceClass ? esc(x.deviceClass) : '<span class="dim">—</span>') + '</td></tr>';
     }).join('');
@@ -767,8 +779,8 @@
       + '</div></section>'
 
       + '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Sensors</h2>'
-      + '<div class="sub">Optional single sensors in addition to the main entity. The main entity is always created and feeds the card. Changes are saved at once.</div></div></div>'
-      + '<div class="table-wrap"><table><thead><tr><th>On</th><th>Sensor name</th><th>Source in payload</th><th>Unit</th><th>Device class</th></tr></thead>'
+      + '<div class="sub">Optional single sensors in addition to the main entity, which is always created. Name them as they are in Home Assistant. The name sets the entity ID only when Home Assistant first creates a sensor; an existing entity keeps its ID. Changes are saved at once.</div></div></div>'
+      + '<div class="table-wrap"><table><thead><tr><th>On</th><th>Name in Home Assistant</th><th>Source in payload</th><th>Entity ID</th><th>Unit</th><th>Device class</th></tr></thead>'
       + '<tbody>' + sensorRows(h.sensors) + '</tbody></table></div></section>'
       + '<section class="card" style="margin-top:16px"><h2 style="margin-bottom:12px">Generated configuration.yaml</h2>'
       + '<pre id="ha-yaml"></pre></section>';
@@ -980,6 +992,12 @@
       const r = await api('/ha/test', { method: 'POST' });
       state.haTest = r.message;
       render();
+    } else if (a === 'sensor-reset') {
+      const sensor = state.ha.sensors.find((x) => x.path === el.dataset.path);
+      if (sensor) {
+        state.ha = await api('/ha', { method: 'PUT', body: { sensors: [{ path: sensor.path, name: sensor.default_name }] } });
+        render();
+      }
     } else if (a === 'ha-rotate') {
       if (!window.confirm('The current endpoint token stops working at once. Continue?')) return;
       state.ha = await api('/ha/rotate-token', { method: 'POST' });
@@ -1073,6 +1091,18 @@
     if (el.dataset.ha) {
       if (el.dataset.ha === 'url') state.haDraft.url = el.value;
       if (el.dataset.ha === 'token') state.haDraft.token = el.value;
+      return;
+    }
+
+    if (el.dataset.sensorName !== undefined) {
+      if (!committed) return;
+      try {
+        state.ha = await api('/ha', { method: 'PUT', body: { sensors: [{ path: el.dataset.sensorName, name: el.value }] } });
+        toast('Sensor name saved');
+      } catch (err) {
+        toast(err.message);
+      }
+      render();
       return;
     }
 

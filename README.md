@@ -68,7 +68,7 @@ Environment variables: `AUDIO_ROOT`, `VIDEO_ROOT`, `CONFIG_DIR`, `FFMPEG_BIN`, `
 |---|---|
 | Decision rules (gain, park, skip, lossy) | Automated tests pass (13) |
 | Pipeline with real ffmpeg: volume, re-encode, backup, output, dry run, silent, park/approve, restart, window, folders | Automated tests pass (15) |
-| REST API: HA auth and token masking, folders and tree, settings validation, parked actions | Automated tests pass (15) |
+| REST API: HA auth and token masking, HA sensor names, folders and tree, settings validation, parked actions | Automated tests pass (17) |
 | Web UI against the live API (headless Chromium) | Checked: pages load, no script errors, folder toggle, parked adjust and sort, settings save |
 | Docker image build | **Not verified** (no Docker in the sandbox) |
 | `aacgain` in Debian bookworm | **Not verified**. Build falls back to no AAC gain if the package is missing |

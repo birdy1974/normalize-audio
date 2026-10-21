@@ -1,6 +1,8 @@
 """Home Assistant interface: the status payload, the REST sensor YAML and the connection test."""
 from __future__ import annotations
 
+import json
+
 import httpx
 
 from . import schedule, stats, state
@@ -74,7 +76,7 @@ def yaml(ha_cfg: dict, port: int) -> str:
             continue
         uid = "audio_normalizer_" + s["path"].replace(".", "_")
         lines.append("      # optional single sensor")
-        lines.append(f'      - name: "{s["name"].replace(chr(34), "")}"')
+        lines.append(f"      - name: {json.dumps(s['name'], ensure_ascii=False)}")   # JSON string = valid YAML quoting
         lines.append(f"        unique_id: {uid}")
         lines.append(f'        value_template: "{{{{ value_json.{s["path"]} }}}}"')
         if s.get("unit"):
