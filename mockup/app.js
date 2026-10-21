@@ -46,6 +46,13 @@
       + '<span class="tip-body" role="tooltip">' + esc(text) + '</span></span>';
   }
 
+  /* green fill up to the thumb: used by every range slider */
+  function paintRange(el) {
+    const min = Number(el.min), max = Number(el.max), v = Number(el.value);
+    const pct = max > min ? ((v - min) / (max - min)) * 100 : 0;
+    el.style.setProperty('--pct', pct.toFixed(2) + '%');
+  }
+
   function toast(msg) {
     const t = document.getElementById('toast');
     t.textContent = msg;
@@ -157,6 +164,9 @@
     },
     log: [],
     parkSel: [],                                     // selected parked file ids
+    parkSort: 'order',                               // sort of the parked list
+    measure: null,                                   // last file level check (baseline)
+    baselineFrom: null,                              // media type when opened from Settings > Level
   };
 
   function log(level, type, msg) {
@@ -503,6 +513,35 @@
       + '</div>';
   }
 
+  /* baseline: check the level of one file and use it as the target */
+  const baselineValue = (lufs) => Math.max(-30, Math.min(-10, Math.round(lufs * 2) / 2));
+  function baselinePanel(t) {
+    const m = state.measure && state.measure.media === t ? state.measure : null;
+    const target = state.settings[t].target;
+    let html = '';
+    if (state.baselineFrom === t) {
+      html += '<div class="notice info baseline-banner"><span><strong>Setting the baseline for Settings, Level.</strong> '
+        + 'Check the level of a representative file below, then use it as the target. The target is now '
+        + '<strong>' + target.toFixed(1) + ' LUFS</strong>.</span>'
+        + '<a class="btn btn-sm" href="#/settings" data-action="baseline-done">Back to Settings</a></div>';
+    }
+    if (m && m.state === 'measuring') {
+      html += '<div class="measure"><span>Measuring <strong>' + esc(m.name) + '</strong> … (integrated loudness, EBU R128, file not changed)</span></div>';
+    } else if (m) {
+      const r = Math.round(m.lufs * 2) / 2;
+      const v = baselineValue(m.lufs);
+      html += '<div class="measure">'
+        + '<div><div class="stat-label">Checked file</div><strong>' + esc(m.name) + '</strong></div>'
+        + '<div><div class="stat-label">Integrated loudness</div><strong>' + m.lufs.toFixed(1) + ' LUFS</strong></div>'
+        + '<div><div class="stat-label">True peak</div><strong>' + m.tp.toFixed(1) + ' dBTP</strong></div>'
+        + '<div><div class="stat-label">Change needed at target ' + target.toFixed(1) + '</div><strong>' + fmtDb(target - m.lufs) + '</strong></div>'
+        + '<span class="grow"></span>'
+        + '<button class="btn btn-primary" data-action="use-baseline">Use ' + v.toFixed(1) + ' LUFS as target' + (v !== r ? ' (slider limit)' : '') + '</button>'
+        + '<button class="btn" data-action="measure-close">Dismiss</button></div>';
+    }
+    return html;
+  }
+
   /* ----------------------------------------------------------- directories */
   function renderTree(nodes) {
     return nodes.map((n) => {
@@ -532,15 +571,16 @@
         + '<td class="num">' + f.lufs.toFixed(1) + ' LUFS</td>'
         + '<td class="num">' + fmtDb(g) + '</td>'
         + '<td class="dim">' + esc(methodFor(t, f)) + '</td>'
-        + '<td>' + statusLabel(f.status) + '</td></tr>';
+        + '<td>' + statusLabel(f.status) + '</td>'
+        + '<td class="actions-cell"><button class="btn btn-sm" data-action="check-level" data-file="' + esc(f.id) + '">Check level</button></td></tr>';
     }).join('');
     const subs = subtreeNodes(node).length - 1;
     return '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
       + '<div class="sub">' + node.files.length + ' files directly in this folder · ' + subs + ' sub-folders</div></div>'
       + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div>'
       + (node.files.length
-        ? '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level</th>'
-          + '<th class="num">Change</th><th>Method</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+        ? '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level' + tip('Integrated loudness of the whole file (EBU R128), measured without changing the file. Check level measures one file again.') + '</th>'
+          + '<th class="num">Change</th><th>Method</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
           + (node.files.length > 80 ? '<p class="small muted" style="margin-top:10px">… and ' + (node.files.length - 80) + ' more files</p>' : '')
         : '<p class="muted">No files directly in this folder. Open a sub-folder in the tree.</p>');
   }
@@ -558,6 +598,7 @@
       + '<button class="btn btn-sm" data-action="collapse-all">Collapse all</button>', true)
       + '<p class="muted" style="margin-bottom:0"><strong style="color:var(--text)">' + s.dirsEnabled + ' of ' + s.dirsTotal
       + '</strong> folders included · ' + fmt(s.filesTotal) + ' files in scope</p>'
+      + baselinePanel(t)
       + '<div class="split-dirs">'
       + '<section class="card tree" aria-label="Folder tree"><ul>' + renderTree(state.trees[t]) + '</ul></section>'
       + '<section class="card">' + renderBrowse(sel) + '</section>'
@@ -580,10 +621,23 @@
     file.adjust = tenth(nv - gainFor(t, file));
   }
 
+  const PARK_SORTS = {
+    order: { label: 'File order', cmp: null },
+    asc: { label: 'Change needed, lowest first', cmp: (x, y) => x - y },
+    desc: { label: 'Change needed, highest first', cmp: (x, y) => y - x },
+    size: { label: 'Size of change, largest first', cmp: (x, y) => Math.abs(y) - Math.abs(x) },
+  };
+  function sortParked(list, t) {
+    const s = PARK_SORTS[state.parkSort];
+    if (!s || !s.cmp) return;
+    list.sort((a, b) => s.cmp(effGain(t, a.file), effGain(t, b.file)));
+  }
+
   function renderParked() {
     const t = state.media;
     const th = state.settings[t].threshold;
     const list = entriesOf([t]).filter((e) => e.file.status === 'parked');
+    sortParked(list, t);
     const ids = list.map((e) => e.file.id);
     state.parkSel = state.parkSel.filter((id) => ids.includes(id));
     const sel = state.parkSel;
@@ -622,13 +676,15 @@
         + '<button class="btn btn-sm btn-primary" data-action="apply-selected">Apply selected</button>'
         + '<button class="btn btn-sm" data-action="clear-selection">Clear selection</button></div>'
       : '';
+    const sortOpts = Object.keys(PARK_SORTS).map((k) => '<option value="' + k + '"' + (state.parkSort === k ? ' selected' : '') + '>' + PARK_SORTS[k].label + '</option>').join('');
+    const sortBar = '<div class="card-tools"><label for="park-sort">Sort by</label><select id="park-sort" class="input" data-park-sort>' + sortOpts + '</select></div>';
     app().innerHTML = pageHead('Parked files',
       MEDIA[t].label + ' changes larger than <strong>' + th + ' dB</strong> are not applied. The run continued with the next file. Adjust a change, then apply it.',
       '<button class="btn btn-primary" data-action="approve-all"' + (list.length ? '' : ' disabled') + '>Apply all (' + list.length + ')</button>'
       + '<a class="btn" href="#/settings">Threshold</a>', true)
       + '<section class="card">'
       + (list.length
-        ? bulk + '<div class="table-wrap"><table class="parked"><colgroup>'
+        ? sortBar + bulk + '<div class="table-wrap"><table class="parked"><colgroup>'
           + '<col class="c-pick"><col class="c-file"><col class="c-folder"><col class="c-level"><col class="c-change"><col class="c-act">'
           + '</colgroup><thead><tr>'
           + '<th class="pick"><input type="checkbox" data-park-all aria-label="Select all parked files"' + (allOn ? ' checked' : '') + '></th>'
@@ -701,6 +757,7 @@
       + '<div class="field"><label class="lbl" for="target-' + t + '">Target loudness (integrated, EBU R128)' + tip('−16 LUFS suits podcasts and speech, −14 suits music streaming, −23 is the EBU broadcast standard.') + '</label>'
       + '<div class="slider-row"><input id="target-' + t + '" type="range" min="-30" max="-10" step="0.5" value="' + cfg.target + '" data-scope="' + t + '" data-setting="target">'
       + '<div class="val"><span data-out="' + t + '.target">' + cfg.target.toFixed(1) + '</span> LUFS</div></div>'
+      + '<p class="baseline-link-row"><a class="inline-link" href="#/directories" data-action="baseline-start" data-media="' + t + '">Set the baseline from a file: check its level in Directories →</a></p>'
       + '</div>'
       + '<div class="field"><label class="lbl" for="tp-' + t + '">True-peak ceiling' + tip('The gain is capped so that no sample exceeds this level, which prevents clipping.') + '</label>'
       + '<div class="slider-row"><input id="tp-' + t + '" type="range" min="-6" max="-1" step="0.1" value="' + cfg.truePeak + '" data-scope="' + t + '" data-setting="truePeak">'
@@ -861,6 +918,7 @@
     });
     updateNavBadge();
     ROUTES[route]();
+    document.querySelectorAll('input[type=range]').forEach(paintRange);
   }
 
   /* --------------------------------------------------------- interaction */
@@ -906,6 +964,36 @@
     } else if (a === 'preset') {
       const fn = PRESETS[el.dataset.preset];
       state.schedule[t] = scheduleFrom(fn);
+    } else if (a === 'check-level') {
+      const entry = entriesOf(ALL).find((x) => x.file.id === el.dataset.file);
+      if (entry) {
+        const f = entry.file;
+        const mm = { id: f.id, media: entry.node.type, name: f.name, state: 'measuring' };
+        state.measure = mm;
+        setTimeout(() => {
+          if (state.measure !== mm) return;                     // dismissed or replaced meanwhile
+          mm.state = 'done';
+          mm.lufs = f.lufs;
+          mm.tp = Math.min(-0.1, Math.round((f.lufs + 9 + (f.name.length % 7) * 0.4) * 10) / 10);
+          log('info', mm.media, 'Level checked: ' + f.name + ' ' + f.lufs.toFixed(1) + ' LUFS');
+          render();
+        }, 900);
+      }
+    } else if (a === 'measure-close') {
+      state.measure = null;
+    } else if (a === 'use-baseline') {
+      const m = state.measure;
+      if (m && m.state === 'done') {
+        const v = baselineValue(m.lufs);
+        state.settings[m.media].target = v;
+        log('ok', m.media, 'Target loudness set to ' + v.toFixed(1) + ' LUFS from ' + m.name);
+        toast('Target loudness set to ' + v.toFixed(1) + ' LUFS');
+      }
+    } else if (a === 'baseline-start') {
+      state.media = el.dataset.media;
+      state.baselineFrom = el.dataset.media;
+    } else if (a === 'baseline-done') {
+      state.baselineFrom = null;
     } else if (a === 'clear-log') {
       state.log = [];
     } else if (a === 'adjust-file') {
@@ -942,6 +1030,7 @@
 
   function onField(e) {
     const el = e.target;
+    if (el.type === 'range') paintRange(el);
 
     if (el.dataset.check !== undefined) {
       const n = findNode(el.dataset.check);
@@ -958,6 +1047,11 @@
         if (out) out.textContent = fmtDb(effGain(entry.node.type, entry.file));
       }
       if (e.type === 'change') render();
+      return;
+    }
+
+    if (el.dataset.parkSort !== undefined) {
+      if (e.type === 'change') { state.parkSort = el.value; render(); }
       return;
     }
 
@@ -1078,7 +1172,10 @@
   });
 
   /* ---------------------------------------------------------------- start */
-  window.addEventListener('hashchange', render);
+  window.addEventListener('hashchange', () => {
+    if (currentRoute() !== 'directories') state.baselineFrom = null;   // the baseline banner lasts while on Directories
+    render();
+  });
   setInterval(tick, 900);
   applyMenu();
   render();

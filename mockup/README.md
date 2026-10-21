@@ -30,6 +30,9 @@ python3 -m http.server 8080
 - Style: greyscale only (no accent colour), square corners everywhere, custom square checkboxes, radios and sliders. The side menu stays on the left at every width; on narrow screens it becomes a narrow rail.
 - `lovelace/` in the repository is linked here as `mockup/lovelace`, so the Download button and the live card preview use the same file as the repository.
 - Menu: icons on every item. The chevron collapses the menu to an icon rail. The pin keeps the menu as it is; when unpinned, the rail opens on hover over the content. The state is remembered in the browser.
+- Parked files: sort by change needed (lowest first, highest first, or largest size of change); the sort stays while you adjust.
+- Level check: in Directories, each file has a Check level button. It shows integrated loudness, true peak and the change needed at the current target. Use as target sets the target (0.5 LUFS steps, within the slider range). Settings, Level links here with a banner.
+- Sliders: the fill up to the thumb is green.
 - Help: field descriptions are shown as an information icon. Hover (or focus) the icon to read the helptip.
 - Parked files: folders show only the last two levels (full path on hover); the file column is the widest.
 - Colours: greyscale base with one muted green accent for selected states and primary buttons, and light tints for notices and selected rows. Small corner radii (4px controls, 6px cards).
