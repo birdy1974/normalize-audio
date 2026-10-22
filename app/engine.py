@@ -26,6 +26,15 @@ log = logging.getLogger("normalizer")
 GAIN_TOOLS = ("mp3gain", "aacgain")
 
 
+class FileBusy(RuntimeError):
+    """The file is being processed by the run; the request is refused."""
+
+
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 class Engine:
     def __init__(self, cfg: Config, db):
         self.cfg = cfg
@@ -378,6 +387,97 @@ class Engine:
                             pass
 
     # ------------------------------------------------------------ on demand
+
+    # ------------------------------------------------------------ editing
+
+    def edit_audio(self, media: str, rel: str, *, fade_in: float = 0.0, fade_out: float = 0.0,
+                   cut: tuple[float, float] | None = None) -> dict:
+        """Fade in/out or remove a part of one audio file.
+
+        The same safety as the run: a temporary file in the same folder, verification, then an
+        atomic replace. The write mode decides about a backup; the file is measured again in the
+        next run, because fades and cuts change its level.
+        """
+        if media != "audio":
+            raise ValueError("editing is available for audio files only")
+        settings = state.get_settings(self.db)
+        if settings["general"]["dryRun"]:
+            raise ValueError("Dry run is on: turn it off in Settings to edit files")
+        mode = settings["audio"]["writeMode"]
+        if mode == "output":
+            raise ValueError("Write mode is 'output folder': editing changes the file itself. "
+                             "Choose in place (with or without backup) in Settings.")
+        root = os.path.realpath(self.cfg.root(media))
+        src = os.path.realpath(os.path.join(root, rel))
+        if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
+            raise ValueError("file not found")
+        row = self.db.one("SELECT * FROM files WHERE media = ? AND relpath = ?", (media, rel))
+        if row is None:
+            raise ValueError("file not found in the library; run a scan first")
+        claimed = self.db.execute(
+            "UPDATE files SET status = 'processing' WHERE id = ? AND status != 'processing'", (row["id"],))
+        if not claimed:
+            raise FileBusy("this file is being processed right now; try again when it is done")
+        try:
+            return self._edit_audio(src, media, rel, row, fade_in, fade_out, cut, mode,
+                                    settings["general"]["preserveMtime"])
+        except BaseException:
+            self.db.execute("UPDATE files SET status = ? WHERE id = ?", (row["status"], row["id"]))
+            raise
+
+    def _edit_audio(self, src: str, media: str, rel: str, row: dict, fade_in: float, fade_out: float,
+                    cut: tuple[float, float] | None, mode: str, preserve_mtime: bool) -> dict:
+        probe = ff.probe(self.cfg.ffmpeg, src)
+        duration = probe.duration
+        if not duration or duration <= 0.1:
+            raise ValueError("this file is too short to edit")
+        fade_in = round(max(0.0, float(fade_in or 0.0)), 2)
+        fade_out = round(max(0.0, float(fade_out or 0.0)), 2)
+        fade_in = 0.0 if fade_in < 0.05 else fade_in
+        fade_out = 0.0 if fade_out < 0.05 else fade_out
+        cut_range = None
+        if cut is not None:
+            start, end = round(float(cut[0]), 2), round(float(cut[1]), 2)
+            if not 0 <= start < end <= duration:
+                raise ValueError("the part to remove must lie inside the file")
+            if duration - (end - start) < 0.1:
+                raise ValueError("the whole file would be removed")
+            cut_range = (start, end)
+        new_duration = duration - ((cut_range[1] - cut_range[0]) if cut_range else 0.0)
+        if fade_in <= 0 and fade_out <= 0 and cut_range is None:
+            raise ValueError("nothing to do: set a fade or select a part to remove")
+        if fade_in > new_duration - 0.05 or fade_out > new_duration - 0.05:
+            raise ValueError("a fade is longer than the file (after the cut)")
+        if fade_in + fade_out > new_duration:
+            raise ValueError("fade in and fade out overlap; shorten one of them")
+
+        tmp = ff.temp_path(src)
+        try:
+            ff.edit(self.cfg.ffmpeg, src, tmp, probe_=probe, duration=duration,
+                    cut=cut_range, fade_in=fade_in, fade_out=fade_out, new_duration=new_duration,
+                    kbps=probe.kbps)
+            ff.verify_edit(self.cfg.ffmpeg, tmp, probe, new_duration)
+            self._commit(src, tmp, src, media, rel, mode, preserve_mtime)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        st = os.stat(src)
+        self.db.execute(
+            "UPDATE files SET status = 'pending', reason = NULL, size = ?, mtime_ns = ?, seen_at = ?, "
+            "lufs = NULL, true_peak = NULL, measured_at = NULL, gain_db = NULL, adjust_db = 0, "
+            "applied_db = NULL, method = NULL, changed_at = NULL WHERE id = ?",
+            (st.st_size, st.st_mtime_ns, time.time(), row["id"]))
+        what = []
+        if fade_in:
+            what.append(f"fade in {fade_in:.1f} s")
+        if fade_out:
+            what.append(f"fade out {fade_out:.1f} s")
+        if cut_range:
+            what.append(f"removed {_clock(cut_range[0])}–{_clock(cut_range[1])}")
+        self.db.log("ok", f"Edited {row['name']}: {', '.join(what)} (now {_clock(new_duration)})", media)
+        return {"ok": True, "name": row["name"], "relpath": rel, "duration": round(new_duration, 3),
+                "size": st.st_size, "fade_in": fade_in, "fade_out": fade_out, "cut": list(cut_range or [])}
 
     def measure(self, media: str, rel: str) -> dict:
         """Level check for one file (baseline). The file is only read."""

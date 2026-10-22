@@ -162,6 +162,178 @@ def test_file_stream_rejects_paths_outside_the_base_and_unplayable_formats(clien
     assert client.get(base, params={"media": "audio", "relpath": "a.mp4"}).status_code == 404
 
 
+def test_waveform_returns_levels_for_the_whole_file_and_for_a_window(client, cfg):
+    """The editor draws its timeline from these peaks."""
+    _scan_library(cfg, client)
+    base = client.get("/api/files/waveform", params={"media": "audio", "relpath": "Music/a.flac", "buckets": 200})
+    assert base.status_code == 200
+    data = base.json()
+    assert abs(data["file_duration"] - 3.0) < 0.2
+    assert data["duration"] == data["file_duration"] and data["start"] == 0
+    assert len(data["min"]) == len(data["max"]) == 200
+    assert max(data["max"]) > 0.1 and min(data["min"]) < -0.1      # the test tone swings both ways
+
+    window = client.get("/api/files/waveform", params={
+        "media": "audio", "relpath": "Music/a.flac", "start": 1, "duration": 1, "buckets": 50}).json()
+    assert window["start"] == 1 and abs(window["duration"] - 1.0) < 0.05
+    assert len(window["min"]) == 50 and max(window["max"]) > 0.1
+
+    # past the end: the window is clamped instead of failing
+    late = client.get("/api/files/waveform", params={
+        "media": "audio", "relpath": "Music/a.flac", "start": 2.9, "duration": 5, "buckets": 50}).json()
+    assert late["duration"] <= 0.11 and len(late["min"]) == 50
+
+    assert client.get("/api/files/waveform", params={"media": "photos", "relpath": "a.flac"}).status_code == 400
+    assert client.get("/api/files/waveform", params={"media": "audio", "relpath": "missing.flac"}).status_code == 404
+    assert client.get("/api/files/waveform", params={"media": "audio", "relpath": "../a.flac"}).status_code == 400
+
+
+def _tone_then_silence(path: str, seconds: float = 2.0) -> None:
+    """Two seconds of silence, then a tone of the same length."""
+    from conftest import FFMPEG, make
+    make(path, "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=mono:d={seconds}",
+         "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+         "-filter_complex", "[0][1]concat=n=2:v=0:a=1", "-c:a", "flac")
+
+
+def test_edit_adds_fades_and_keeps_the_file_playable(client, cfg):
+    _scan_library(cfg, client)
+    r = client.post("/api/files/edit", json={"media": "audio", "relpath": "Music/a.flac",
+                                             "fade_in": 1.0, "fade_out": 1.0})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert abs(body["duration"] - 3.0) < 0.2 and body["fade_in"] == 1.0 and body["fade_out"] == 1.0
+
+    # the file is still a playable flac of the same length
+    stream = client.get("/api/files/stream", params={"media": "audio", "relpath": "Music/a.flac"})
+    assert stream.status_code == 200 and stream.headers["content-type"] == "audio/flac"
+    peaks = client.get("/api/files/waveform", params={
+        "media": "audio", "relpath": "Music/a.flac", "buckets": 60}).json()
+    assert len(peaks["max"]) == 60
+    assert peaks["max"][0] < 0.02                      # faded in from silence
+    assert peaks["max"][-1] < 0.02                     # and out again
+    assert max(peaks["max"][20:40]) > 0.1              # the middle is untouched
+
+    # the level changed, so the file is measured again in the next run
+    row = client.app_state.db.one("SELECT status, lufs, gain_db FROM files WHERE relpath = 'Music/a.flac'")
+    assert row["status"] == "pending" and row["lufs"] is None and row["gain_db"] is None
+    messages = [l["msg"] for l in client.app_state.db.log_list()]
+    assert any("Edited a.flac" in m and "fade in" in m for m in messages)
+
+
+def test_edit_can_remove_a_part_and_reports_the_new_length(client, cfg):
+    _tone_then_silence(os.path.join(cfg.audio_root, "Cut", "mixed.flac"))
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    # remove one second of silence and one second of the tone: 1 s silence + 1 s tone remains
+    r = client.post("/api/files/edit", json={"media": "audio", "relpath": "Cut/mixed.flac",
+                                             "cut_start": 1.0, "cut_end": 3.0})
+    assert r.status_code == 200, r.text
+    assert abs(r.json()["duration"] - 2.0) < 0.2
+    peaks = client.get("/api/files/waveform", params={
+        "media": "audio", "relpath": "Cut/mixed.flac", "buckets": 40}).json()
+    assert abs(peaks["file_duration"] - 2.0) < 0.2
+    half = len(peaks["max"]) // 2
+    assert max(peaks["max"][:half]) < 0.02             # silence first
+    assert max(peaks["max"][half:]) > 0.1              # then the tone
+
+    # a second cut keeps the rest intact and updates the length again
+    r = client.post("/api/files/edit", json={"media": "audio", "relpath": "Cut/mixed.flac",
+                                             "cut_start": 0.5, "cut_end": 1.0})
+    assert r.status_code == 200, r.text
+    assert abs(r.json()["duration"] - 1.5) < 0.2
+
+
+def test_info_reports_length_and_codec(client, cfg):
+    os.makedirs(os.path.join(cfg.audio_root, "Info"), exist_ok=True)
+    tone(os.path.join(cfg.audio_root, "Info", "i.mp3"), 0, seconds=3.0,
+         codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    r = client.get("/api/files/info", params={"media": "audio", "relpath": "Info/i.mp3"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert abs(d["duration"] - 3.0) < 0.2 and d["codec"] == "mp3" and d["size"] > 1000
+    assert client.get("/api/files/info", params={"media": "audio", "relpath": "Info/nope.mp3"}).status_code == 404
+    assert client.get("/api/files/info", params={"media": "audio", "relpath": "../x.mp3"}).status_code == 400
+
+
+def test_edit_and_waveform_refuse_files_outside_the_base_location(client, cfg):
+    _scan_library(cfg, client)
+    link = os.path.join(cfg.audio_root, "escape.flac")
+    os.symlink("/etc/hostname", link)
+    assert client.get("/api/files/stream", params={"media": "audio", "relpath": "escape.flac"}).status_code == 404
+    assert client.get("/api/files/waveform", params={"media": "audio", "relpath": "escape.flac"}).status_code == 404
+    r = client.post("/api/files/edit", json={"media": "audio", "relpath": "escape.flac", "fade_in": 1.0})
+    assert r.status_code in (400, 404)
+    os.remove(link)
+
+
+def test_edit_cuts_at_the_edges_of_the_file(client, cfg):
+    """A cut at the start or at the end must not confuse the filter graph."""
+    tone(os.path.join(cfg.audio_root, "Edges", "e.flac"), 0, seconds=4.0, codec_args=("-c:a", "flac"))
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+
+    r = client.post("/api/files/edit", json={"media": "audio", "relpath": "Edges/e.flac",
+                                             "cut_start": 0.0, "cut_end": 1.5})
+    assert r.status_code == 200, r.text
+    assert abs(r.json()["duration"] - 2.5) < 0.2
+
+    end = r.json()["duration"]
+    r = client.post("/api/files/edit", json={"media": "audio", "relpath": "Edges/e.flac",
+                                             "cut_start": end - 1.0, "cut_end": end})
+    assert r.status_code == 200, r.text
+    assert abs(r.json()["duration"] - 1.5) < 0.2
+    peaks = client.get("/api/files/waveform", params={
+        "media": "audio", "relpath": "Edges/e.flac", "buckets": 20}).json()
+    assert abs(peaks["file_duration"] - 1.5) < 0.2 and max(peaks["max"]) > 0.1
+
+
+def test_edit_rejects_bad_requests_and_busy_files(client, cfg):
+    _scan_library(cfg, client)
+    post = lambda **body: client.post("/api/files/edit", json={"media": "audio", **body})
+    assert post(relpath="Music/a.flac").status_code == 400                       # nothing to do
+    assert post(relpath="Music/a.flac", fade_in=5.0, fade_out=5.0).status_code == 400   # fades overlap
+    assert post(relpath="Music/a.flac", fade_in=10.0).status_code == 400         # longer than the file
+    assert post(relpath="Music/a.flac", cut_start=2.0).status_code == 400        # half a cut
+    assert post(relpath="Music/a.flac", cut_start=2.0, cut_end=1.0).status_code == 400
+    assert post(relpath="Music/a.flac", cut_start=0.0, cut_end=9.0).status_code == 400
+    assert post(relpath="Music/a.flac", cut_start=0.0, cut_end=3.0).status_code == 400   # everything
+    assert post(relpath="Music/missing.flac", fade_in=1.0).status_code == 400
+    assert post(relpath="../a.flac", fade_in=1.0).status_code == 400
+    assert client.post("/api/files/edit", json={"media": "video", "relpath": "a.mp4",
+                                                "fade_in": 1.0}).status_code == 422
+
+    client.app_state.db.execute("UPDATE files SET status = 'processing' WHERE relpath = 'Music/a.flac'")
+    assert post(relpath="Music/a.flac", fade_in=1.0).status_code == 409
+    client.app_state.db.execute("UPDATE files SET status = 'pending' WHERE relpath = 'Music/a.flac'")
+
+    client.put("/api/settings", json={"general": {"dryRun": True}})
+    r = post(relpath="Music/a.flac", fade_in=1.0)
+    assert r.status_code == 400 and "Dry run" in r.json()["detail"]
+    client.put("/api/settings", json={"general": {"dryRun": False}})
+
+    client.put("/api/settings", json={"audio": {"writeMode": "output", "outputDir": "/tmp/out"}})
+    r = post(relpath="Music/a.flac", fade_in=1.0)
+    assert r.status_code == 400 and "output folder" in r.json()["detail"]
+
+
+def test_edit_keeps_a_backup_when_the_write_mode_says_so(client, cfg):
+    _scan_library(cfg, client)
+    client.put("/api/settings", json={"audio": {"writeMode": "backup"}})
+    original = os.path.join(cfg.audio_root, "Music", "a.flac")
+    with open(original, "rb") as fh:
+        before = fh.read()
+    assert client.post("/api/files/edit", json={"media": "audio", "relpath": "Music/a.flac",
+                                                "fade_in": 1.0}).status_code == 200
+    with open(original, "rb") as fh:
+        assert fh.read() != before
+    backups = []
+    for dirpath, _dirs, names in os.walk(cfg.backup_dir):
+        backups += [os.path.join(dirpath, n) for n in names]
+    assert len(backups) == 1
+    with open(backups[0], "rb") as fh:
+        assert fh.read() == before
+
+
 def test_dashboard_reports_that_a_scan_is_running(client, cfg):
     """The web UI shows the periodic scan in its activity indicator."""
     _scan_library(cfg, client)

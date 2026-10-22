@@ -165,6 +165,8 @@
   const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h3.2v14H8zM12.8 5H16v14h-3.2z"/></svg>';
 
   const previewAudio = () => document.getElementById('preview-audio');
+  const streamUrl = (media, relpath) => '/api/files/stream?media=' + encodeURIComponent(media)
+    + '&relpath=' + encodeURIComponent(relpath);
 
   function fmtTime(sec) {
     if (!isFinite(sec) || sec < 0) return '0:00';
@@ -201,8 +203,7 @@
     PLAY.relpath = file.relpath;
     PLAY.name = file.name;
     PLAY.playing = false;
-    audio.src = '/api/files/stream?media=' + encodeURIComponent(media)
-      + '&relpath=' + encodeURIComponent(file.relpath);
+    audio.src = streamUrl(media, file.relpath);
     syncPlayer();
     audio.play().catch(() => toast('The browser blocked playback. Press play in the player.'));
   }
@@ -252,6 +253,740 @@
       audio.currentTime = (Number(seek.value) / 1000) * audio.duration;
     });
     syncPlayer();
+  }
+
+  /* ------------------------------------------------------------ audio editor
+     A window over one file: waveform with a dB scale and a time ruler, zoom, fades
+     and a cut. The server applies everything in one pass (ffmpeg) on a temporary
+     file and replaces the original atomically, like the normalization run does. */
+  const EDIT = {
+    open: false, media: 'audio', relpath: null, name: null, duration: 0,
+    lufs: null, peak: null,
+    view: { start: 0, dur: 1 }, base: null, window: null,
+    sel: null, cut: null, fadeIn: 0, fadeOut: 0,
+    loading: false, waveError: '', applyError: '', busy: false, playing: false,
+    req: 0, session: 0, timer: null, raf: null, lastDraw: 0, dragging: null, lastFocus: null, viewTouched: false,
+  };
+  const EDIT_MIN_WINDOW = 0.25;          // seconds visible at the deepest zoom
+  const ZOOM_STEP = 1.6;
+  const EDIT_COLORS = {
+    bg: '#fbfbfa', grid: '#d9d9d5', gridText: '#9d9e99', text: '#6c6d69',
+    wave: '#2f7a6b', waveDim: '#8fc0b5',
+    sel: 'rgba(47,122,107,.20)', cut: 'rgba(160,63,54,.20)', cutLine: '#a03f36',
+    fade: 'rgba(47,122,107,.14)', playhead: '#2f3130',
+  };
+
+  function fmtClock(sec, decimals) {
+    if (!isFinite(sec) || sec < 0) sec = 0;
+    const m = Math.floor(sec / 60);
+    const s = sec - m * 60;
+    const text = decimals ? s.toFixed(1) : String(Math.round(s));
+    return m + ':' + (Number(text) < 10 ? '0' : '') + text;
+  }
+
+  const editorAudio = () => document.getElementById('editor-audio');
+
+  function editPlan() {
+    const cutLen = EDIT.cut ? Math.max(0, EDIT.cut.end - EDIT.cut.start) : 0;
+    return { cutLen, newDur: Math.max(0, EDIT.duration - cutLen) };
+  }
+
+  function editBlocked() {
+    const gen = (state.settings && state.settings.general) || {};
+    const audio = (state.settings && state.settings.audio) || {};
+    if (gen.dryRun) return 'Dry run is on: turn it off in Settings to edit files.';
+    if (audio.writeMode === 'output') {
+      return 'Write mode is output folder: editing the original is switched off in Settings.';
+    }
+    return '';
+  }
+
+  function editProblem(plan) {
+    if (!EDIT.duration) return '';
+    if (EDIT.fadeIn <= 0 && EDIT.fadeOut <= 0 && !EDIT.cut) return 'Set a fade or select a part to cut.';
+    if (EDIT.fadeIn > plan.newDur - 0.05 || EDIT.fadeOut > plan.newDur - 0.05) {
+      return 'A fade is longer than the file will be after the cut.';
+    }
+    if (EDIT.fadeIn + EDIT.fadeOut > plan.newDur) return 'Fade in and fade out overlap. Shorten one of them.';
+    return '';
+  }
+
+  function selectionHtml() {
+    if (EDIT.cut) {
+      const len = EDIT.cut.end - EDIT.cut.start;
+      return '<span class="cut-chip">Remove ' + fmtClock(EDIT.cut.start, 1) + ' – ' + fmtClock(EDIT.cut.end, 1)
+        + ' · ' + len.toFixed(1) + ' s</span>'
+        + '<button type="button" class="btn btn-sm" data-action="editor-uncut">Undo cut</button>';
+    }
+    if (EDIT.sel) {
+      const len = EDIT.sel.end - EDIT.sel.start;
+      return '<span><strong>Selection</strong> ' + fmtClock(EDIT.sel.start, 1) + ' – ' + fmtClock(EDIT.sel.end, 1)
+        + ' · ' + len.toFixed(1) + ' s</span>'
+        + '<button type="button" class="btn btn-sm btn-primary" data-action="editor-cut">Cut this part</button>'
+        + '<button type="button" class="btn btn-sm" data-action="editor-clear-sel">Clear</button>';
+    }
+    return '<span class="muted">Drag over the waveform to select a part to remove.</span>';
+  }
+
+  function summaryHtml(plan) {
+    if (!EDIT.duration) return '';
+    const bits = [];
+    if (EDIT.cut) {
+      bits.push('cut ' + fmtClock(EDIT.cut.start, 1) + ' – ' + fmtClock(EDIT.cut.end, 1));
+    }
+    if (EDIT.fadeIn > 0) bits.push('fade in ' + EDIT.fadeIn.toFixed(1) + ' s');
+    if (EDIT.fadeOut > 0) bits.push('fade out ' + EDIT.fadeOut.toFixed(1) + ' s');
+    if (!bits.length) return 'New length <strong>' + fmtClock(plan.newDur, 1) + '</strong> · nothing selected yet';
+    return 'New length <strong>' + fmtClock(plan.newDur, 1) + '</strong> (now ' + fmtClock(EDIT.duration, 1) + ') · '
+      + esc(bits.join(' · '));
+  }
+
+  function editorNoteHtml() {
+    const mode = state.settings && state.settings.audio ? state.settings.audio.writeMode : 'inplace';
+    if (mode === 'backup') return 'Saved over the original; a backup is kept in the config volume.';
+    if (mode === 'output') return 'Write mode is output folder: editing the original is switched off in Settings.';
+    return 'Saved over the original, without a backup. The file is measured again in the next run.';
+  }
+
+  function syncEditor() {
+    if (!EDIT.open) return;
+    const plan = editPlan();
+    const audio = editorAudio();
+    document.getElementById('editor-title').textContent = 'Edit ' + (EDIT.name || 'audio');
+    const measured = EDIT.lufs === null ? 'not measured yet'
+      : fmtLufs(EDIT.lufs) + (typeof EDIT.peak === 'number' ? ' · ' + EDIT.peak.toFixed(1) + ' dBTP' : '');
+    const sub = [folderTail(EDIT.relpath), MEDIA[EDIT.media].label,
+      EDIT.duration ? fmtClock(EDIT.duration, 0) + ' long' : '', measured].filter(Boolean).join(' · ');
+    document.getElementById('editor-sub').textContent =
+      sub + (EDIT.loading ? ' · reading the levels…' : '');
+    const play = document.getElementById('editor-play');
+    play.textContent = EDIT.playing ? 'Pause' : 'Play';
+    play.disabled = !EDIT.duration || EDIT.loading;
+    document.getElementById('editor-time').textContent =
+      fmtClock(audio ? audio.currentTime : 0, 0) + ' / ' + fmtClock(EDIT.duration, 0);
+    document.getElementById('editor-zoom').textContent = !EDIT.duration ? ''
+      : EDIT.view.dur >= EDIT.duration - 0.01 ? 'whole file'
+        : fmtClock(EDIT.view.dur, EDIT.view.dur < 10 ? 1 : 0) + ' visible';
+    const pan = document.getElementById('editor-pan');
+    const span = Math.max(0, EDIT.duration - EDIT.view.dur);
+    pan.hidden = !(EDIT.duration && span > 0.02);
+    if (!pan.hidden) {
+      pan.value = String(Math.round((EDIT.view.start / span) * 1000));
+      paintRange(pan);
+    }
+    document.getElementById('editor-sel').innerHTML = selectionHtml();
+    const fadeIn = document.getElementById('editor-fade-in');
+    const fadeOut = document.getElementById('editor-fade-out');
+    const maxFade = Math.max(0.5, Math.min(30, plan.newDur || 30));
+    if (EDIT.fadeIn > maxFade) EDIT.fadeIn = maxFade;
+    if (EDIT.fadeOut > maxFade) EDIT.fadeOut = maxFade;
+    fadeIn.max = fadeOut.max = String(maxFade);
+    if (document.activeElement !== fadeIn) fadeIn.value = String(EDIT.fadeIn);
+    if (document.activeElement !== fadeOut) fadeOut.value = String(EDIT.fadeOut);
+    paintRange(fadeIn);
+    paintRange(fadeOut);
+    document.getElementById('editor-fade-in-out').textContent = EDIT.fadeIn > 0 ? EDIT.fadeIn.toFixed(1) + ' s' : 'off';
+    document.getElementById('editor-fade-out-out').textContent = EDIT.fadeOut > 0 ? EDIT.fadeOut.toFixed(1) + ' s' : 'off';
+    document.getElementById('editor-summary').innerHTML = summaryHtml(plan);
+    const problem = editBlocked() || editProblem(plan);
+    const warn = document.getElementById('editor-warn');
+    const message = problem || EDIT.applyError;
+    warn.hidden = !message;
+    warn.textContent = message || '';
+    const apply = document.getElementById('editor-apply');
+    apply.disabled = EDIT.busy || EDIT.loading || !!EDIT.waveError || !EDIT.duration || !!problem;
+    apply.textContent = EDIT.busy ? 'Applying…' : 'Apply edits';
+    document.getElementById('editor-note').textContent = editorNoteHtml();
+  }
+
+  function drawEditor() {
+    const canvas = document.getElementById('editor-canvas');
+    if (!canvas || !EDIT.open) return;
+    const ctx = canvas.getContext ? canvas.getContext('2d') : null;
+    if (!ctx) return;                                  // no canvas support: the controls still work
+    const W = Math.max(280, canvas.clientWidth || 680);
+    const H = 190;
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+      canvas.width = Math.round(W * dpr);
+      canvas.height = Math.round(H * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = EDIT_COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (!EDIT.duration) {                              // the length is on its way: never show the last file
+      ctx.fillStyle = EDIT_COLORS.text;
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(EDIT.waveError || 'Opening…', W / 2, H / 2);
+      ctx.textAlign = 'left';
+      return;
+    }
+    const ruler = 22, top = ruler + 8, bottom = H - 8;
+    const mid = (top + bottom) / 2, half = (bottom - top) / 2;
+    const view = EDIT.view;
+    const xOf = (t) => ((t - view.start) / view.dur) * W;
+
+    /* time ruler */
+    const steps = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800];
+    const target = view.dur / Math.max(2, W / 90);
+    const step = steps.find((v) => v >= target) || steps[steps.length - 1];
+    ctx.strokeStyle = EDIT_COLORS.grid;
+    ctx.beginPath();
+    ctx.moveTo(0, ruler + 0.5);
+    ctx.lineTo(W, ruler + 0.5);
+    ctx.stroke();
+    ctx.fillStyle = EDIT_COLORS.text;
+    ctx.font = '10px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    const first = Math.ceil(view.start / step) * step;
+    for (let t = first; t <= view.start + view.dur + 1e-6; t += step) {
+      const x = Math.round(xOf(t)) + 0.5;
+      if (x < 0 || x > W) continue;
+      ctx.strokeStyle = EDIT_COLORS.grid;
+      ctx.beginPath();
+      ctx.moveTo(x, ruler);
+      ctx.lineTo(x, ruler + 5);
+      ctx.stroke();
+      ctx.fillText(fmtClock(t, step < 1 ? 1 : 0), Math.max(1, Math.min(W - 36, x + 3)), 12);
+    }
+
+    /* level lines */
+    ctx.font = '10px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textBaseline = 'middle';
+    [[0, '0 dB'], [-6, '−6'], [-12, '−12'], [-24, '−24']].forEach(([db, label]) => {
+      const y = mid - Math.pow(10, db / 20) * half;
+      if (y < top - 1 || y > bottom + 1) return;
+      ctx.strokeStyle = EDIT_COLORS.grid;
+      ctx.setLineDash(db === 0 ? [] : [3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(0, y + 0.5);
+      ctx.lineTo(W, y + 0.5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = EDIT_COLORS.gridText;
+      ctx.fillText(label, 4, Math.max(top, y - 7));
+    });
+
+    /* waveform */
+    const win = EDIT.window;
+    if (!win || !win.min || !win.min.length) {
+      ctx.fillStyle = EDIT_COLORS.text;
+      ctx.font = '12px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(EDIT.waveError || 'Reading the levels…', W / 2, mid);
+      ctx.textAlign = 'left';
+      return;
+    }
+    const n = win.min.length;
+    const winEnd = win.start + win.duration;
+    ctx.fillStyle = EDIT_COLORS.wave;
+    for (let x = 0; x < W; x += 1) {
+      const t0 = view.start + (x / W) * view.dur;
+      const t1 = view.start + ((x + 1) / W) * view.dur;
+      if (t1 < win.start || t0 > winEnd) continue;
+      let i0 = Math.floor(((t0 - win.start) / win.duration) * n);
+      let i1 = Math.ceil(((t1 - win.start) / win.duration) * n);
+      i0 = Math.max(0, Math.min(n - 1, i0));
+      i1 = Math.max(i0 + 1, Math.min(n, i1));
+      let lo = 0;
+      let hi = 0;
+      for (let i = i0; i < i1; i += 1) {
+        if (win.min[i] < lo) lo = win.min[i];
+        if (win.max[i] > hi) hi = win.max[i];
+      }
+      const yTop = mid - hi * half;
+      const yBot = mid - lo * half;
+      ctx.fillRect(x, yTop, 1, Math.max(1, yBot - yTop));
+    }
+
+    /* fades: drawn on the timeline that remains after the cut */
+    const plan = editPlan();
+    const mapTime = (t) => {
+      if (!EDIT.cut) return t;
+      return t < EDIT.cut.start ? t : Math.min(EDIT.duration, t + plan.cutLen);
+    };
+    ctx.strokeStyle = EDIT_COLORS.waveDim;
+    if (EDIT.fadeIn > 0) {
+      const x0 = xOf(0);
+      const x1 = xOf(Math.min(EDIT.fadeIn, plan.newDur));
+      ctx.fillStyle = EDIT_COLORS.fade;
+      ctx.fillRect(Math.max(0, x0), top, Math.max(0, x1 - Math.max(0, x0)), bottom - top);
+      ctx.beginPath();
+      ctx.moveTo(x0, bottom);
+      ctx.lineTo(x1, top);
+      ctx.stroke();
+    }
+    if (EDIT.fadeOut > 0) {
+      const x0 = xOf(mapTime(Math.max(0, plan.newDur - EDIT.fadeOut)));
+      const x1 = xOf(mapTime(plan.newDur));
+      ctx.fillStyle = EDIT_COLORS.fade;
+      ctx.fillRect(Math.max(0, x0), top, Math.min(W, x1) - Math.max(0, x0), bottom - top);
+      ctx.beginPath();
+      ctx.moveTo(x0, top);
+      ctx.lineTo(x1, bottom);
+      ctx.stroke();
+    }
+
+    /* the part that will be removed */
+    if (EDIT.cut) {
+      const x0 = Math.max(0, xOf(EDIT.cut.start));
+      const x1 = Math.min(W, xOf(EDIT.cut.end));
+      if (x1 > x0) {
+        ctx.fillStyle = EDIT_COLORS.cut;
+        ctx.fillRect(x0, top, x1 - x0, bottom - top);
+        ctx.strokeStyle = EDIT_COLORS.cutLine;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(x0, top);
+        ctx.lineTo(x0, bottom);
+        ctx.moveTo(x1, top);
+        ctx.lineTo(x1, bottom);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        const label = 'remove ' + (EDIT.cut.end - EDIT.cut.start).toFixed(1) + ' s';
+        ctx.font = '11px system-ui, sans-serif';
+        if (x1 - x0 > ctx.measureText(label).width + 10) {
+          ctx.fillStyle = EDIT_COLORS.cutLine;
+          ctx.textBaseline = 'top';
+          ctx.fillText(label, x0 + 5, top + 4);
+        }
+      }
+    }
+
+    /* the selection */
+    if (EDIT.sel) {
+      const x0 = xOf(EDIT.sel.start);
+      const x1 = xOf(EDIT.sel.end);
+      ctx.fillStyle = EDIT_COLORS.sel;
+      ctx.fillRect(Math.max(0, x0), top, Math.min(W, x1) - Math.max(0, x0), bottom - top);
+      ctx.strokeStyle = EDIT_COLORS.wave;
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(x0, top);
+      ctx.lineTo(x0, bottom);
+      ctx.moveTo(x1, top);
+      ctx.lineTo(x1, bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    /* playhead */
+    const audio = editorAudio();
+    const now = audio ? audio.currentTime : 0;
+    if (now >= view.start && now <= view.start + view.dur) {
+      const x = xOf(now);
+      ctx.strokeStyle = EDIT_COLORS.playhead;
+      ctx.beginPath();
+      ctx.moveTo(x, ruler);
+      ctx.lineTo(x, bottom);
+      ctx.stroke();
+      ctx.fillStyle = EDIT_COLORS.playhead;
+      ctx.beginPath();
+      ctx.moveTo(x - 4, ruler);
+      ctx.lineTo(x + 4, ruler);
+      ctx.lineTo(x, ruler + 6);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function scheduleWindow() {
+    clearTimeout(EDIT.timer);
+    EDIT.timer = setTimeout(fetchViewWindow, 180);
+  }
+
+  function fetchViewWindow() {
+    if (!EDIT.open || !EDIT.duration) return;
+    const view = EDIT.view;
+    if (EDIT.base && view.dur >= EDIT.duration - 0.01) {
+      EDIT.window = EDIT.base;
+      drawEditor();
+      return;
+    }
+    const canvas = document.getElementById('editor-canvas');
+    const buckets = Math.min(4000, Math.max(200, Math.round((canvas && canvas.clientWidth ? canvas.clientWidth : 800) * 1.5)));
+    loadWaveform(view.start, view.dur, buckets, false);
+  }
+
+  function loadWaveform(start, duration, buckets, base) {
+    if (!EDIT.open) return;
+    const seq = ++EDIT.req;
+    if (base) {
+      EDIT.loading = true;
+      EDIT.base = null;
+      EDIT.window = null;
+      EDIT.waveError = '';
+      syncEditor();
+    }
+    let url = '/files/waveform?media=' + encodeURIComponent(EDIT.media)
+      + '&relpath=' + encodeURIComponent(EDIT.relpath)
+      + '&buckets=' + buckets + '&start=' + Number(start || 0).toFixed(3);
+    if (duration) url += '&duration=' + Number(duration).toFixed(3);
+    api(url).then((d) => {
+      if (!EDIT.open || seq !== EDIT.req) return;
+      if (base) {
+        EDIT.base = d;
+        EDIT.window = d;
+        EDIT.duration = d.file_duration;
+        if (!EDIT.viewTouched) EDIT.view = { start: 0, dur: d.file_duration };
+        EDIT.loading = false;
+        if (EDIT.viewTouched) scheduleWindow();
+      } else {
+        EDIT.window = d;
+      }
+      EDIT.waveError = '';
+      syncEditor();
+      drawEditor();
+    }).catch((err) => {
+      if (!EDIT.open || seq !== EDIT.req) return;
+      EDIT.loading = false;
+      EDIT.waveError = err.message;
+      syncEditor();
+      drawEditor();
+    });
+  }
+
+  function zoomBy(factor, anchor) {
+    if (!EDIT.duration) return;
+    const view = EDIT.view;
+    const minDur = Math.min(EDIT.duration, EDIT_MIN_WINDOW);
+    const newDur = Math.max(minDur, Math.min(EDIT.duration, view.dur * factor));
+    if (Math.abs(newDur - view.dur) < 1e-6) return;
+    const at = anchor === undefined ? view.start + view.dur / 2 : anchor;
+    const frac = view.dur > 0 ? (at - view.start) / view.dur : 0.5;
+    let start = at - frac * newDur;
+    start = Math.max(0, Math.min(EDIT.duration - newDur, start));
+    EDIT.view = { start, dur: newDur };
+    EDIT.viewTouched = true;
+    scheduleWindow();
+    syncEditor();
+    drawEditor();
+  }
+
+  function panBy(delta) {
+    if (!EDIT.duration) return;
+    const span = Math.max(0, EDIT.duration - EDIT.view.dur);
+    const start = Math.max(0, Math.min(span, EDIT.view.start + delta));
+    if (Math.abs(start - EDIT.view.start) < 1e-9) return;
+    EDIT.view.start = start;
+    EDIT.viewTouched = true;
+    scheduleWindow();
+    syncEditor();
+    drawEditor();
+  }
+
+  function fitEditor() {
+    if (!EDIT.duration) return;
+    EDIT.view = { start: 0, dur: EDIT.duration };
+    EDIT.viewTouched = false;
+    if (EDIT.base) EDIT.window = EDIT.base;
+    clearTimeout(EDIT.timer);
+    syncEditor();
+    drawEditor();
+  }
+
+  function seekEditor(t) {
+    const audio = editorAudio();
+    if (!audio || !EDIT.duration) return;
+    audio.currentTime = Math.max(0, Math.min(EDIT.duration, t));
+    updateEditorTime();
+    drawEditor();
+  }
+
+  function toggleEditorPlay() {
+    const audio = editorAudio();
+    if (!audio || !EDIT.duration) return;
+    if (EDIT.playing) audio.pause();
+    else audio.play().catch(() => toast('The browser blocked playback. Press Play again.'));
+  }
+
+  function updateEditorTime() {
+    const audio = editorAudio();
+    const time = document.getElementById('editor-time');
+    if (time) time.textContent = fmtClock(audio ? audio.currentTime : 0, 0) + ' / ' + fmtClock(EDIT.duration, 0);
+    const play = document.getElementById('editor-play');
+    if (play) play.textContent = EDIT.playing ? 'Pause' : 'Play';
+  }
+
+  function editorTick() {
+    EDIT.raf = null;
+    if (!EDIT.open) return;
+    const audio = editorAudio();
+    const playing = EDIT.playing;              // the play/pause/ended events are the source
+    updateEditorTime();
+    if (playing && audio && EDIT.duration) {
+      const t = audio.currentTime;
+      /* keep the playhead in view while playing a zoomed part */
+      if (EDIT.view.dur < EDIT.duration - 0.01
+        && (t < EDIT.view.start + 0.02 || t > EDIT.view.start + EDIT.view.dur - 0.02)) {
+        EDIT.view.start = Math.max(0, Math.min(EDIT.duration - EDIT.view.dur, t - EDIT.view.dur / 2));
+        EDIT.viewTouched = true;
+        scheduleWindow();
+      }
+    }
+    const now = Date.now();
+    if (!EDIT.lastDraw || now - EDIT.lastDraw > 30) {
+      drawEditor();
+      EDIT.lastDraw = now;
+    }
+    if (playing) EDIT.raf = requestAnimationFrame(editorTick);
+    else { syncEditor(); drawEditor(); }
+  }
+
+  function editorAnchor() {
+    const audio = editorAudio();
+    const t = audio ? audio.currentTime : 0;
+    return t >= EDIT.view.start && t <= EDIT.view.start + EDIT.view.dur
+      ? t : EDIT.view.start + EDIT.view.dur / 2;
+  }
+
+  function editorTimeAt(ev) {
+    const canvas = document.getElementById('editor-canvas');
+    if (!canvas) return 0;
+    const rect = canvas.getBoundingClientRect();
+    const width = rect.width || canvas.clientWidth || 680;
+    const x = Math.max(0, Math.min(width, ev.clientX - rect.left));
+    return EDIT.view.start + (x / width) * EDIT.view.dur;
+  }
+
+  function openEditor(media, file) {
+    if (!file) return;
+    if (media !== 'audio') { toast('Editing is available for audio files only.'); return; }
+    if (!file.playable) { toast('This format cannot be edited here.'); return; }
+    closePreview();                                  // only one thing plays at a time
+    EDIT.open = true;
+    EDIT.media = media;
+    EDIT.relpath = file.relpath;
+    EDIT.name = file.name;
+    EDIT.duration = 0;
+    EDIT.lufs = typeof file.lufs === 'number' ? file.lufs : null;
+    EDIT.peak = typeof file.true_peak === 'number' ? file.true_peak : null;
+    EDIT.view = { start: 0, dur: 1 };
+    EDIT.base = EDIT.window = null;
+    EDIT.sel = EDIT.cut = null;
+    EDIT.fadeIn = EDIT.fadeOut = 0;
+    EDIT.loading = true;
+    EDIT.waveError = '';
+    EDIT.applyError = '';
+    EDIT.busy = false;
+    EDIT.playing = false;
+    EDIT.viewTouched = false;
+    EDIT.session += 1;
+    EDIT.lastFocus = document.activeElement;
+    drawEditor();                                    // drop the previous file's picture at once
+    const audio = editorAudio();
+    if (audio) {
+      audio.pause();
+      audio.src = streamUrl(media, file.relpath);
+    }
+    const modal = document.getElementById('editor');
+    modal.hidden = false;
+    document.body.classList.add('has-modal');
+    syncEditor();
+    const close = modal.querySelector('[data-action="editor-close"]');
+    if (close) close.focus();
+    loadEditInfo();
+    loadWaveform(0, null, 1800, true);
+  }
+
+  function loadEditInfo() {
+    const session = EDIT.session;
+    api('/files/info?media=' + encodeURIComponent(EDIT.media)
+      + '&relpath=' + encodeURIComponent(EDIT.relpath)).then((d) => {
+      if (!EDIT.open || session !== EDIT.session || !d || !d.duration) return;
+      if (!EDIT.duration) {
+        EDIT.duration = d.duration;
+        if (!EDIT.viewTouched) EDIT.view = { start: 0, dur: d.duration };
+        syncEditor();
+        drawEditor();
+      }
+    }).catch(() => { /* the waveform call reports the error */ });
+  }
+
+  function closeEditor() {
+    if (!EDIT.open) return;
+    EDIT.open = false;
+    EDIT.req += 1;
+    EDIT.session += 1;
+    clearTimeout(EDIT.timer);
+    if (EDIT.raf) cancelAnimationFrame(EDIT.raf);
+    EDIT.raf = null;
+    EDIT.playing = false;
+    EDIT.sel = null;
+    EDIT.cut = null;
+    const audio = editorAudio();
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute('src');
+      if (audio.load) audio.load();
+    }
+    const modal = document.getElementById('editor');
+    if (modal) modal.hidden = true;
+    document.body.classList.remove('has-modal');
+    if (EDIT.lastFocus && EDIT.lastFocus.focus) EDIT.lastFocus.focus();
+    EDIT.lastFocus = null;
+  }
+
+  async function applyEdit() {
+    const plan = editPlan();
+    if (EDIT.busy || editBlocked() || editProblem(plan)) return;
+    EDIT.busy = true;
+    EDIT.applyError = '';
+    const busy = startBusy('Editing ' + EDIT.name);
+    const tick = tickBusy(busy);
+    syncEditor();
+    let name = EDIT.name;
+    try {
+      const r = await api('/files/edit', {
+        method: 'POST',
+        body: {
+          media: EDIT.media,
+          relpath: EDIT.relpath,
+          fade_in: EDIT.fadeIn,
+          fade_out: EDIT.fadeOut,
+          cut_start: EDIT.cut ? EDIT.cut.start : null,
+          cut_end: EDIT.cut ? EDIT.cut.end : null,
+        },
+      });
+      name = r.name;
+      closeEditor();
+      invalidate('dir:' + state.media);
+      state.browse = { media: null, rel: null, rows: null, loading: false };
+      await refreshDash();
+      toast('Edited ' + name + ' · new length ' + fmtClock(r.duration, 1));
+      render();
+    } catch (err) {
+      EDIT.applyError = err.message;
+      toast(err.message);
+      syncEditor();
+    } finally {
+      tick.stop();
+      endBusy(busy);
+      EDIT.busy = false;
+      syncEditor();
+    }
+  }
+
+  function initEditor() {
+    const modal = document.getElementById('editor');
+    const audio = editorAudio();
+    const canvas = document.getElementById('editor-canvas');
+    if (!modal || !audio || !canvas) return;
+
+    audio.addEventListener('play', () => {
+      EDIT.playing = true;
+      syncEditor();
+      if (!EDIT.raf) EDIT.raf = requestAnimationFrame(editorTick);
+    });
+    audio.addEventListener('pause', () => {
+      EDIT.playing = false;
+      syncEditor();
+      drawEditor();
+    });
+    audio.addEventListener('ended', () => {
+      EDIT.playing = false;
+      syncEditor();
+      drawEditor();
+    });
+    audio.addEventListener('timeupdate', () => {
+      if (!EDIT.playing) {
+        updateEditorTime();
+        drawEditor();
+      }
+    });
+    audio.addEventListener('loadedmetadata', drawEditor);
+    audio.addEventListener('error', () => {
+      if (!EDIT.open || !EDIT.relpath) return;
+      EDIT.waveError = 'This file cannot be played in the browser.';
+      syncEditor();
+    });
+
+    let drag = null;
+    canvas.addEventListener('pointerdown', (ev) => {
+      if (!EDIT.duration) return;
+      ev.preventDefault();
+      if (canvas.setPointerCapture) canvas.setPointerCapture(ev.pointerId);
+      drag = { t0: editorTimeAt(ev), t: editorTimeAt(ev), moved: false };
+      EDIT.dragging = drag;
+    });
+    canvas.addEventListener('pointermove', (ev) => {
+      if (!drag) return;
+      const t = editorTimeAt(ev);
+      drag.t = t;
+      const px = EDIT.view.dur / Math.max(1, canvas.clientWidth || 680);
+      if (Math.abs(t - drag.t0) > px * 3) {
+        drag.moved = true;
+        EDIT.sel = { start: Math.min(drag.t0, t), end: Math.max(drag.t0, t) };
+        syncEditor();
+        drawEditor();
+      }
+    });
+    const finishDrag = () => {
+      if (!drag) return;
+      if (!drag.moved) {
+        EDIT.sel = null;
+        seekEditor(drag.t0);
+      }
+      drag = null;
+      EDIT.dragging = null;
+      syncEditor();
+      drawEditor();
+    };
+    canvas.addEventListener('pointerup', finishDrag);
+    canvas.addEventListener('pointercancel', () => { drag = null; EDIT.dragging = null; });
+    canvas.addEventListener('wheel', (ev) => {
+      if (!EDIT.duration) return;
+      ev.preventDefault();
+      if (ev.ctrlKey || ev.metaKey) {
+        zoomBy(ev.deltaY > 0 ? ZOOM_STEP : 1 / ZOOM_STEP, editorTimeAt(ev));
+      } else {
+        const delta = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+        panBy((delta / 400) * EDIT.view.dur);
+      }
+    }, { passive: false });
+
+    const fadeIn = document.getElementById('editor-fade-in');
+    const fadeOut = document.getElementById('editor-fade-out');
+    const onFade = () => {
+      EDIT.fadeIn = Number(fadeIn.value);
+      EDIT.fadeOut = Number(fadeOut.value);
+      syncEditor();
+      drawEditor();
+    };
+    fadeIn.addEventListener('input', onFade);
+    fadeOut.addEventListener('input', onFade);
+
+    const pan = document.getElementById('editor-pan');
+    pan.addEventListener('input', () => {
+      const span = Math.max(0, EDIT.duration - EDIT.view.dur);
+      EDIT.view.start = (Number(pan.value) / 1000) * span;
+      EDIT.viewTouched = true;
+      scheduleWindow();
+      paintRange(pan);
+      drawEditor();
+    });
+
+    modal.addEventListener('click', (ev) => {
+      if (ev.target === modal) closeEditor();
+    });
+    document.addEventListener('keydown', (ev) => {
+      if (!EDIT.open) return;
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeEditor();
+        return;
+      }
+      const tag = (ev.target && ev.target.tagName) || '';
+      if (ev.key === ' ' && !/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(tag)) {
+        ev.preventDefault();
+        toggleEditorPlay();
+      }
+    });
+    window.addEventListener('resize', () => { if (EDIT.open) drawEditor(); });
+    paintRange(fadeIn);
+    paintRange(fadeOut);
   }
 
   /* ------------------------------------------------------------------ API */
@@ -648,7 +1383,7 @@
     const b = state.browse;
     const head = '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
       + '<div class="sub">' + node.directFiles + ' files directly in this folder · ' + (subtree(node).length - 1) + ' sub-folders'
-      + ' · Play listens to the original, without changing it</div></div>'
+      + ' · Play listens to the original · Edit fades or cuts a part</div></div>'
       + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div>';
     if (b.loading || b.media !== t || b.rel !== node.rel || !b.rows) {
       return head + '<p class="muted">Loading files…</p>';
@@ -660,6 +1395,12 @@
       const ext = String(f.name).split('.').pop();
       const checking = !!(state.measure && state.measure.relpath === f.relpath && state.measure.state === 'measuring');
       const playing = PLAY.media === t && PLAY.relpath === f.relpath && PLAY.playing;
+      const editing = t === 'audio' && !!f.playable
+        ? '<button class="btn btn-sm" data-action="edit-file" data-idx="' + i + '"'
+          + (f.status === 'processing'
+            ? ' disabled title="This file is being processed right now"'
+            : ' title="Edit ' + esc(f.name) + ': fades and cut"') + '>Edit</button>'
+        : '';
       const listen = !f.playable
         ? '<button class="btn btn-sm" disabled title="This format cannot be played in the browser">Play</button>'
         : '<button class="btn btn-sm' + (playing ? ' btn-primary' : '') + '" data-action="preview" data-idx="' + i
@@ -675,7 +1416,7 @@
         + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
         + '<td>' + statusLabel(f.status) + '</td>'
-        + '<td class="actions-cell">' + listen + check + '</td></tr>';
+        + '<td class="actions-cell">' + listen + editing + check + '</td></tr>';
     }).join('');
     return head
       + '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level'
@@ -1147,6 +1888,36 @@
     } else if (a === 'preview') {
       const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
       if (f) playFile(t, f);
+    } else if (a === 'edit-file') {
+      const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
+      if (f) openEditor(t, f);
+    } else if (a === 'editor-close') {
+      closeEditor();
+    } else if (a === 'editor-play') {
+      toggleEditorPlay();
+    } else if (a === 'editor-zoom-in') {
+      zoomBy(1 / ZOOM_STEP, editorAnchor());
+    } else if (a === 'editor-zoom-out') {
+      zoomBy(ZOOM_STEP, editorAnchor());
+    } else if (a === 'editor-fit') {
+      fitEditor();
+    } else if (a === 'editor-cut') {
+      if (EDIT.sel && EDIT.sel.end - EDIT.sel.start >= 0.05) {
+        EDIT.cut = { start: EDIT.sel.start, end: EDIT.sel.end };
+        EDIT.sel = null;
+        syncEditor();
+        drawEditor();
+      }
+    } else if (a === 'editor-uncut') {
+      EDIT.cut = null;
+      syncEditor();
+      drawEditor();
+    } else if (a === 'editor-clear-sel') {
+      EDIT.sel = null;
+      syncEditor();
+      drawEditor();
+    } else if (a === 'editor-apply') {
+      await applyEdit();
     } else if (a === 'player-toggle') {
       togglePreview();
     } else if (a === 'player-close') {
@@ -1520,6 +2291,7 @@
 
   applyMenu();
   initPlayer();
+  initEditor();
   if (currentRoute() === 'directories') openDirectories();   // also when the app opens on this page
   render();
 })();

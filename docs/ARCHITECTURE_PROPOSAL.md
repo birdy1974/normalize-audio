@@ -81,7 +81,8 @@ audio-normalizer/
 | State | **SQLite** in `/config` | Survives restarts; stores per-file fingerprint (path, size, mtime, hash), status, gain, history. |
 | Scheduler | Own weekly-window logic (not cron) | Simple "days + hours" grid in the UI; no external daemon. |
 | Frontend | Vanilla JS (as in the mock-up) | No build step, small image, easy to maintain on a NAS. |
-| Busy state | Client actions + `/api/dashboard.scanning` | The menu shows what the app is doing (scan, level check, save, run) on every page. |
+| Busy state | Client actions + `/api/dashboard.scanning` | The menu shows what the app is doing (scan, level check, save, edit, run) on every page. |
+| Waveform | ffmpeg decode to 8 kHz mono PCM, reduced to min/max buckets, LRU cached by path/mtime/size/window | One cheap decode per window; zoom and scroll reuse the cache instead of the browser decoding the whole file, and a long file is only decoded where it is shown. |
 | HA integration | REST endpoint `/api/v1/ha/status` (bearer token) | Works with HA's built-in RESTful sensors without custom code. |
 
 ### 2.2 Processing pipeline (per file)
@@ -167,6 +168,7 @@ volumes:
 | Parked files sorted by change (mock-up v4.2) | Sort select: file order, change needed lowest or highest first, size of change largest first. The list is sorted by the server (`/api/parked?sort=`). |
 | Green range sliders (mock-up v4.2) | The part of the track left of the thumb is filled green, on every slider. |
 | Pre-listen from Directories | Play button per file (`playable` from the API); one player at the bottom of the page streams `GET /api/files/stream?media=&relpath=` unchanged, with HTTP Range so it can seek. Formats a browser cannot decode (WMA, AVI, MKV, …) have the button disabled. |
+| Edit an audio file (fades, cut) | Edit button per audio file opens a pop-up with the waveform: `GET /api/files/waveform` returns min/max peak buckets per window (8…8000 buckets, LRU cached, so zooming and scrolling stay fast), `GET /api/files/info` gives the length at once, and `POST /api/files/edit` applies `fade_in`, `fade_out` and one `cut_start`/`cut_end` range. The server does the work with ffmpeg (`afade` after `atrim`, then `concat`), verifies the result and replaces the file atomically, with the configured backup; the row goes back to `pending` so the next run measures the new level. Blocked in dry run and in the output-folder write mode. The browser never transcodes. |
 | Editable Home Assistant sensor names | Each optional sensor has a name that can be changed to match the sensor in Home Assistant (default kept, with a Default button). The UI shows the entity ID Home Assistant derives from it. The unique ID does not change with the name. |
 | Helptips instead of help text (mock-up v4.1) | Descriptions appear as an information icon with a popup on hover/focus; the page keeps only its intro text and status messages. |
 | Override confirmation for large changes | Toggle in settings (applies large changes automatically). |

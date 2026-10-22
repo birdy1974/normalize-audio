@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import __version__, folders, ha, state, stats
+from . import __version__, folders, ha, state, stats, waveform
 from .config import tool_path
 from .media import EXTENSIONS, MEDIA
 from .schedule import in_window, next_change
@@ -49,6 +49,15 @@ class ScanBody(BaseModel):
 class MeasureBody(BaseModel):
     media: Literal["audio", "video"]
     relpath: str
+
+
+class EditBody(BaseModel):
+    media: Literal["audio"]
+    relpath: str
+    fade_in: float = 0.0            # seconds
+    fade_out: float = 0.0           # seconds
+    cut_start: float | None = None  # seconds; both or neither
+    cut_end: float | None = None
 
 
 class AdjustBody(BaseModel):
@@ -292,6 +301,36 @@ def measure(body: MeasureBody, engine=Engine):
     if ".." in body.relpath.split("/") or body.relpath.startswith("/"):
         raise HTTPException(400, "invalid path")
     return engine.measure(body.media, body.relpath)
+
+
+@router.get("/files/info")
+def file_info(media: str = "audio", relpath: str = "", engine=Engine):
+    """Length and codec of one file; the editor uses it before the levels are read."""
+    _media_check(media)
+    return waveform.info(engine.cfg.ffmpeg, _stream_path(engine, media, relpath))
+
+
+@router.get("/files/waveform")
+def file_waveform(media: str = "audio", relpath: str = "", start: float = 0.0,
+                  duration: float | None = None, buckets: int = 1200, engine=Engine):
+    """Levels over time for the timeline of the editor: one (min, max) pair per bucket."""
+    _media_check(media)
+    return waveform.peaks(engine.cfg.ffmpeg, _stream_path(engine, media, relpath),
+                          start=start, duration=duration, buckets=buckets)
+
+
+@router.post("/files/edit")
+def edit_file(body: EditBody, engine=Engine):
+    """Fade in/out and/or remove a part of one audio file, in place (with backup when set)."""
+    _media_check(body.media)
+    if ".." in body.relpath.split("/") or body.relpath.startswith("/"):
+        raise HTTPException(400, "invalid path")
+    cut = None
+    if body.cut_start is not None or body.cut_end is not None:
+        if body.cut_start is None or body.cut_end is None:
+            raise HTTPException(400, "a cut needs both a start and an end")
+        cut = (body.cut_start, body.cut_end)
+    return engine.edit_audio(body.media, body.relpath, fade_in=body.fade_in, fade_out=body.fade_out, cut=cut)
 
 
 # ------------------------------------------------------------ parked files

@@ -10,7 +10,7 @@
   <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
   <link rel="manifest" href="/static/site.webmanifest">
   <meta name="theme-color" content="#2f3130">
-  <link rel="stylesheet" href="/static/styles.css?v=8">
+  <link rel="stylesheet" href="/static/styles.css?v=9">
 </head>
 <body>
   <div class="app">
@@ -61,8 +61,53 @@
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
     </button>
   </div>
+  <audio id="editor-audio" preload="metadata"></audio>
+  <div class="modal" id="editor" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <header class="modal-head">
+        <div class="modal-title-wrap">
+          <h2 id="editor-title">Edit audio</h2>
+          <p class="sub" id="editor-sub"></p>
+        </div>
+        <button type="button" class="icon-btn" data-action="editor-close" aria-label="Close the editor" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+      <div class="editor-bar">
+        <button type="button" class="btn btn-sm" data-action="editor-play" id="editor-play">Play</button>
+        <span class="editor-time" id="editor-time">0:00 / 0:00</span>
+        <span class="grow"></span>
+        <button type="button" class="btn btn-sm" data-action="editor-zoom-out" aria-label="Zoom out" title="Zoom out">−</button>
+        <button type="button" class="btn btn-sm" data-action="editor-zoom-in" aria-label="Zoom in" title="Zoom in">+</button>
+        <button type="button" class="btn btn-sm" data-action="editor-fit" title="Show the whole file">Fit</button>
+        <span class="editor-zoom" id="editor-zoom"></span>
+      </div>
+      <div class="editor-wave">
+        <canvas id="editor-canvas" height="190" aria-label="Audio levels over time. Drag to select a part."></canvas>
+        <p class="editor-hint">Drag over the waveform to select a part · click to seek · Ctrl + wheel zooms, wheel scrolls · Space plays, Esc closes</p>
+      </div>
+      <input type="range" class="editor-pan" id="editor-pan" min="0" max="1000" step="1" value="0" aria-label="Scroll through the file" hidden>
+      <div class="editor-sel" id="editor-sel" aria-live="polite"></div>
+      <div class="editor-fades">
+        <label for="editor-fade-in">Fade in</label>
+        <input type="range" id="editor-fade-in" min="0" max="30" step="0.1" value="0">
+        <output id="editor-fade-in-out" for="editor-fade-in">off</output>
+        <label for="editor-fade-out">Fade out</label>
+        <input type="range" id="editor-fade-out" min="0" max="30" step="0.1" value="0">
+        <output id="editor-fade-out-out" for="editor-fade-out">off</output>
+      </div>
+      <p class="editor-summary" id="editor-summary"></p>
+      <p class="editor-warn" id="editor-warn" hidden></p>
+      <footer class="modal-foot">
+        <span class="editor-note" id="editor-note"></span>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-action="editor-close">Cancel</button>
+        <button type="button" class="btn btn-primary" data-action="editor-apply" id="editor-apply">Apply edits</button>
+      </footer>
+    </div>
+  </div>
   <div id="toast" class="toast" role="status"></div>
   <script src="/static/audio-normalizer-card.js?v=5"></script>
-  <script src="/static/app.js?v=8"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>
