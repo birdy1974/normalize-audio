@@ -540,9 +540,13 @@ def test_dashboard_reports_the_mode_and_the_scan_schedule(client, cfg):
     d = client.get("/api/dashboard").json()
     assert d["mode"] == "bulk" and d["run_mode"] == "stopped" and d["status"] == "stopped"
     assert d["scan_every"] == 15 and d["last_scan"] is None
-    assert d["next_scan"]                                  # planned as soon as the app can scan
+    assert d["next_scan"] is None                          # Bulk has no periodic scan
 
-    _scan_library(cfg, client)
+    _scan_library(cfg, client)                             # a manual scan still works in Bulk
+    d = client.get("/api/dashboard").json()
+    assert d["last_scan"] and d["next_scan"] is None
+
+    assert client.put("/api/settings", json={"general": {"mode": "auto"}}).status_code == 200
     d = client.get("/api/dashboard").json()
     last, nxt = d["last_scan"], d["next_scan"]
     assert last and nxt

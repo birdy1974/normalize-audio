@@ -149,9 +149,9 @@ def dashboard(engine=Engine):
         "paused": run["paused"],
         "types": run["types"],
         "last_finished": run["lastFinished"],
-        "scan_every": sched["scanEvery"],         # minutes between two looks for new files
+        "scan_every": sched["scanEvery"],         # minutes between scans in Automatic mode
         "last_scan": run.get("lastScan"),
-        "next_scan": engine.next_scan(),          # None when the app is off
+        "next_scan": engine.next_scan(),          # None unless Automatic mode is selected
         "progress_percent": int(round(100 * checked / total)) if total else 0,
         "current_file": engine.current_file(),
         "scanning": engine.scanning(),

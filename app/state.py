@@ -10,8 +10,7 @@ from .db import Database
 DEFAULT_SETTINGS = {
     # mode: what the app does on its own
     #   off   nothing is scanned or normalized (manual reads still work)
-    #   bulk  new files are found every "scanEvery" minutes, but only a run started by the user
-    #         checks and normalizes the files that are there
+    #   bulk  only a run started by the user checks and normalizes enabled folders; no periodic scan
     #   auto  new and changed files are found every "scanEvery" minutes and normalized by themselves
     "general": {"dryRun": False, "preserveMtime": True, "mode": "bulk"},
     "audio": {

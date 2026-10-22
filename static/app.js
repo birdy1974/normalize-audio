@@ -1214,7 +1214,11 @@
 
   /* last scan: "14:02" today, "Tue 22:15" otherwise */
   function scanLine(d) {
-    if (d.mode === 'off') return 'Not scanning while the app is off.';
+    if (d.mode === 'off') return 'Automatic discovery is off. Rescan and opening Directories still work.';
+    if (d.mode === 'bulk') {
+      return 'Bulk processes enabled folders only; no periodic scan. Use Rescan to find new files'
+        + ' · last scan ' + (d.last_scan ? dayAndClock(d.last_scan) : 'not yet');
+    }
     const every = d.scan_every ? 'every ' + d.scan_every + ' min' : 'periodically';
     return 'Looking for new files ' + every
       + ' · last ' + (d.last_scan ? dayAndClock(d.last_scan) : 'not yet')
@@ -1224,9 +1228,9 @@
   function scheduleText(t) {
     const m = dashMedia(t);
     if (!m) return '';
-    if (!m.next_change) return m.in_schedule_window ? 'Always on' : 'No active hours (manual runs only)';
+    if (!m.next_change) return m.in_window ? 'Always on' : 'No active hours';
     const when = whenLabel(new Date(m.next_change));
-    return m.in_schedule_window ? 'Window open until ' + when : 'Window opens ' + when;
+    return m.in_window ? 'Window open until ' + when : 'Window opens ' + when;
   }
 
   function tree(t) { return state.trees[t]; }
@@ -1270,12 +1274,20 @@
   }
 
   /* ------------------------------------------------------------- dashboard */
+  function modeButtons(mode) {
+    return '<div class="seg mode-buttons" role="group" aria-label="Mode">'
+      + ['off', 'bulk', 'auto'].map((value) => '<button type="button" data-action="set-mode" data-mode="' + value + '"'
+        + ' class="' + (mode === value ? 'on' : '') + '" aria-pressed="' + (mode === value) + '">'
+        + MODE_LABEL[value] + '</button>').join('')
+      + '</div>';
+  }
+
   function mediaPanel(t) {
     const m = dashMedia(t);
     return '<section class="card">'
       + '<div class="card-head"><div><h2>' + MEDIA[t].label + '</h2>'
       + '<div class="mono sub">' + MEDIA[t].root + '</div></div>'
-      + '<span class="chip' + (m.in_schedule_window ? '' : ' is-out') + '">' + (m.in_schedule_window ? 'In window' : 'Outside window') + '</span></div>'
+      + '<span class="chip' + (m.in_window ? '' : ' is-out') + '">' + (m.in_window ? 'In window' : 'Outside window') + '</span></div>'
       + '<div class="stats">'
       + stat('1 · Folders / files in scope', m.directories_enabled + ' / ' + fmt(m.files_total), 'of ' + m.directories_total + ' folders')
       + stat('2 · To do', fmt(m.files_pending), 'waiting for analysis or normalization')
@@ -1287,7 +1299,7 @@
       + '</section>';
   }
 
-  function runCard(d, checked, total, pct, noTypes, outside) {
+  function runCard(d, checked, total, pct, noTypes) {
     const mode = MODE_LABEL[d.mode] ? d.mode : 'bulk';
     const isOff = mode === 'off';
     const isAuto = mode === 'auto';
@@ -1304,7 +1316,7 @@
     const pauseOn = !isOff && status !== 'stopped';
     let buttons = '';
     if (isOff) {
-      buttons = '<a class="btn" href="#/settings">Change the mode in Settings</a>';
+      buttons = '';
     } else if (isAuto) {
       buttons = '<button class="btn' + (status === 'paused' ? ' btn-primary' : '') + '" data-action="run" data-path="pause">'
         + (status === 'paused' ? 'Resume' : 'Pause') + '</button>';
@@ -1319,9 +1331,10 @@
       ? 'The app is off: folders are not scanned and no file is normalized. Rescan and Check level still work when you use them.'
       : isAuto
         ? 'Automatic: new and changed files are found and normalized by themselves, within the schedule and the folders that are included here.'
-        : 'Bulk: press Start to check and normalize the files that are in the library now. Files that appear later wait for the next Start.';
+        : 'Bulk: press Start to check and normalize the files that are in the library now, within the schedule and enabled folders. Files that appear later wait for the next Start.';
     const typesLocked = !isOff && mode === 'bulk' && status !== 'stopped';   // no switches during a bulk run
     return '<section class="card">'
+      + '<div class="dashboard-mode"><span class="muted">Mode</span>' + modeButtons(mode) + '</div>'
       + '<div class="run-top"><div class="run-state"><span class="dot ' + dotClass + '"></span>'
       + '<strong>' + esc(MODE_LABEL[mode]) + '</strong>'
       + '<span class="muted">· ' + esc(stateText) + '</span>'
@@ -1340,21 +1353,17 @@
       + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '')
       + '</div>'
       + (d.dry_run ? '<div class="notice info">Dry run is on: files are checked, nothing is written.</div>' : '')
-      + (outside.length ? '<div class="notice">Running outside the schedule of ' + outside.map((t) => MEDIA[t].label).join(' and ')
-        + ' (started manually). Stop the run to return to the schedule.</div>' : '')
       + '</section>';
   }
 
   function renderDashboard() {
     const d = state.dash;
     const s = state.settings;
-    const status = d.status;
     const mode = MODE_LABEL[d.mode] ? d.mode : 'bulk';
     const types = enabledTypes();
     const noTypes = types.length === 0;
     const total = types.reduce((a, t) => a + dashMedia(t).files_total, 0);
     const checked = types.reduce((a, t) => a + dashMedia(t).files_checked, 0);
-    const outside = status === 'running' ? types.filter((t) => !dashMedia(t).in_schedule_window) : [];
     const writeLabel = (t) => {
       const cfg = s[t];
       if (cfg.writeMode === 'backup') return 'in place, backup kept';
@@ -1373,15 +1382,16 @@
     const pct = d.progress_percent;
 
     app().innerHTML = pageHead('Dashboard', 'Audio and video are tracked separately: each has its own folders, schedule, settings and counters.', '')
-      + runCard(d, checked, total, pct, noTypes, outside)
+      + runCard(d, checked, total, pct, noTypes)
       + '<div class="split-2">' + mediaPanel('audio') + mediaPanel('video') + '</div>'
       + '<div class="split-2">'
       + '<section class="card"><h2 style="margin-bottom:12px">Needs attention</h2><dl class="rows">'
       + '<div><dt>Mode</dt><dd>' + esc(MODE_LABEL[mode]) + ' <span class="muted">· ' + esc(MODE_SHORT[mode]) + '</span>'
       + ' · <a href="#/settings">change</a></dd></div>'
-      + '<div><dt>Look for new files</dt><dd>' + (mode === 'off' ? '<span class="muted">off</span>'
-        : 'every ' + fmt(d.scan_every) + ' min · last ' + esc(d.last_scan ? dayAndClock(d.last_scan) : 'not yet')
-          + ' · next ' + esc(d.next_scan ? dayAndClock(d.next_scan) : '—')) + '</dd></div>'
+      + '<div><dt>Look for new files</dt><dd>' + (mode === 'auto'
+        ? 'every ' + fmt(d.scan_every) + ' min · last ' + esc(d.last_scan ? dayAndClock(d.last_scan) : 'not yet')
+          + ' · next ' + esc(d.next_scan ? dayAndClock(d.next_scan) : '—')
+        : '<span class="muted">manual only (Rescan or opening Directories)</span>') + '</dd></div>'
       + '<div><dt>Parked for review</dt><dd><a href="#/parked">Audio ' + dashMedia('audio').files_parked + ' · Video ' + dashMedia('video').files_parked + '</a>'
       + (parkedTotal ? '' : ' <span class="muted">(none)</span>') + '</dd></div>'
       + '<div><dt>Errors</dt><dd>' + errors + '</dd></div>'
@@ -1763,7 +1773,7 @@
       + '<div class="sub">Applies to audio and video. The time windows are set on the Schedule tab.</div></div></div>'
       + '<div class="split-2" style="margin-top:0">'
       + '<div class="field" style="margin:0"><label class="lbl" for="scan-every">Look for new or changed files every'
-      + tip('Used by Automatic mode: the folders are scanned this often and new or changed files are normalized. A manual Rescan also counts, so the next scan starts a full interval later. Also runs in Bulk mode, so the list of files stays current.') + '</label>'
+      + tip('Used only by Automatic mode: the folders are scanned this often and new or changed files are normalized. Bulk has no periodic scan. A manual Rescan also counts, so the next automatic scan starts a full interval later.') + '</label>'
       + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + sc.scanEvery + '">'
       + '<span class="muted small">minutes</span></div>'
       + '</div>'
@@ -1954,6 +1964,19 @@
     } else if (a === 'run') {
       await api('/run/' + el.dataset.path, { method: 'POST' });
       await refreshDash();
+      render();
+    } else if (a === 'set-mode') {
+      const mode = el.dataset.mode;
+      if (mode === state.dash.mode) return;
+      const busy = startBusy('Changing the mode');
+      try {
+        state.settings = await api('/settings', { method: 'PUT', body: { general: { mode } } });
+        state.draft = clone(state.settings);
+        await refreshDash();
+        toast(MODE_LABEL[mode] + ' mode selected');
+      } finally {
+        endBusy(busy);
+      }
       render();
     } else if (a === 'clear-log') {
       await api('/log/clear', { method: 'POST' });
