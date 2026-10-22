@@ -126,6 +126,42 @@ def test_rescan_makes_new_folders_and_files_visible(client, cfg):
     assert "Old/Deep" not in names
 
 
+def test_file_stream_serves_audio_and_supports_range_requests(client, cfg):
+    """The player in the Directories tab streams the file itself, with seeking."""
+    _scan_library(cfg, client)
+    listing = client.get("/api/files", params={"media": "audio", "dir": "Old"}).json()["files"]
+    row = next(f for f in listing if f["name"] == "b.flac")
+    assert row["playable"] is True
+
+    r = client.get("/api/files/stream", params={"media": "audio", "relpath": "Old/b.flac"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/flac"
+    assert r.headers["accept-ranges"] == "bytes"
+    with open(os.path.join(cfg.audio_root, "Old", "b.flac"), "rb") as fh:
+        assert r.content == fh.read()
+
+    # a range request returns just that part: the player uses it to seek
+    r = client.get("/api/files/stream", params={"media": "audio", "relpath": "Old/b.flac"},
+                   headers={"Range": "bytes=0-9"})
+    assert r.status_code == 206
+    assert len(r.content) == 10
+    assert r.headers["content-range"].startswith("bytes 0-9/")
+
+
+def test_file_stream_rejects_paths_outside_the_base_and_unplayable_formats(client, cfg):
+    _scan_library(cfg, client)
+    with open(os.path.join(cfg.audio_root, "notes.txt"), "w", encoding="utf-8") as fh:
+        fh.write("not audio")
+    base = "/api/files/stream"
+    assert client.get(base, params={"media": "audio", "relpath": "../etc/passwd"}).status_code in (400, 404)
+    assert client.get(base, params={"media": "audio", "relpath": "/etc/passwd"}).status_code == 400
+    assert client.get(base, params={"media": "audio", "relpath": "notes.txt"}).status_code == 404
+    assert client.get(base, params={"media": "audio", "relpath": "Old/missing.flac"}).status_code == 404
+    assert client.get(base, params={"media": "photos", "relpath": "a.flac"}).status_code == 400
+    # the audio endpoint does not hand out video files
+    assert client.get(base, params={"media": "audio", "relpath": "a.mp4"}).status_code == 404
+
+
 def test_dashboard_reports_that_a_scan_is_running(client, cfg):
     """The web UI shows the periodic scan in its activity indicator."""
     _scan_library(cfg, client)

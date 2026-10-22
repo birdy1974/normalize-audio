@@ -156,6 +156,104 @@
     box.title = now.title + (now.sub ? ' · ' + now.sub : '');
   }
 
+  /* ----------------------------------------------------------- preview player
+     One player for the whole app, outside #app so a re-render never stops it. A Play
+     button in the Directories file list loads the file into it. The file is streamed
+     unchanged (no transcoding): what you hear is what will be normalized. */
+  const PLAY = { media: null, relpath: null, name: null, playing: false };
+  const ICON_PLAY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>';
+  const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5h3.2v14H8zM12.8 5H16v14h-3.2z"/></svg>';
+
+  const previewAudio = () => document.getElementById('preview-audio');
+
+  function fmtTime(sec) {
+    if (!isFinite(sec) || sec < 0) return '0:00';
+    return Math.floor(sec / 60) + ':' + pad2(Math.floor(sec % 60));
+  }
+
+  function syncPlayer() {
+    const bar = document.getElementById('player');
+    const audio = previewAudio();
+    if (!bar || !audio) return;
+    bar.hidden = !PLAY.relpath;
+    document.body.classList.toggle('has-player', !!PLAY.relpath);
+    if (!PLAY.relpath) return;
+    const duration = isFinite(audio.duration) ? audio.duration : 0;
+    const toggle = document.getElementById('player-toggle');
+    toggle.innerHTML = PLAY.playing ? ICON_PAUSE : ICON_PLAY;
+    toggle.setAttribute('aria-label', PLAY.playing ? 'Pause' : 'Play');
+    document.getElementById('player-name').textContent = PLAY.name || '';
+    document.getElementById('player-sub').textContent =
+      (PLAY.media ? MEDIA[PLAY.media].label : '') + ' · ' + folderTail(PLAY.relpath);
+    const seek = document.getElementById('player-seek');
+    seek.value = duration ? String(Math.round((audio.currentTime / duration) * 1000)) : '0';
+    paintRange(seek);
+    document.getElementById('player-time').textContent =
+      fmtTime(audio.currentTime) + ' / ' + (duration ? fmtTime(duration) : '--:--');
+    bar.classList.toggle('is-playing', PLAY.playing);
+  }
+
+  function playFile(media, file) {
+    const audio = previewAudio();
+    if (!audio || !file || !file.playable) return;
+    if (PLAY.media === media && PLAY.relpath === file.relpath) { togglePreview(); return; }
+    PLAY.media = media;
+    PLAY.relpath = file.relpath;
+    PLAY.name = file.name;
+    PLAY.playing = false;
+    audio.src = '/api/files/stream?media=' + encodeURIComponent(media)
+      + '&relpath=' + encodeURIComponent(file.relpath);
+    syncPlayer();
+    audio.play().catch(() => toast('The browser blocked playback. Press play in the player.'));
+  }
+
+  function togglePreview() {
+    const audio = previewAudio();
+    if (!audio || !PLAY.relpath) return;
+    if (PLAY.playing) audio.pause();
+    else audio.play().catch(() => toast('The browser blocked playback. Press play again.'));
+  }
+
+  function closePreview() {
+    const audio = previewAudio();
+    const wasOpen = !!PLAY.relpath;
+    PLAY.media = PLAY.relpath = PLAY.name = null;
+    PLAY.playing = false;
+    if (audio) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+    }
+    syncPlayer();
+    if (wasOpen && currentRoute() === 'directories') render();
+  }
+
+  function initPlayer() {
+    const audio = previewAudio();
+    if (!audio) return;
+    const repaint = () => {
+      syncPlayer();
+      if (currentRoute() === 'directories') render();      // the Play/Pause button of the row
+    };
+    audio.addEventListener('play', () => { PLAY.playing = true; repaint(); });
+    audio.addEventListener('pause', () => { PLAY.playing = false; repaint(); });
+    audio.addEventListener('ended', () => { PLAY.playing = false; repaint(); });
+    audio.addEventListener('timeupdate', syncPlayer);
+    audio.addEventListener('loadedmetadata', syncPlayer);
+    audio.addEventListener('durationchange', syncPlayer);
+    audio.addEventListener('error', () => {
+      if (!PLAY.relpath) return;
+      toast('This file cannot be played in the browser.');
+      closePreview();
+    });
+    const seek = document.getElementById('player-seek');
+    if (seek) seek.addEventListener('input', () => {
+      if (!isFinite(audio.duration) || audio.duration <= 0) return;
+      audio.currentTime = (Number(seek.value) / 1000) * audio.duration;
+    });
+    syncPlayer();
+  }
+
   /* ------------------------------------------------------------------ API */
   async function api(path, options) {
     const opts = options || {};
@@ -549,7 +647,8 @@
     const t = node.type;
     const b = state.browse;
     const head = '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
-      + '<div class="sub">' + node.directFiles + ' files directly in this folder · ' + (subtree(node).length - 1) + ' sub-folders</div></div>'
+      + '<div class="sub">' + node.directFiles + ' files directly in this folder · ' + (subtree(node).length - 1) + ' sub-folders'
+      + ' · Play listens to the original, without changing it</div></div>'
       + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div>';
     if (b.loading || b.media !== t || b.rel !== node.rel || !b.rows) {
       return head + '<p class="muted">Loading files…</p>';
@@ -560,16 +659,23 @@
     const rows = b.rows.map((f, i) => {
       const ext = String(f.name).split('.').pop();
       const checking = !!(state.measure && state.measure.relpath === f.relpath && state.measure.state === 'measuring');
-      const button = checking
+      const playing = PLAY.media === t && PLAY.relpath === f.relpath && PLAY.playing;
+      const listen = !f.playable
+        ? '<button class="btn btn-sm" disabled title="This format cannot be played in the browser">Play</button>'
+        : '<button class="btn btn-sm' + (playing ? ' btn-primary' : '') + '" data-action="preview" data-idx="' + i
+          + '" aria-pressed="' + playing + '" title="' + esc((playing ? 'Pause ' : 'Listen to ') + f.name) + '">'
+          + (playing ? 'Pause' : 'Play') + '</button>';
+      const check = checking
         ? '<span class="row-busy"><span class="working" aria-hidden="true"></span>Checking…</span>'
         : '<button class="btn btn-sm" data-action="check-level" data-idx="' + i + '">Check level</button>';
-      return '<tr' + (checking ? ' class="is-busy-row"' : '') + '>'
+      const cls = checking ? 'is-busy-row' : playing ? 'is-playing-row' : '';
+      return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>'
         + '<td>' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
         + '<td class="num">' + fmtLufs(f.lufs) + '</td>'
         + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
         + '<td>' + statusLabel(f.status) + '</td>'
-        + '<td class="actions-cell">' + button + '</td></tr>';
+        + '<td class="actions-cell">' + listen + check + '</td></tr>';
     }).join('');
     return head
       + '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level'
@@ -1015,6 +1121,7 @@
     if (a === 'media') {
       state.media = el.dataset.media;
       state.browse = { media: null, rel: null, rows: null, loading: false };
+      closePreview();
       render();
     } else if (a === 'run') {
       await api('/run/' + el.dataset.path, { method: 'POST' });
@@ -1037,6 +1144,13 @@
     } else if (a === 'rescan') {
       scanDirectories(t, true);       // the button shows Scanning… until the fresh tree is read
       render();
+    } else if (a === 'preview') {
+      const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
+      if (f) playFile(t, f);
+    } else if (a === 'player-toggle') {
+      togglePreview();
+    } else if (a === 'player-close') {
+      closePreview();
     } else if (a === 'select-all' || a === 'select-none') {
       const busy = startBusy(a === 'select-all' ? 'Including all folders' : 'Excluding all folders');
       try {
@@ -1405,6 +1519,7 @@
   }, 3000);
 
   applyMenu();
+  initPlayer();
   if (currentRoute() === 'directories') openDirectories();   // also when the app opens on this page
   render();
 })();

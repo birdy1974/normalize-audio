@@ -6,11 +6,12 @@ import os
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from . import __version__, folders, ha, state, stats
 from .config import tool_path
-from .media import MEDIA
+from .media import EXTENSIONS, MEDIA
 from .schedule import in_window, next_change
 
 router = APIRouter()
@@ -231,6 +232,34 @@ def toggle_all(body: FolderAll, engine=Engine):
 
 # ------------------------------------------------------------ files
 
+# Formats a browser can play as they are; a check in the Directories tab streams the file
+# unchanged (no transcoding, so what you hear is exactly what will be normalized).
+PLAYABLE = {
+    "audio": ("mp3", "flac", "wav", "aif", "aiff", "m4a", "aac", "ogg", "oga", "opus"),
+    "video": ("mp4", "m4v", "mov", "webm"),
+}
+
+STREAM_TYPES = {
+    "mp3": "audio/mpeg", "flac": "audio/flac", "wav": "audio/wav", "aif": "audio/aiff", "aiff": "audio/aiff",
+    "m4a": "audio/mp4", "aac": "audio/aac", "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
+    "mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+}
+
+
+def _stream_path(engine, media: str, rel: str) -> str:
+    """The file for a preview, or an HTTP error. Nothing outside the base location is served."""
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        raise HTTPException(400, "invalid path")
+    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    if ext not in PLAYABLE[media] or ext not in EXTENSIONS[media]:
+        raise HTTPException(404, "this format cannot be played in a browser")
+    root = os.path.realpath(engine.cfg.root(media))
+    path = os.path.realpath(os.path.join(root, rel))
+    if os.path.commonpath([root, path]) != root or not os.path.isfile(path):
+        raise HTTPException(404, "file not found")
+    return path
+
+
 @router.get("/files")
 def list_files(media: str = "audio", dir: str = ".", engine=Engine):
     _media_check(media)
@@ -238,7 +267,23 @@ def list_files(media: str = "audio", dir: str = ".", engine=Engine):
         "SELECT id, name, relpath, ext, lufs, true_peak, status, reason, gain_db, adjust_db, applied_db, "
         "method, measured_at, changed_at FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
         (media, dir))
+    for row in rows:
+        row["playable"] = row["ext"] in PLAYABLE[media]
     return {"files": rows, "target": state.get_settings(engine.db)[media]["target"]}
+
+
+@router.get("/files/stream")
+def stream_file(media: str = "audio", relpath: str = "", engine=Engine):
+    """The file itself, for the player in the Directories tab. Range requests are supported,
+    so the player can seek without downloading the whole file first."""
+    _media_check(media)
+    path = _stream_path(engine, media, relpath)
+    ext = path.rsplit(".", 1)[-1].lower()
+    return FileResponse(
+        path,
+        media_type=STREAM_TYPES.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.post("/files/measure")

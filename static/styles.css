@@ -501,3 +501,41 @@ tr.is-busy-row td { background: var(--accent-tint); }
 .row-busy { display: inline-flex; align-items: center; gap: 6px; color: var(--accent); font-size: 12px; font-weight: 600; }
 .measure.is-busy { border-color: var(--accent); background: var(--accent-tint); }
 .measure .working { color: var(--accent); }
+
+/* ---------- audio preview player (Directories) ---------- */
+.player {
+  position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+  z-index: 55; width: min(720px, calc(100vw - 32px));
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 12px;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .18);
+}
+.player[hidden] { display: none; }
+.player-btn {
+  flex: none; width: 34px; height: 34px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--line-strong); border-radius: 50%;
+  background: var(--surface); color: var(--text); cursor: pointer;
+}
+.player-btn:hover { background: var(--accent-tint); border-color: var(--accent); color: var(--accent); }
+.player-btn svg { width: 16px; height: 16px; fill: currentColor; }
+#player-toggle { width: 40px; height: 40px; background: var(--accent); border-color: var(--accent); color: #fff; }
+#player-toggle:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: #fff; }
+#player-toggle svg { width: 18px; height: 18px; }
+.player-body { flex: 1; min-width: 0; }
+.player-head { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.player-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player-sub { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player-time { margin-left: auto; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.player-body input[type=range] { height: 14px; margin-top: 2px; }
+body.has-player .content { padding-bottom: 112px; }
+body.has-player .toast { bottom: 92px; }
+tr.is-playing-row td { background: var(--accent-tint); }
+.actions-cell .btn + .btn { margin-left: 6px; }
+
+@media (max-width: 760px) {
+  .player { bottom: 10px; width: calc(100vw - 16px); gap: 8px; }
+  .player-sub { display: none; }
+  body.has-player .content { padding-bottom: 124px; }
+}

@@ -166,6 +166,7 @@ volumes:
 | Baseline from a file (mock-up v4.2) | Directories: Check level on a file shows its integrated loudness and true peak (measured, file unchanged); Use as target sets the target level. Settings, Level links to this. |
 | Parked files sorted by change (mock-up v4.2) | Sort select: file order, change needed lowest or highest first, size of change largest first. The list is sorted by the server (`/api/parked?sort=`). |
 | Green range sliders (mock-up v4.2) | The part of the track left of the thumb is filled green, on every slider. |
+| Pre-listen from Directories | Play button per file (`playable` from the API); one player at the bottom of the page streams `GET /api/files/stream?media=&relpath=` unchanged, with HTTP Range so it can seek. Formats a browser cannot decode (WMA, AVI, MKV, …) have the button disabled. |
 | Editable Home Assistant sensor names | Each optional sensor has a name that can be changed to match the sensor in Home Assistant (default kept, with a Default button). The UI shows the entity ID Home Assistant derives from it. The unique ID does not change with the name. |
 | Helptips instead of help text (mock-up v4.1) | Descriptions appear as an information icon with a popup on hover/focus; the page keeps only its intro text and status messages. |
 | Override confirmation for large changes | Toggle in settings (applies large changes automatically). |

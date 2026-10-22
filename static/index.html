@@ -10,7 +10,7 @@
   <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
   <link rel="manifest" href="/static/site.webmanifest">
   <meta name="theme-color" content="#2f3130">
-  <link rel="stylesheet" href="/static/styles.css?v=7">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
 </head>
 <body>
   <div class="app">
@@ -44,8 +44,25 @@
       <div id="app" aria-live="polite"></div>
     </main>
   </div>
+  <audio id="preview-audio" preload="metadata"></audio>
+  <div class="player" id="player" role="region" hidden aria-label="Audio preview">
+    <button type="button" class="player-btn" id="player-toggle" data-action="player-toggle" aria-label="Play">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>
+    </button>
+    <div class="player-body">
+      <div class="player-head">
+        <strong class="player-name" id="player-name"></strong>
+        <span class="player-sub" id="player-sub"></span>
+        <span class="player-time" id="player-time">0:00 / 0:00</span>
+      </div>
+      <input id="player-seek" type="range" min="0" max="1000" step="1" value="0" aria-label="Position in the file">
+    </div>
+    <button type="button" class="player-btn" data-action="player-close" aria-label="Stop and close the player">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </div>
   <div id="toast" class="toast" role="status"></div>
   <script src="/static/audio-normalizer-card.js?v=5"></script>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>
