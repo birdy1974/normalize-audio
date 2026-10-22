@@ -12,7 +12,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from . import ffmpeg as ff
@@ -26,6 +26,15 @@ log = logging.getLogger("normalizer")
 GAIN_TOOLS = ("mp3gain", "aacgain")
 
 
+class FileBusy(RuntimeError):
+    """The file is being processed by the run; the request is refused."""
+
+
+def _clock(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 class Engine:
     def __init__(self, cfg: Config, db):
         self.cfg = cfg
@@ -34,9 +43,12 @@ class Engine:
         self.scanner = Scanner(cfg, db)
         self.tools = {name for name in GAIN_TOOLS if tool_path(getattr(cfg, name))}
         self._lock = threading.Lock()
+        self._scan_lock = threading.Lock()
+        self._scanning = 0                     # scans running (the periodic one and manual ones)
         self._inflight: dict[int, dict] = {}    # file id -> {future, relpath, media, approved}
         self._cancel: set[int] = set()
         self._had_work = False
+        self._mode_seen: str | None = None     # the app mode (off / bulk / auto) last applied
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._pool = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="normalizer")
@@ -44,6 +56,7 @@ class Engine:
         db.execute("UPDATE files SET status = 'pending' WHERE status = 'processing'")
         self._remove_stale_temp_files()
         state.get_ha(db)                         # creates the endpoint token on first start
+        self.apply_mode()                        # off stops a run left over from before the restart; auto starts one
 
     # ------------------------------------------------------------ helpers
 
@@ -56,9 +69,71 @@ class Engine:
     def window_open(self, media: str, when: datetime | None = None) -> bool:
         return schedule.in_window(state.get_schedule(self.db)[media], when or self.now())
 
+    def mode(self) -> str:
+        """What the app does on its own: 'off', 'bulk' (only a started run works) or 'auto'."""
+        return state.get_settings(self.db)["general"]["mode"]
+
+    def scan_interval(self) -> int:
+        """Minutes between two looks for new, changed and removed files (Settings > Scheduling)."""
+        return state.get_schedule(self.db)["scanEvery"]
+
+    def last_scan(self) -> str | None:
+        return state.get_run(self.db).get("lastScan")
+
+    def next_scan(self) -> str | None:
+        """When the folders are looked at next; None when the app is off."""
+        if self.mode() == "off":
+            return None
+        last = self.last_scan()
+        if not last:
+            return self.now().replace(microsecond=0).isoformat(timespec="seconds")
+        try:
+            when = datetime.fromisoformat(last) + timedelta(minutes=self.scan_interval())
+        except ValueError:
+            return self.now().replace(microsecond=0).isoformat(timespec="seconds")
+        return when.isoformat(timespec="seconds")
+
+    def scan_status(self) -> dict:
+        """The automatic side of the app, for the dashboard and Home Assistant."""
+        return {"mode": self.mode(), "scan_every": self.scan_interval(),
+                "last_scan": self.last_scan(), "next_scan": self.next_scan()}
+
+    def apply_mode(self) -> str:
+        """Bring the run in line with the mode setting. Called on start and on every tick."""
+        mode = self.mode()
+        previous, self._mode_seen = self._mode_seen, mode
+        if previous == mode:
+            return mode
+        run = state.get_run(self.db)
+        if mode == "off":
+            if run["mode"] != "stopped" or run["paused"]:
+                state.set_run(self.db, mode="stopped", paused=False)
+            with self._lock:                 # stop the work that only the automatic run would do
+                for fid, item in self._inflight.items():
+                    if not item["approved"]:
+                        self._cancel.add(fid)
+            if previous is not None:
+                self.db.log("info", "Mode off: scanning and normalizing are stopped")
+        elif mode == "bulk":
+            if previous == "auto" and run["mode"] == "active":
+                state.set_run(self.db, mode="stopped", paused=False)
+                self.db.log("info", "Bulk mode: the automatic run is stopped, press Start to normalize the files that are here")
+        else:                                # auto
+            # switching to automatic starts at once; a restart keeps a pause the user left in place
+            state.set_run(self.db, mode="active", **({"paused": False} if previous is not None else {}))
+            self.db.log("info", f"Automatic mode is on: new files are checked and normalized every "
+                                f"{self.scan_interval()} minutes")
+        self._had_work = False
+        return mode
+
     def inflight_count(self) -> int:
         with self._lock:
             return len(self._inflight)
+
+    def scanning(self) -> bool:
+        """True while the disk is being walked for new, changed and removed files."""
+        with self._scan_lock:
+            return self._scanning > 0
 
     def current_file(self) -> str | None:
         with self._lock:
@@ -66,9 +141,12 @@ class Engine:
             return items[0]["relpath"] if items else None
 
     def status(self) -> str:
+        mode = self.mode()
+        if mode == "off":
+            return "off"
         run = state.get_run(self.db)
-        if run["mode"] != "active":
-            return "stopped"
+        if run["mode"] != "active" and mode != "auto":
+            return "stopped"            # auto keeps the run active by itself, also before the first tick
         if run["paused"]:
             return "paused"
         types = [m for m in MEDIA if run["types"].get(m)]
@@ -84,10 +162,17 @@ class Engine:
     # ------------------------------------------------------------ run control
 
     def start(self) -> None:
+        if self.mode() == "off":
+            raise ValueError("The app is off: choose Bulk or Automatic mode in Settings first")
+        # a run that starts with nothing to do finishes at once (and in bulk mode stops itself)
+        self._had_work = True
         state.set_run(self.db, mode="active", paused=False)
-        self.db.log("info", "Run started")
+        self.db.log("info", "Bulk run started" if self.mode() == "bulk" else "Run started")
 
     def stop(self) -> None:
+        if self.mode() == "auto":
+            raise ValueError("Automatic mode keeps watching for new files; pause the run to hold it, "
+                             "or choose Off or Bulk in Settings")
         state.set_run(self.db, mode="stopped", paused=False)
         with self._lock:
             for fid, item in self._inflight.items():
@@ -101,7 +186,8 @@ class Engine:
             return
         paused = not run["paused"]
         state.set_run(self.db, paused=paused)
-        self.db.log("info", "Run paused" if paused else "Run resumed")
+        what = "Automatic mode" if self.mode() == "auto" else "Run"
+        self.db.log("info", f"{what} paused" if paused else f"{what} resumed")
 
     def set_types(self, changes: dict) -> None:
         run = state.get_run(self.db)
@@ -134,24 +220,55 @@ class Engine:
                 log.exception("scheduler tick failed")
             self._stop.wait(1.0)
 
+    def _scan_due(self) -> datetime | None:
+        """When the next periodic scan is due; None right after a restart."""
+        last = self.last_scan()
+        if not last:
+            return None
+        try:
+            return datetime.fromisoformat(last) + timedelta(minutes=self.scan_interval())
+        except ValueError:
+            return None
+
     def _scan_loop(self) -> None:
+        """Look for new, changed and removed files every `scanEvery` minutes, unless the app is off.
+
+        The loop wakes up every two seconds, so turning the app off, changing the interval in the
+        settings or starting automatic mode takes effect at once instead of after the old wait.
+        """
         while not self._stop.is_set():
-            try:
-                self.scanner.scan_all()
-            except Exception as exc:
-                log.exception("scan failed")
-                self.db.log("error", f"Scan failed: {exc}")
-            minutes = state.get_schedule(self.db)["scanEvery"]
-            self._stop.wait(minutes * 60)
+            if self.mode() == "off":
+                self._stop.wait(2.0)
+                continue
+            due = self._scan_due()
+            if due is None or self.now() >= due:
+                try:
+                    self.scan_now()
+                except Exception as exc:  # keep the loop alive; the next scan comes at the next interval
+                    log.exception("scan failed")
+                    self.db.log("error", f"Scan failed: {exc}")
+                continue
+            self._stop.wait(min(2.0, max(0.05, (due - self.now()).total_seconds())))
 
     def scan_now(self, media: str | None = None) -> dict:
-        if media:
-            return {media: self.scanner.scan(media)}
-        return self.scanner.scan_all()
+        with self._scan_lock:
+            self._scanning += 1
+        try:
+            if media:
+                return {media: self.scanner.scan(media)}
+            return self.scanner.scan_all()
+        finally:
+            with self._scan_lock:
+                self._scanning -= 1
+            # a manual Rescan counts as a scan: the next automatic one starts a full interval later
+            state.set_run(self.db, lastScan=self.now().replace(microsecond=0).isoformat(timespec="seconds"))
 
     # ------------------------------------------------------------ scheduler
 
     def tick(self) -> None:
+        mode = self.apply_mode()
+        if mode == "off":
+            return
         run = state.get_run(self.db)
         sched = state.get_schedule(self.db)
         now = self.now()
@@ -195,7 +312,12 @@ class Engine:
             if left == 0:
                 self._had_work = False
                 state.set_run(self.db, lastFinished=now.isoformat(timespec="seconds"))
-                self.db.log("info", "Run finished: nothing left to check in the enabled folders")
+                if mode == "bulk":
+                    # a bulk run works through what is there now; files found later wait for the next Start
+                    state.set_run(self.db, mode="stopped")
+                    self.db.log("info", "Bulk run finished: nothing left to check; new files wait for the next Start")
+                else:
+                    self.db.log("info", "Run finished: nothing left to check; automatic mode keeps watching")
 
     def _submit(self, fid: int, approved: bool) -> None:
         row = self.db.one("SELECT relpath, media FROM files WHERE id = ?", (fid,))
@@ -365,6 +487,97 @@ class Engine:
                             pass
 
     # ------------------------------------------------------------ on demand
+
+    # ------------------------------------------------------------ editing
+
+    def edit_audio(self, media: str, rel: str, *, fade_in: float = 0.0, fade_out: float = 0.0,
+                   cut: tuple[float, float] | None = None) -> dict:
+        """Fade in/out or remove a part of one audio file.
+
+        The same safety as the run: a temporary file in the same folder, verification, then an
+        atomic replace. The write mode decides about a backup; the file is measured again in the
+        next run, because fades and cuts change its level.
+        """
+        if media != "audio":
+            raise ValueError("editing is available for audio files only")
+        settings = state.get_settings(self.db)
+        if settings["general"]["dryRun"]:
+            raise ValueError("Dry run is on: turn it off in Settings to edit files")
+        mode = settings["audio"]["writeMode"]
+        if mode == "output":
+            raise ValueError("Write mode is 'output folder': editing changes the file itself. "
+                             "Choose in place (with or without backup) in Settings.")
+        root = os.path.realpath(self.cfg.root(media))
+        src = os.path.realpath(os.path.join(root, rel))
+        if os.path.commonpath([root, src]) != root or not os.path.isfile(src):
+            raise ValueError("file not found")
+        row = self.db.one("SELECT * FROM files WHERE media = ? AND relpath = ?", (media, rel))
+        if row is None:
+            raise ValueError("file not found in the library; run a scan first")
+        claimed = self.db.execute(
+            "UPDATE files SET status = 'processing' WHERE id = ? AND status != 'processing'", (row["id"],))
+        if not claimed:
+            raise FileBusy("this file is being processed right now; try again when it is done")
+        try:
+            return self._edit_audio(src, media, rel, row, fade_in, fade_out, cut, mode,
+                                    settings["general"]["preserveMtime"])
+        except BaseException:
+            self.db.execute("UPDATE files SET status = ? WHERE id = ?", (row["status"], row["id"]))
+            raise
+
+    def _edit_audio(self, src: str, media: str, rel: str, row: dict, fade_in: float, fade_out: float,
+                    cut: tuple[float, float] | None, mode: str, preserve_mtime: bool) -> dict:
+        probe = ff.probe(self.cfg.ffmpeg, src)
+        duration = probe.duration
+        if not duration or duration <= 0.1:
+            raise ValueError("this file is too short to edit")
+        fade_in = round(max(0.0, float(fade_in or 0.0)), 2)
+        fade_out = round(max(0.0, float(fade_out or 0.0)), 2)
+        fade_in = 0.0 if fade_in < 0.05 else fade_in
+        fade_out = 0.0 if fade_out < 0.05 else fade_out
+        cut_range = None
+        if cut is not None:
+            start, end = round(float(cut[0]), 2), round(float(cut[1]), 2)
+            if not 0 <= start < end <= duration:
+                raise ValueError("the part to remove must lie inside the file")
+            if duration - (end - start) < 0.1:
+                raise ValueError("the whole file would be removed")
+            cut_range = (start, end)
+        new_duration = duration - ((cut_range[1] - cut_range[0]) if cut_range else 0.0)
+        if fade_in <= 0 and fade_out <= 0 and cut_range is None:
+            raise ValueError("nothing to do: set a fade or select a part to remove")
+        if fade_in > new_duration - 0.05 or fade_out > new_duration - 0.05:
+            raise ValueError("a fade is longer than the file (after the cut)")
+        if fade_in + fade_out > new_duration:
+            raise ValueError("fade in and fade out overlap; shorten one of them")
+
+        tmp = ff.temp_path(src)
+        try:
+            ff.edit(self.cfg.ffmpeg, src, tmp, probe_=probe, duration=duration,
+                    cut=cut_range, fade_in=fade_in, fade_out=fade_out, new_duration=new_duration,
+                    kbps=probe.kbps)
+            ff.verify_edit(self.cfg.ffmpeg, tmp, probe, new_duration)
+            self._commit(src, tmp, src, media, rel, mode, preserve_mtime)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+        st = os.stat(src)
+        self.db.execute(
+            "UPDATE files SET status = 'pending', reason = NULL, size = ?, mtime_ns = ?, seen_at = ?, "
+            "lufs = NULL, true_peak = NULL, measured_at = NULL, gain_db = NULL, adjust_db = 0, "
+            "applied_db = NULL, method = NULL, changed_at = NULL WHERE id = ?",
+            (st.st_size, st.st_mtime_ns, time.time(), row["id"]))
+        what = []
+        if fade_in:
+            what.append(f"fade in {fade_in:.1f} s")
+        if fade_out:
+            what.append(f"fade out {fade_out:.1f} s")
+        if cut_range:
+            what.append(f"removed {_clock(cut_range[0])}–{_clock(cut_range[1])}")
+        self.db.log("ok", f"Edited {row['name']}: {', '.join(what)} (now {_clock(new_duration)})", media)
+        return {"ok": True, "name": row["name"], "relpath": rel, "duration": round(new_duration, 3),
+                "size": st.st_size, "fade_in": fade_in, "fade_out": fade_out, "cut": list(cut_range or [])}
 
     def measure(self, media: str, rel: str) -> dict:
         """Level check for one file (baseline). The file is only read."""

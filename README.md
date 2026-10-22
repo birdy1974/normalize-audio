@@ -4,7 +4,7 @@ Self-hosted web app that brings the loudness of audio files (MP3, FLAC, M4A, WAV
 track of AVI, MKV and MP4 files) in a chosen folder tree to one common level, without changing the audio quality.
 Designed for Docker on a Synology DS918+.
 
-**Status: version 0.1.0, implemented.** Checked in a Linux sandbox: 43 automated tests (decision rules, pipeline with
+**Status: version 0.1.0, implemented.** Checked in a Linux sandbox: 74 automated tests (decision rules, pipeline with
 real ffmpeg, REST API), a live run on a demo library, and the web UI in headless Chromium.
 **Not yet verified:** the Docker image build, the `aacgain` package in Debian, the mp3gain/aacgain command-line
 options on a real file, a run on the NAS, and the Home Assistant integration. See "Verification status" below.
@@ -16,8 +16,17 @@ options on a real file, a run on the NAS, and the Home Assistant integration. Se
 
 ## What it does
 
+- Three modes, set in Settings (Mode card) and shown on the dashboard and in Home Assistant:
+  - **Automatic** — every *Look for new or changed files every* N minutes the folders are scanned and new or changed
+    files are checked and normalized by themselves, within the schedule and the folders that are included.
+  - **Bulk** (default) — the folders are scanned on the same interval, so the list stays current, but nothing is
+    normalized until you press Start. A bulk run works through the files that are in the library then and stops by
+    itself; files that appear later wait for the next Start.
+  - **Off** — nothing is scanned and nothing is normalized. The app only shows what it already knows; Rescan,
+    Check level and the audio editor still work when you use them, and Start is refused.
 - Scans two base locations (audio and video) including all sub-folders. New and changed files are found
-  periodically and after a restart (the state is kept in SQLite).
+  on the interval above, after a restart, when the Directories tab is opened and with its Rescan button (the state is
+  kept in SQLite). A manual Rescan also resets the interval, so the next automatic scan starts a full interval later.
 - Measures integrated loudness (EBU R128) and true peak with ffmpeg, then changes the level to the target
   (default −16 LUFS, −1 dBTP ceiling).
 - Lossless files (FLAC, WAV) use ffmpeg `volume` at the original sample format. Lossy MP3 and AAC use
@@ -32,7 +41,21 @@ options on a real file, a run on the NAS, and the Home Assistant integration. Se
 - Schedule: a 7×24 grid per media type. When a window closes during a file, the file is finished and the run pauses
   (or pauses at once, selectable).
 - Home Assistant: a token-protected REST endpoint (`/api/v1/ha/status`) for RESTful sensors, with the YAML and the
-  Lovelace card configuration generated in the UI.
+  Lovelace card configuration generated in the UI. The payload carries `mode` (off / bulk / auto), `scan_every`,
+  `last_scan` and `next_scan` next to the run status and the counters; the new *Mode*, *Last file scan* and
+  *Next file scan* sensors can be enabled with one click.
+- An activity indicator in the menu shows on every page what the app is doing right now: scanning the folders,
+  checking the level of a file, saving, a running normalization (with the current file) or idle.
+- Pre-listen to the files: the Directories tab has a Play button per file and one player at the bottom of the page.
+  The file is streamed unchanged, so what you hear is exactly what will be normalized; the player supports seeking.
+  Formats the browser cannot decode (WMA, AVI, MKV, …) are shown with the button disabled.
+- Edit an audio file in the Directories tab: the Edit button opens a pop-up with the waveform and its levels, a time
+  ruler, fade in / fade out sliders and a cut. Drag over the waveform to select a part, then "Cut this part"; the
+  preview shows the length the file will get. Zoom with the +/− buttons, Ctrl + wheel or the Fit button, scroll with
+  the wheel or the scrollbar under the waveform, and listen to the result before applying it (Space plays, Esc closes).
+  The edit is done by ffmpeg on the server in the file itself — with a backup when the write mode says so — and the file
+  is measured again in the next run, because fades and cuts change its level. Editing is off in dry run and in the
+  output-folder write mode, where it would not change the file you hear.
 
 ## Install on the NAS (Container Manager or docker compose)
 
@@ -67,9 +90,15 @@ Environment variables: `AUDIO_ROOT`, `VIDEO_ROOT`, `CONFIG_DIR`, `FFMPEG_BIN`, `
 | Item | Status |
 |---|---|
 | Decision rules (gain, park, skip, lossy) | Automated tests pass (13) |
-| Pipeline with real ffmpeg: volume, re-encode, backup, output, dry run, silent, park/approve, restart, window, folders | Automated tests pass (15) |
-| REST API: HA auth and token masking, HA sensor names, folders and tree, settings validation, parked actions | Automated tests pass (17) |
+| Pipeline with real ffmpeg: volume, re-encode, backup, output, dry run, silent, park/approve, restart, window, folders, off / bulk / automatic mode and the scan schedule | Automated tests pass (27) |
+| REST API: HA auth and token masking, HA sensor names, folders and tree (including rescan and the scan state), file streaming, waveform and info, editing, app modes and the scan schedule, settings validation, parked actions | Automated tests pass (33) |
 | Web UI against the live API (headless Chromium) | Checked: pages load, no script errors, folder toggle, parked adjust and sort, settings save |
+| Directories rescan | REST endpoint tested; UI checked in jsdom (tab open starts a scan, Rescan button and result message, tree updates) |
+| Activity indicator and folder tree layout | UI checked in jsdom (scan, level check with counter, run and idle states; one line per folder) |
+| Audio preview player | Stream endpoint tested (bytes, Range/206, path checks); UI checked in jsdom (play, pause, switch file, close, disabled formats, survives re-render) |
+| Audio editor (fades, cut, waveform, zoom) | Waveform, info and edit endpoints tested with real ffmpeg on FLAC/MP3/M4A/OGG/WAV/Opus, edges, write modes and path checks; UI checked in jsdom (open, selection, cut, fades, zoom, pan, play, apply, blocked write modes, close) |
+| Audio editor on very long files | Waveform of a 30-minute FLAC takes about 1.4 s; shorter views are cached and fetched per window. **Not checked on a real library** |
+| Automatic mode (new files normalized without Start) | Pipeline tests (off / bulk / auto, schedule, pause, restart, mode switch) and a live run with a 1-minute scan interval: a file dropped in the folder was found and normalized by itself; in bulk mode it waited for Start; in off mode no scan ran for 72 s. UI checked in jsdom (mode choice, dashboard state, buttons, activity indicator, HA page and card) |
 | Docker image build | **Not verified** (no Docker in the sandbox) |
 | `aacgain` in Debian bookworm | **Not verified**. Build falls back to no AAC gain if the package is missing |
 | mp3gain and aacgain command-line options (`-q`, `-p`, `-g`) | **Not verified** on real files (tools not installed in the sandbox) |

@@ -10,7 +10,7 @@
   <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
   <link rel="manifest" href="/static/site.webmanifest">
   <meta name="theme-color" content="#2f3130">
-  <link rel="stylesheet" href="/static/styles.css?v=5">
+  <link rel="stylesheet" href="/static/styles.css?v=10">
 </head>
 <body>
   <div class="app">
@@ -34,14 +34,80 @@
         <a href="#/settings" data-route="settings" title="Settings"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></svg><span class="nav-text">Settings</span></span></a>
         <a href="#/homeassistant" data-route="homeassistant" title="Home Assistant"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span class="nav-text">Home Assistant</span></span></a>
       </nav>
+      <div class="sidebar-activity" id="activity" title="What the app is doing now">
+        <span class="dot activity-dot"></span>
+        <span class="activity-text"><strong id="activity-main" role="status" aria-live="polite"></strong><span class="activity-sub" id="activity-sub" aria-live="off"></span></span>
+      </div>
       <div class="sidebar-foot">Audio Normalizer · local network only</div>
     </aside>
     <main class="content">
       <div id="app" aria-live="polite"></div>
     </main>
   </div>
+  <audio id="preview-audio" preload="metadata"></audio>
+  <div class="player" id="player" role="region" hidden aria-label="Audio preview">
+    <button type="button" class="player-btn" id="player-toggle" data-action="player-toggle" aria-label="Play">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l11-6.5z"/></svg>
+    </button>
+    <div class="player-body">
+      <div class="player-head">
+        <strong class="player-name" id="player-name"></strong>
+        <span class="player-sub" id="player-sub"></span>
+        <span class="player-time" id="player-time">0:00 / 0:00</span>
+      </div>
+      <input id="player-seek" type="range" min="0" max="1000" step="1" value="0" aria-label="Position in the file">
+    </div>
+    <button type="button" class="player-btn" data-action="player-close" aria-label="Stop and close the player">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <audio id="editor-audio" preload="metadata"></audio>
+  <div class="modal" id="editor" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="editor-title">
+      <header class="modal-head">
+        <div class="modal-title-wrap">
+          <h2 id="editor-title">Edit audio</h2>
+          <p class="sub" id="editor-sub"></p>
+        </div>
+        <button type="button" class="icon-btn" data-action="editor-close" aria-label="Close the editor" title="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+      <div class="editor-bar">
+        <button type="button" class="btn btn-sm" data-action="editor-play" id="editor-play">Play</button>
+        <span class="editor-time" id="editor-time">0:00 / 0:00</span>
+        <span class="grow"></span>
+        <button type="button" class="btn btn-sm" data-action="editor-zoom-out" aria-label="Zoom out" title="Zoom out">−</button>
+        <button type="button" class="btn btn-sm" data-action="editor-zoom-in" aria-label="Zoom in" title="Zoom in">+</button>
+        <button type="button" class="btn btn-sm" data-action="editor-fit" title="Show the whole file">Fit</button>
+        <span class="editor-zoom" id="editor-zoom"></span>
+      </div>
+      <div class="editor-wave">
+        <canvas id="editor-canvas" height="190" aria-label="Audio levels over time. Drag to select a part."></canvas>
+        <p class="editor-hint">Drag over the waveform to select a part · click to seek · Ctrl + wheel zooms, wheel scrolls · Space plays, Esc closes</p>
+      </div>
+      <input type="range" class="editor-pan" id="editor-pan" min="0" max="1000" step="1" value="0" aria-label="Scroll through the file" hidden>
+      <div class="editor-sel" id="editor-sel" aria-live="polite"></div>
+      <div class="editor-fades">
+        <label for="editor-fade-in">Fade in</label>
+        <input type="range" id="editor-fade-in" min="0" max="30" step="0.1" value="0">
+        <output id="editor-fade-in-out" for="editor-fade-in">off</output>
+        <label for="editor-fade-out">Fade out</label>
+        <input type="range" id="editor-fade-out" min="0" max="30" step="0.1" value="0">
+        <output id="editor-fade-out-out" for="editor-fade-out">off</output>
+      </div>
+      <p class="editor-summary" id="editor-summary"></p>
+      <p class="editor-warn" id="editor-warn" hidden></p>
+      <footer class="modal-foot">
+        <span class="editor-note" id="editor-note"></span>
+        <span class="grow"></span>
+        <button type="button" class="btn" data-action="editor-close">Cancel</button>
+        <button type="button" class="btn btn-primary" data-action="editor-apply" id="editor-apply">Apply edits</button>
+      </footer>
+    </div>
+  </div>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/static/audio-normalizer-card.js?v=5"></script>
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/audio-normalizer-card.js?v=6"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

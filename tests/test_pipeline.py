@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import time
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -40,6 +41,17 @@ def run_until_idle(engine: Engine, db: Database, timeout: float = 180) -> None:
             return
         time.sleep(0.2)
     raise AssertionError("pipeline did not finish in time")
+
+
+def wait_until(engine: Engine, predicate, timeout: float = 30.0) -> None:
+    """Run the scheduler until a condition holds (the scan threads are not started in tests)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        engine.tick()
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError("condition not met in time")
 
 
 def row(db, name: str) -> dict:
@@ -288,3 +300,193 @@ def test_disabled_folder_is_not_processed(lib):
     engine.tick()
     assert engine.inflight_count() == 0
     assert row(db, "skip.flac")["status"] == "pending"
+
+
+# ------------------------------------------------------------ app modes (off / bulk / auto)
+
+def test_off_mode_does_nothing_and_refuses_start(lib):
+    cfg, engine, db = lib
+    tone(os.path.join(cfg.audio_root, "off.flac"), 0, codec_args=("-c:a", "flac"))
+    open_windows(db)
+    engine.scan_now("audio")                       # a manual Rescan still shows what is on disk
+    state.put_settings(db, {"general": {"mode": "off"}})
+    with pytest.raises(ValueError):
+        engine.start()
+    for _ in range(3):
+        engine.tick()
+    assert engine.status() == "off"
+    assert state.get_run(db)["mode"] == "stopped"
+    assert row(db, "off.flac")["status"] == "pending"
+    assert engine.next_scan() is None              # nothing is planned while the app is off
+
+
+def test_bulk_run_stops_when_the_files_that_were_here_are_done(lib):
+    cfg, engine, db = lib
+    tone(os.path.join(cfg.audio_root, "first.flac"), 0, codec_args=("-c:a", "flac"))
+    open_windows(db)
+    engine.scan_now("audio")
+    engine.start()
+    wait_until(engine, lambda: state.get_run(db)["mode"] == "stopped")
+    assert row(db, "first.flac")["status"] == "changed"
+    assert state.get_run(db)["lastFinished"]
+
+    # a file that appears later waits for the next Start
+    tone(os.path.join(cfg.audio_root, "later.flac"), 0, codec_args=("-c:a", "flac"))
+    engine.scan_now("audio")
+    for _ in range(3):
+        engine.tick()
+        time.sleep(0.1)
+    assert row(db, "later.flac")["status"] == "pending"
+    assert engine.status() == "stopped"
+
+    engine.start()                                 # bulk: the user asks for the next batch
+    wait_until(engine, lambda: row(db, "later.flac")["status"] == "changed")
+
+
+def test_a_bulk_run_with_nothing_to_do_finishes_at_once(lib):
+    cfg, engine, db = lib
+    open_windows(db)
+    engine.start()
+    wait_until(engine, lambda: state.get_run(db)["mode"] == "stopped")
+    assert state.get_run(db)["lastFinished"]
+    assert engine.status() == "stopped"
+
+
+def test_automatic_mode_normalizes_new_files_without_start(lib):
+    cfg, engine, db = lib
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    open_windows(db)
+    tone(os.path.join(cfg.audio_root, "new.flac"), 0, codec_args=("-c:a", "flac"))
+    engine.scan_now("audio")
+    engine.tick()                                  # applies the mode: the run starts itself
+    assert state.get_run(db)["mode"] == "active"
+    wait_until(engine, lambda: row(db, "new.flac")["status"] == "changed")
+    assert engine.status() == "idle"               # waiting for the next file
+    assert state.get_run(db)["mode"] == "active"   # and still watching
+
+    # a file that appears later is picked up on its own, too
+    tone(os.path.join(cfg.audio_root, "second.flac"), 0, codec_args=("-c:a", "flac"))
+    engine.scan_now("audio")
+    wait_until(engine, lambda: row(db, "second.flac")["status"] == "changed")
+
+
+def test_automatic_mode_waits_for_the_schedule_window(lib):
+    cfg, engine, db = lib
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    closed = [[False] * 24 for _ in range(7)]
+    state.put_schedule(db, {"audio": closed, "video": closed})
+    tone(os.path.join(cfg.audio_root, "outside.flac"), 0, codec_args=("-c:a", "flac"))
+    engine.scan_now("audio")
+    for _ in range(3):
+        engine.tick()
+        time.sleep(0.05)
+    assert engine.status() == "waiting_window"
+    assert row(db, "outside.flac")["status"] == "pending"
+
+    open_windows(db)
+    wait_until(engine, lambda: row(db, "outside.flac")["status"] == "changed")
+
+
+def test_automatic_mode_pauses_and_resumes(lib):
+    cfg, engine, db = lib
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    open_windows(db)
+    engine.tick()                                  # starts the automatic run
+    engine.toggle_pause()
+    assert engine.status() == "paused"
+    tone(os.path.join(cfg.audio_root, "held.flac"), 0, codec_args=("-c:a", "flac"))
+    engine.scan_now("audio")
+    for _ in range(3):
+        engine.tick()
+        time.sleep(0.05)
+    assert row(db, "held.flac")["status"] == "pending"
+    engine.toggle_pause()
+    wait_until(engine, lambda: row(db, "held.flac")["status"] == "changed")
+
+
+def test_switching_the_mode_stops_or_starts_the_run(lib):
+    cfg, engine, db = lib
+    tone(os.path.join(cfg.audio_root, "mode.flac"), 0, codec_args=("-c:a", "flac"))
+    open_windows(db)
+    engine.scan_now("audio")
+    engine.start()
+    assert state.get_run(db)["mode"] == "active"
+
+    state.put_settings(db, {"general": {"mode": "off"}})
+    engine.tick()                                  # the API applies the mode at once; a tick does too
+    assert state.get_run(db)["mode"] == "stopped"
+    assert engine.status() == "off"
+
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    engine.tick()
+    assert state.get_run(db)["mode"] == "active"
+    wait_until(engine, lambda: row(db, "mode.flac")["status"] == "changed")
+
+
+def test_switching_from_a_paused_automatic_run_to_bulk_stops_it(lib):
+    cfg, engine, db = lib
+    open_windows(db)
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    engine.tick()
+    engine.toggle_pause()
+    assert engine.status() == "paused"
+
+    state.put_settings(db, {"general": {"mode": "bulk"}})
+    engine.tick()
+    run = state.get_run(db)
+    assert (run["mode"], run["paused"], engine.status()) == ("stopped", False, "stopped")
+
+
+def test_automatic_mode_survives_a_restart(cfg):
+    from app.main import create_app
+    db = create_app(cfg, start_threads=False).state.db
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    open_windows(db)
+    app2 = create_app(cfg, start_threads=False)    # the app is started again
+    engine2 = app2.state.engine
+    assert state.get_run(app2.state.db)["mode"] == "active"
+    assert engine2.status() in ("idle", "running", "waiting_window")
+    tone(os.path.join(cfg.audio_root, "after-restart.flac"), 0, codec_args=("-c:a", "flac"))
+    engine2.scan_now("audio")
+    wait_until(engine2, lambda: row(app2.state.db, "after-restart.flac")["status"] == "changed")
+
+
+def test_a_pause_in_automatic_mode_survives_a_restart(cfg):
+    from app.main import create_app
+    app = create_app(cfg, start_threads=False)
+    db = app.state.db
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    app.state.engine.tick()                       # activates the automatic run
+    app.state.engine.toggle_pause()
+    assert state.get_run(db)["paused"] is True
+
+    app2 = create_app(cfg, start_threads=False)   # a restart keeps the hold
+    assert app2.state.engine.status() == "paused"
+    tone(os.path.join(cfg.audio_root, "held2.flac"), 0, codec_args=("-c:a", "flac"))
+    app2.state.engine.scan_now("audio")
+    for _ in range(3):
+        app2.state.engine.tick()
+        time.sleep(0.1)
+    assert row(app2.state.db, "held2.flac")["status"] == "pending"
+
+
+def test_off_mode_survives_a_restart(cfg):
+    from app.main import create_app
+    app = create_app(cfg, start_threads=False)
+    state.put_settings(app.state.db, {"general": {"mode": "off"}})
+    app2 = create_app(cfg, start_threads=False)
+    assert state.get_run(app2.state.db)["mode"] == "stopped"
+    assert app2.state.engine.status() == "off"
+
+
+def test_the_scan_interval_comes_from_the_settings(lib):
+    cfg, engine, db = lib
+    assert engine.scan_interval() == 15
+    state.put_schedule(db, {"scanEvery": 5})
+    assert engine.scan_interval() == 5
+    engine.scan_now("audio")
+    last, nxt = engine.last_scan(), engine.next_scan()
+    assert last and nxt
+    assert datetime.fromisoformat(nxt) - datetime.fromisoformat(last) == timedelta(minutes=5)
+    state.put_settings(db, {"general": {"mode": "off"}})
+    assert engine.next_scan() is None

@@ -1,9 +1,9 @@
 # Audio Normalizer — Lovelace card
 
 A native Home Assistant dashboard card that shows every value of the audio normalizer:
-run status and progress, audio and video counters (folders, files in scope, to do,
-checked, changed, parked), target loudness, next schedule change, errors, current file
-and last run.
+run status and progress, the app mode (off / bulk / automatic) with the last and next file
+scan, audio and video counters (folders, files in scope, to do, checked, changed, parked),
+target loudness, next schedule change, errors, current file and last run.
 
 The card is one self-contained file: `audio-normalizer-card.js`. It has no dependencies,
 and it follows your Home Assistant theme (light and dark).
@@ -70,7 +70,7 @@ Full-width layout tip: put the card in a *Panel* or a *Grid* section with one co
 | `title` | `Audio Normalizer` | Card title |
 | `show_audio` | `true` | Show the audio block |
 | `show_video` | `true` | Show the video block |
-| `show_details` | `true` | Show target, next schedule change, current file and last run |
+| `show_details` | `true` | Show target, next schedule change, last and next file scan, current file and last run |
 | `fields` | all values | Optional list of values to show, e.g. `audio.files_total`. The Home Assistant page generates this list from the enabled sensors. |
 
 ## Troubleshooting
@@ -81,4 +81,4 @@ Full-width layout tip: put the card in a *Panel* or a *Grid* section with one co
 
 ## Version
 
-This is card version 1.1.0. Version 1.1.0 adds the `fields` option (see the table above). Version 1.0.0 showed all values and had no `fields` option.
+This is card version 1.2.0. Version 1.2.0 adds the app mode and the last and next file scan (the *Mode*, *Last file scan* and *Next file scan* sensors of the web page). Version 1.1.0 adds the `fields` option (see the table above). Version 1.0.0 showed all values and had no `fields` option.

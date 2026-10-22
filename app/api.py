@@ -6,11 +6,12 @@ import os
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from . import __version__, folders, ha, state, stats
+from . import __version__, folders, ha, state, stats, waveform
 from .config import tool_path
-from .media import MEDIA
+from .media import EXTENSIONS, MEDIA
 from .schedule import in_window, next_change
 
 router = APIRouter()
@@ -48,6 +49,15 @@ class ScanBody(BaseModel):
 class MeasureBody(BaseModel):
     media: Literal["audio", "video"]
     relpath: str
+
+
+class EditBody(BaseModel):
+    media: Literal["audio"]
+    relpath: str
+    fade_in: float = 0.0            # seconds
+    fade_out: float = 0.0           # seconds
+    cut_start: float | None = None  # seconds; both or neither
+    cut_end: float | None = None
 
 
 class AdjustBody(BaseModel):
@@ -134,12 +144,17 @@ def dashboard(engine=Engine):
             checked += s["files_checked"]
     return {
         "status": engine.status(),
-        "mode": run["mode"],
+        "mode": settings["general"]["mode"],      # off / bulk / auto: what the app does on its own
+        "run_mode": run["mode"],                  # the run engine: active / stopped
         "paused": run["paused"],
         "types": run["types"],
         "last_finished": run["lastFinished"],
+        "scan_every": sched["scanEvery"],         # minutes between two looks for new files
+        "last_scan": run.get("lastScan"),
+        "next_scan": engine.next_scan(),          # None when the app is off
         "progress_percent": int(round(100 * checked / total)) if total else 0,
         "current_file": engine.current_file(),
+        "scanning": engine.scanning(),
         "dry_run": settings["general"]["dryRun"],
         "media": media,
         "log": db.log_list(60),
@@ -230,6 +245,34 @@ def toggle_all(body: FolderAll, engine=Engine):
 
 # ------------------------------------------------------------ files
 
+# Formats a browser can play as they are; a check in the Directories tab streams the file
+# unchanged (no transcoding, so what you hear is exactly what will be normalized).
+PLAYABLE = {
+    "audio": ("mp3", "flac", "wav", "aif", "aiff", "m4a", "aac", "ogg", "oga", "opus"),
+    "video": ("mp4", "m4v", "mov", "webm"),
+}
+
+STREAM_TYPES = {
+    "mp3": "audio/mpeg", "flac": "audio/flac", "wav": "audio/wav", "aif": "audio/aiff", "aiff": "audio/aiff",
+    "m4a": "audio/mp4", "aac": "audio/aac", "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
+    "mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
+}
+
+
+def _stream_path(engine, media: str, rel: str) -> str:
+    """The file for a preview, or an HTTP error. Nothing outside the base location is served."""
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        raise HTTPException(400, "invalid path")
+    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
+    if ext not in PLAYABLE[media] or ext not in EXTENSIONS[media]:
+        raise HTTPException(404, "this format cannot be played in a browser")
+    root = os.path.realpath(engine.cfg.root(media))
+    path = os.path.realpath(os.path.join(root, rel))
+    if os.path.commonpath([root, path]) != root or not os.path.isfile(path):
+        raise HTTPException(404, "file not found")
+    return path
+
+
 @router.get("/files")
 def list_files(media: str = "audio", dir: str = ".", engine=Engine):
     _media_check(media)
@@ -237,7 +280,23 @@ def list_files(media: str = "audio", dir: str = ".", engine=Engine):
         "SELECT id, name, relpath, ext, lufs, true_peak, status, reason, gain_db, adjust_db, applied_db, "
         "method, measured_at, changed_at FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
         (media, dir))
+    for row in rows:
+        row["playable"] = row["ext"] in PLAYABLE[media]
     return {"files": rows, "target": state.get_settings(engine.db)[media]["target"]}
+
+
+@router.get("/files/stream")
+def stream_file(media: str = "audio", relpath: str = "", engine=Engine):
+    """The file itself, for the player in the Directories tab. Range requests are supported,
+    so the player can seek without downloading the whole file first."""
+    _media_check(media)
+    path = _stream_path(engine, media, relpath)
+    ext = path.rsplit(".", 1)[-1].lower()
+    return FileResponse(
+        path,
+        media_type=STREAM_TYPES.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.post("/files/measure")
@@ -246,6 +305,36 @@ def measure(body: MeasureBody, engine=Engine):
     if ".." in body.relpath.split("/") or body.relpath.startswith("/"):
         raise HTTPException(400, "invalid path")
     return engine.measure(body.media, body.relpath)
+
+
+@router.get("/files/info")
+def file_info(media: str = "audio", relpath: str = "", engine=Engine):
+    """Length and codec of one file; the editor uses it before the levels are read."""
+    _media_check(media)
+    return waveform.info(engine.cfg.ffmpeg, _stream_path(engine, media, relpath))
+
+
+@router.get("/files/waveform")
+def file_waveform(media: str = "audio", relpath: str = "", start: float = 0.0,
+                  duration: float | None = None, buckets: int = 1200, engine=Engine):
+    """Levels over time for the timeline of the editor: one (min, max) pair per bucket."""
+    _media_check(media)
+    return waveform.peaks(engine.cfg.ffmpeg, _stream_path(engine, media, relpath),
+                          start=start, duration=duration, buckets=buckets)
+
+
+@router.post("/files/edit")
+def edit_file(body: EditBody, engine=Engine):
+    """Fade in/out and/or remove a part of one audio file, in place (with backup when set)."""
+    _media_check(body.media)
+    if ".." in body.relpath.split("/") or body.relpath.startswith("/"):
+        raise HTTPException(400, "invalid path")
+    cut = None
+    if body.cut_start is not None or body.cut_end is not None:
+        if body.cut_start is None or body.cut_end is None:
+            raise HTTPException(400, "a cut needs both a start and an end")
+        cut = (body.cut_start, body.cut_end)
+    return engine.edit_audio(body.media, body.relpath, fade_in=body.fade_in, fade_out=body.fade_out, cut=cut)
 
 
 # ------------------------------------------------------------ parked files
@@ -368,7 +457,9 @@ def get_settings(engine=Engine):
 
 @router.put("/settings")
 def put_settings(body: dict, engine=Engine):
-    return state.put_settings(engine.db, body)
+    settings = state.put_settings(engine.db, body)
+    engine.apply_mode()               # off stops the run, automatic starts it, bulk stops an automatic one
+    return settings
 
 
 @router.get("/schedule")
@@ -378,7 +469,7 @@ def get_schedule(engine=Engine):
 
 @router.put("/schedule")
 def put_schedule(body: dict, engine=Engine):
-    return state.put_schedule(engine.db, body)
+    return state.put_schedule(engine.db, body)     # the scan loop picks a new interval up within two seconds
 
 
 # ------------------------------------------------------------ Home Assistant

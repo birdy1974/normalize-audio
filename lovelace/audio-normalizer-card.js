@@ -1,8 +1,9 @@
 /*!
- * Audio Normalizer — Lovelace card  (v1.1.0)
+ * Audio Normalizer — Lovelace card  (v1.2.0)
  *
  * Shows the values published by the audio-normalizer status entity:
- * run status, progress, audio and video counters, parked files, errors,
+ * run status, app mode (off / bulk / automatic) with the last and next file
+ * scan, progress, audio and video counters, parked files, errors,
  * target loudness, next schedule change, current file and last run.
  *
  * It reads ONE entity (default sensor.audio_normalizer). Its attributes hold
@@ -26,8 +27,10 @@
 (function () {
   'use strict';
 
-  const CARD_VERSION = '1.1.0';
+  const CARD_VERSION = '1.2.0';
   const CARD_TAG = 'audio-normalizer-card';
+  const MODE_NAMES = { off: 'Off', bulk: 'Bulk', auto: 'Automatic' };
+
   const DEFAULTS = {
     entity: 'sensor.audio_normalizer',
     title: 'Audio Normalizer',
@@ -71,6 +74,10 @@
     .status.s-running::before { background: #2f7a6b; }
     .status.s-paused { color: #8a5d10; }
     .status.s-paused::before { background: #8a5d10; }
+    .status.s-idle { color: #2f7a6b; }
+    .status.s-idle::before { background: #2f7a6b; }
+    .status.s-off { color: #9d9e99; }
+    .status.s-off::before { background: #9d9e99; }
     .bar { height: 6px; background: var(--divider-color, #dcdcd8); border-radius: 999px; overflow: hidden; }
     .bar > div { height: 100%; background: #2f7a6b; border-radius: 999px; transition: width .5s linear; }
     .meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--secondary-text-color, #6c6d69); margin: 8px 0 16px; }
@@ -176,6 +183,15 @@
       if (top('errors')) meta.push('<span>Errors <b>' + num(a.errors) + '</b></span>');
 
       const foot = [];
+      if (top('mode')) {
+        foot.push('<div><dt>Mode</dt><dd>' + esc(MODE_NAMES[a.mode] || a.mode || '—') + '</dd></div>');
+      }
+      if (c.show_details && top('last_scan')) {
+        foot.push('<div><dt>Last scan</dt><dd>' + when(a.last_scan) + '</dd></div>');
+      }
+      if (c.show_details && top('next_scan')) {
+        foot.push('<div><dt>Next scan</dt><dd>' + when(a.next_scan) + '</dd></div>');
+      }
       if (c.show_details && top('current_file')) {
         foot.push('<div><dt>Current file</dt><dd class="mono" title="' + esc(a.current_file || '') + '">' + esc(a.current_file || '—') + '</dd></div>');
       }

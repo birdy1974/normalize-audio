@@ -12,7 +12,7 @@ from . import __version__, api
 from . import ffmpeg as ff
 from .config import Config, load_config
 from .db import Database
-from .engine import Engine
+from .engine import Engine, FileBusy
 
 
 def create_app(cfg: Config | None = None, start_threads: bool = True) -> FastAPI:
@@ -40,6 +40,10 @@ def create_app(cfg: Config | None = None, start_threads: bool = True) -> FastAPI
     @app.exception_handler(ff.ToolError)
     async def _tool_error(_req: Request, exc: ff.ToolError):
         return JSONResponse({"detail": str(exc)}, status_code=422)
+
+    @app.exception_handler(FileBusy)
+    async def _file_busy(_req: Request, exc: FileBusy):
+        return JSONResponse({"detail": str(exc)}, status_code=409)
 
     app.mount("/static", StaticFiles(directory=cfg.static_dir), name="static")
 

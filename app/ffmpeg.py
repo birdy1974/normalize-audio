@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from .media import DEFAULT_KBPS, ENCODER
+from .media import DEFAULT_KBPS, ENCODER, audio_family
 
 Cancel = Callable[[], bool] | None
 
@@ -148,6 +148,76 @@ def gain_tool(binary: str, path: str, steps: int, cancel: Cancel = None) -> None
     rc, err = run_tool([binary, "-q", "-p", "-g", str(steps), path], cancel)
     if rc != 0:
         raise ToolError(f"{os.path.basename(binary)} failed: " + _tail(err))
+
+
+def edit_args(src: str, dst: str, *, probe_: Probe, duration: float,
+              cut: tuple[float, float] | None, fade_in: float, fade_out: float,
+              new_duration: float, kbps: int | None) -> list[str]:
+    """ffmpeg command for the editor: remove a part, then fade in and out; audio only."""
+    parts: list[str] = []
+    label = "[0:a:0]"
+    if cut:
+        start, end = cut
+        if start <= 0.005:                     # only the tail is kept
+            parts.append(f"[0:a:0]atrim=start={end:.3f},asetpts=PTS-STARTPTS[kept]")
+        elif end >= duration - 0.005:          # only the head is kept
+            parts.append(f"[0:a:0]atrim=end={start:.3f},asetpts=PTS-STARTPTS[kept]")
+        else:
+            parts.append(f"[0:a:0]atrim=end={start:.3f},asetpts=PTS-STARTPTS[head]")
+            parts.append(f"[0:a:0]atrim=start={end:.3f},asetpts=PTS-STARTPTS[tail]")
+            parts.append("[head][tail]concat=n=2:v=0:a=1[kept]")
+        label = "[kept]"
+    effects = []
+    if fade_in > 0:
+        effects.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        effects.append(f"afade=t=out:st={max(0.0, new_duration - fade_out):.3f}:d={fade_out:.3f}")
+    if effects:
+        parts.append(f"{label}{','.join(effects)}[out]")
+        label = "[out]"
+    args = ["-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src,
+            "-filter_complex", ";".join(parts), "-map", label,
+            "-map_metadata", "0", "-map_chapters", "-1"]
+    codec = (probe_.codec or "").lower()
+    family = audio_family(codec)
+    if family is None:
+        raise ToolError(f"editing {codec or 'this format'} is not supported")
+    if family == "lossless" or codec.startswith("pcm_"):
+        args += ["-c:a", probe_.codec]
+        if codec == "flac":
+            args += ["-sample_fmt", "s32" if (probe_.sample_fmt or "").startswith("s32") else "s16"]
+    else:
+        bitrate = kbps or DEFAULT_KBPS.get(family, 192)
+        args += ["-c:a", ENCODER[family], "-b:a", f"{bitrate}k"]
+    args.append(dst)
+    return args
+
+
+def edit(ffmpeg: str, src: str, dst: str, *, probe_: Probe, duration: float,
+         cut: tuple[float, float] | None, fade_in: float, fade_out: float,
+         new_duration: float, kbps: int | None, cancel: Cancel = None) -> None:
+    cmd = [ffmpeg, *edit_args(src, dst, probe_=probe_, duration=duration, cut=cut,
+                              fade_in=fade_in, fade_out=fade_out, new_duration=new_duration, kbps=kbps)]
+    rc, err = run_tool(cmd, cancel)
+    if rc != 0:
+        raise ToolError("editing failed: " + _tail(err))
+
+
+def verify_edit(ffmpeg: str, path: str, source: Probe, expected_duration: float,
+                cancel: Cancel = None) -> None:
+    """The edited file must decode without errors and have the length the edit asks for."""
+    rc, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
+                        "-map", "0:a", "-f", "null", "-"], cancel)
+    if rc != 0 or err.strip():
+        raise ToolError("verification failed: " + _tail(err))
+    out = probe(ffmpeg, path, cancel)
+    if out.audio_streams != 1:
+        raise ToolError("verification failed: audio stream count changed")
+    if audio_family((out.codec or "").lower()) != audio_family((source.codec or "").lower()):
+        raise ToolError(f"verification failed: the codec changed from {source.codec} to {out.codec}")
+    if out.duration is None or abs(out.duration - expected_duration) > 0.6:
+        raise ToolError(f"verification failed: the new length is {out.duration or 0:.1f} s "
+                        f"instead of {expected_duration:.1f} s")
 
 
 def verify(ffmpeg: str, path: str, source: Probe, cancel: Cancel = None) -> None:
