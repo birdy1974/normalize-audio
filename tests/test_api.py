@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 import pytest
 from fastapi.testclient import TestClient
@@ -90,6 +91,37 @@ def test_folder_toggle_and_select_all_none(client, cfg):
 def test_folder_api_rejects_unknown_media(client):
     assert client.post("/api/folders/all", json={"media": "photos", "enabled": True}).status_code == 422
     assert client.get("/api/folders", params={"media": "photos"}).status_code == 400
+
+
+def test_rescan_makes_new_folders_and_files_visible(client, cfg):
+    """The Rescan button on the Directories tab uses this endpoint; the tree follows the disk."""
+    _scan_library(cfg, client)
+    names = {d["relpath"] for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+    assert "New" not in names
+
+    # A folder and a file created after the previous scan.
+    tone(os.path.join(cfg.audio_root, "New", "Album", "d.flac"), 0, codec_args=("-c:a", "flac"))
+    r = client.post("/api/scan", json={"media": "audio"})
+    assert r.status_code == 200
+    assert r.json()["audio"]["new"] == 1
+
+    data = client.get("/api/folders/tree", params={"media": "audio"}).json()
+    by = {d["relpath"]: d for d in data["dirs"]}
+    assert by["New"]["parent"] == "." and by["New/Album"]["parent"] == "New"
+    assert by["New"]["files"] == 1 and by["New/Album"]["direct_files"] == 1
+
+    # A new folder inherits the state of its parent, so a rescan never adds excluded files.
+    assert client.post("/api/folders/toggle", json={"media": "audio", "relpath": "New", "enabled": False}).status_code == 200
+    tone(os.path.join(cfg.audio_root, "New", "Album", "Later", "e.flac"), 0, codec_args=("-c:a", "flac"))
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    by = {d["relpath"]: d for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+    assert by["New/Album/Later"]["enabled"] is False
+
+    # A folder removed from the disk disappears on the next scan.
+    shutil.rmtree(os.path.join(cfg.audio_root, "Old", "Deep"))
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    names = {d["relpath"] for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+    assert "Old/Deep" not in names
 
 
 # ------------------------------------------------------------ settings

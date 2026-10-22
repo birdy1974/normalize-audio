@@ -199,6 +199,15 @@ pre {
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn-sm { height: 26px; padding: 0 8px; font-size: 12px; }
+.btn.is-busy:disabled { opacity: .7; cursor: progress; }
+.btn.is-busy::before {
+  content: ""; width: 10px; height: 10px; flex: none; border-radius: 50%;
+  border: 1.5px solid currentColor; border-top-color: transparent;
+  animation: btn-spin .7s linear infinite;
+}
+@keyframes btn-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .btn.is-busy::before { animation: none; } }
+.scan-note { color: var(--accent); font-weight: 600; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: var(--r-s); background: var(--surface); padding: 2px; gap: 2px; }

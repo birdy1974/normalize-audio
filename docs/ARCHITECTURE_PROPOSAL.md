@@ -85,7 +85,7 @@ audio-normalizer/
 
 ### 2.2 Processing pipeline (per file)
 
-1. **Detect** — periodic scan of enabled directories (default every 15 min). A file is "new/changed" when path, size or mtime differ from the database. inotify is **not** used as the primary mechanism: it is unreliable on Synology shares and bind mounts. (Optional inotify later.)
+1. **Detect** — periodic scan of enabled directories (default every 15 min); opening the Directories tab or pressing Rescan scans at once. A file is "new/changed" when path, size or mtime differ from the database. inotify is **not** used as the primary mechanism: it is unreliable on Synology shares and bind mounts. (Optional inotify later.)
 2. **Analyse** — ffmpeg `ebur128` → integrated loudness (LUFS) and true peak (dBTP). Result cached by file fingerprint.
 3. **Decide** — `gain = target − measured`, limited so the true peak stays below the ceiling (default −1 dBTP).
    - |gain| < 0.5 dB → `ok` (no change).

@@ -110,6 +110,7 @@
     trees: { audio: null, video: null },   // { roots, map, rootFiles } built from /api/folders/tree
     selected: { audio: null, video: null },// selected folder (relpath) per media type
     browse: { media: null, rel: null, rows: null, loading: false },
+    scanning: { audio: false, video: false },  // a rescan of the base location is running
     parked: { audio: null, video: null },  // GET /api/parked
     parkSel: [],                    // selected parked file ids
     parkSort: 'order',
@@ -124,7 +125,7 @@
     const t = state.media;
     switch (route) {
       case 'dashboard': return ['dashboard', 'settings'];
-      case 'directories': return ['dir:' + t, 'settings'];
+      case 'directories': return ['dir:' + t, 'settings', 'dashboard'];   // folder counts come from the dashboard
       case 'parked': return ['parked:' + t, 'settings'];
       case 'schedule': return ['schedule'];
       case 'settings': return ['settings', 'schedule'];
@@ -217,6 +218,54 @@
       toast(err.message);
     }
     render();
+  }
+
+  /* Look for new, changed and removed files and folders on disk. One scan per media type at a
+     time; the tree and the open folder are read again when it finishes. */
+  const scans = { audio: null, video: null };     // in-flight rescan per media type
+
+  function scanSummary(t, r) {
+    if (!r) return 'Rescan finished';
+    if (r.available === false) {
+      return MEDIA[t].label + ' base location ' + MEDIA[t].root + ' is not available. Check the mount in docker-compose.yml.';
+    }
+    const found = [];
+    if (r.new) found.push(r.new + ' new');
+    if (r.changed) found.push(r.changed + ' changed');
+    if (r.removed) found.push(r.removed + ' removed');
+    const n = r.new + r.changed + r.removed;
+    const files = n ? found.join(', ') + ' file' + (n === 1 ? '' : 's') : 'no new or changed files';
+    return 'Rescan: ' + files + ' · ' + fmt(r.folders) + ' folders';
+  }
+
+  function scanDirectories(t, notify) {
+    if (scans[t]) return scans[t];
+    state.scanning[t] = true;
+    scans[t] = api('/scan', { method: 'POST', body: { media: t } })
+      .then((r) => {
+        const res = (r && r[t]) || null;
+        if (notify || (res && res.available === false)) toast(scanSummary(t, res));
+        return res;
+      })
+      .catch((err) => {
+        toast('Rescan failed: ' + err.message);
+        return null;
+      })
+      .finally(() => {
+        state.scanning[t] = false;
+        scans[t] = null;
+        invalidate('dir:' + t);
+        if (state.browse.media === t) state.browse = { media: null, rel: null, rows: null, loading: false };
+        const done = () => { if (currentRoute() === 'directories') render(); };
+        refreshDash().then(done, done);
+      });
+    return scans[t];
+  }
+
+  function openDirectories() {
+    const t = state.media;
+    invalidate('dir:' + t);                 // read the tree again, also when the scan is slow
+    scanDirectories(t, false);              // new files and folders become visible when it finishes
   }
 
   /* ----------------------------------------------------- derived helpers */
@@ -443,21 +492,26 @@
     const m = dashMedia(t);
     const selRel = state.selected[t];
     const sel = selRel && tr.map.get(selRel);
+    const scanning = !!state.scanning[t];
     if (sel && (state.browse.media !== t || state.browse.rel !== sel.rel) && !state.browse.loading) {
       loadBrowse(sel.rel);
     }
     const dirs = !tr.roots.length
-      ? '<p class="muted">No folders found under the base location. Check the mount in docker-compose.yml and run a scan.</p>'
+      ? '<p class="muted">No folders found under the base location. Check the mount in docker-compose.yml, then use Rescan.</p>'
       : '';
     app().innerHTML = pageHead('Directories',
       'Base location <span class="mono">' + MEDIA[t].root + '</span>, mounted from <span class="mono">' + MEDIA[t].host
       + '</span> in docker-compose.yml. Untick a folder to exclude it. Ticking or unticking applies to its sub-folders too.',
-      '<button class="btn btn-sm" data-action="select-all">Select all</button>'
+      '<button class="btn btn-sm' + (scanning ? ' is-busy' : '') + '" data-action="rescan"' + (scanning ? ' disabled' : '') + '>'
+      + (scanning ? 'Scanning…' : 'Rescan') + '</button>'
+      + tip('Looks on disk for new, changed and removed files and folders, then updates this page. The same check runs when you open this tab.')
+      + '<button class="btn btn-sm" data-action="select-all">Select all</button>'
       + '<button class="btn btn-sm" data-action="select-none">Select none</button>'
       + '<button class="btn btn-sm" data-action="expand-all">Expand all</button>'
       + '<button class="btn btn-sm" data-action="collapse-all">Collapse all</button>', true)
       + '<p class="muted" style="margin-bottom:0"><strong style="color:var(--text)">' + m.directories_enabled + ' of ' + m.directories_total
-      + '</strong> folders included · ' + fmt(m.files_total) + ' files in scope</p>'
+      + '</strong> folders included · ' + fmt(m.files_total) + ' files in scope'
+      + (scanning ? ' · <span class="scan-note">looking for new files and folders…</span>' : '') + '</p>'
       + baselinePanel(t)
       + dirs
       + '<div class="split-dirs">'
@@ -887,6 +941,9 @@
     } else if (a === 'tree-browse') {
       state.selected[t] = el.dataset.rel;
       render();
+    } else if (a === 'rescan') {
+      scanDirectories(t, true);       // the button shows Scanning… until the fresh tree is read
+      render();
     } else if (a === 'select-all' || a === 'select-none') {
       await api('/folders/all', { method: 'POST', body: { media: t, enabled: a === 'select-all' } });
       invalidate('dir:' + t);
@@ -1195,7 +1252,7 @@
     if (route !== 'directories') state.baselineFrom = null;      // the baseline banner lasts while on Directories
     if (route !== 'settings' && state.settings) state.draft = clone(state.settings);   // unsaved edits are dropped
     if (route === 'parked') invalidate('parked:' + state.media);  // fresh list each time the page is opened
-    if (route === 'directories') invalidate('dir:' + state.media);
+    if (route === 'directories') openDirectories();                // and look for new files and folders
     render();
   });
 
@@ -1214,5 +1271,6 @@
   }, 3000);
 
   applyMenu();
+  if (currentRoute() === 'directories') openDirectories();   // also when the app opens on this page
   render();
 })();
