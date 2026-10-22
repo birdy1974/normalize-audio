@@ -264,7 +264,7 @@ def test_new_and_changed_files_are_detected(lib):
     assert row(db, "one.flac")["status"] == "pending"
 
 
-def test_no_processing_outside_schedule_window(lib):
+def test_bulk_run_respects_the_schedule_window(lib):
     cfg, engine, db = lib
     tone(os.path.join(cfg.audio_root, "night.flac"), 0, codec_args=("-c:a", "flac"))
     closed = [[False] * 24 for _ in range(7)]
@@ -276,6 +276,10 @@ def test_no_processing_outside_schedule_window(lib):
     assert engine.inflight_count() == 0
     assert row(db, "night.flac")["status"] == "pending"
     assert engine.status() == "waiting_window"
+    assert state.get_run(db)["mode"] == "active"       # Start does not bypass a closed window
+
+    open_windows(db)
+    wait_until(engine, lambda: row(db, "night.flac")["status"] == "changed")
 
 
 def test_stopped_run_does_not_process(lib):
@@ -300,6 +304,37 @@ def test_disabled_folder_is_not_processed(lib):
     engine.tick()
     assert engine.inflight_count() == 0
     assert row(db, "skip.flac")["status"] == "pending"
+
+
+def test_excluded_backlog_does_not_starve_enabled_files(lib):
+    """The 300-file batch limit must be applied after the enabled-folder filter."""
+    from app import folders
+    cfg, engine, db = lib
+    engine.scan_now("audio")
+    now = time.time()
+    db.executemany(
+        "INSERT INTO files (media, relpath, dir, name, ext, size, mtime_ns, status, seen_at) "
+        "VALUES ('audio', ?, 'Excluded', ?, 'flac', 1, 1, 'pending', ?)",
+        [(f"Excluded/{n}.flac", f"{n}.flac", now) for n in range(301)],
+    )
+    db.execute("INSERT INTO dirs (media, relpath, parent, enabled) VALUES ('audio', 'Excluded', '.', 0)")
+    wanted = tone(os.path.join(cfg.audio_root, "Enabled", "wanted.flac"), 0, codec_args=("-c:a", "flac"))
+    stat = os.stat(wanted)
+    db.execute("INSERT INTO dirs (media, relpath, parent, enabled) VALUES ('audio', 'Enabled', '.', 1)")
+    db.execute(
+        "INSERT INTO files (media, relpath, dir, name, ext, size, mtime_ns, status, seen_at) "
+        "VALUES ('audio', 'Enabled/wanted.flac', 'Enabled', 'wanted.flac', 'flac', ?, ?, 'pending', ?)",
+        (stat.st_size, stat.st_mtime_ns, now),
+    )
+    open_windows(db)
+    set_settings(db, target=-16.0, threshold=12.0)
+
+    engine.start()
+    wait_until(engine, lambda: row(db, "wanted.flac")["status"] == "changed", timeout=30)
+
+    assert db.one("SELECT status FROM files WHERE relpath = 'Enabled/wanted.flac'")["status"] == "changed"
+    assert db.one("SELECT COUNT(*) AS n FROM files WHERE dir = 'Excluded' AND status != 'pending'")["n"] == 0
+    assert folders.enabled_set(db, "audio") == {".", "Enabled"}
 
 
 # ------------------------------------------------------------ app modes (off / bulk / auto)
@@ -485,8 +520,46 @@ def test_the_scan_interval_comes_from_the_settings(lib):
     state.put_schedule(db, {"scanEvery": 5})
     assert engine.scan_interval() == 5
     engine.scan_now("audio")
+    assert engine.last_scan() and engine.next_scan() is None  # manual Bulk scan, no automatic follow-up
+    state.put_settings(db, {"general": {"mode": "auto"}})
     last, nxt = engine.last_scan(), engine.next_scan()
     assert last and nxt
     assert datetime.fromisoformat(nxt) - datetime.fromisoformat(last) == timedelta(minutes=5)
     state.put_settings(db, {"general": {"mode": "off"}})
     assert engine.next_scan() is None
+
+
+def test_only_automatic_mode_runs_the_periodic_scanner(lib, monkeypatch):
+    cfg, engine, db = lib
+
+    class StopAfterWaitOrScan:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, _seconds):
+            self.stopped = True
+
+    stop = StopAfterWaitOrScan()
+    scans = []
+    monkeypatch.setattr(engine, "_stop", stop)
+
+    def scan():
+        scans.append(engine.now())
+        stop.stopped = True
+
+    monkeypatch.setattr(engine, "scan_now", scan)
+
+    engine._scan_loop()
+    assert scans == []                                       # Bulk waits; it does not scan
+
+    stop.stopped = False
+    state.put_settings(db, {"general": {"mode": "off"}})
+    engine._scan_loop()
+    assert scans == []                                       # Off does not scan either
+
+    stop.stopped = False
+    state.put_settings(db, {"general": {"mode": "auto"}})
+    engine._scan_loop()
+    assert len(scans) == 1                                   # Automatic scans immediately after a restart

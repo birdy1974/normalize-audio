@@ -4,7 +4,7 @@ Self-hosted web app that brings the loudness of audio files (MP3, FLAC, M4A, WAV
 track of AVI, MKV and MP4 files) in a chosen folder tree to one common level, without changing the audio quality.
 Designed for Docker on a Synology DS918+.
 
-**Status: version 0.1.0, implemented.** Checked in a Linux sandbox: 74 automated tests (decision rules, pipeline with
+**Status: version 0.1.0, implemented.** Checked in a Linux sandbox: 76 automated tests (decision rules, pipeline with
 real ffmpeg, REST API), a live run on a demo library, and the web UI in headless Chromium.
 **Not yet verified:** the Docker image build, the `aacgain` package in Debian, the mp3gain/aacgain command-line
 options on a real file, a run on the NAS, and the Home Assistant integration. See "Verification status" below.
@@ -16,17 +16,18 @@ options on a real file, a run on the NAS, and the Home Assistant integration. Se
 
 ## What it does
 
-- Three modes, set in Settings (Mode card) and shown on the dashboard and in Home Assistant:
+- Three modes, selected with buttons on the dashboard or in Settings (Mode card), and shown in Home Assistant:
   - **Automatic** — every *Look for new or changed files every* N minutes the folders are scanned and new or changed
     files are checked and normalized by themselves, within the schedule and the folders that are included.
-  - **Bulk** (default) — the folders are scanned on the same interval, so the list stays current, but nothing is
-    normalized until you press Start. A bulk run works through the files that are in the library then and stops by
-    itself; files that appear later wait for the next Start.
+  - **Bulk** (default) — there is no periodic scan and nothing is normalized until you press Start. A bulk run works
+    through the pending files in enabled folders, within their schedule, and stops by itself; files that appear later
+    wait for a manual scan and the next Start.
   - **Off** — nothing is scanned and nothing is normalized. The app only shows what it already knows; Rescan,
     Check level and the audio editor still work when you use them, and Start is refused.
-- Scans two base locations (audio and video) including all sub-folders. New and changed files are found
-  on the interval above, after a restart, when the Directories tab is opened and with its Rescan button (the state is
-  kept in SQLite). A manual Rescan also resets the interval, so the next automatic scan starts a full interval later.
+- Scans two base locations (audio and video) including all sub-folders. Automatic mode finds new and changed files on
+  the interval above. In every mode, opening the Directories tab or using its Rescan button scans manually (the state
+  is kept in SQLite). A manual Rescan also resets the automatic interval, so the next automatic scan starts a full
+  interval later.
 - Measures integrated loudness (EBU R128) and true peak with ffmpeg, then changes the level to the target
   (default −16 LUFS, −1 dBTP ceiling).
 - Lossless files (FLAC, WAV) use ffmpeg `volume` at the original sample format. Lossy MP3 and AAC use
@@ -90,7 +91,7 @@ Environment variables: `AUDIO_ROOT`, `VIDEO_ROOT`, `CONFIG_DIR`, `FFMPEG_BIN`, `
 | Item | Status |
 |---|---|
 | Decision rules (gain, park, skip, lossy) | Automated tests pass (13) |
-| Pipeline with real ffmpeg: volume, re-encode, backup, output, dry run, silent, park/approve, restart, window, folders, off / bulk / automatic mode and the scan schedule | Automated tests pass (27) |
+| Pipeline with real ffmpeg: volume, re-encode, backup, output, dry run, silent, park/approve, restart, window, folders, off / bulk / automatic mode and the scan schedule | Automated tests pass (29) |
 | REST API: HA auth and token masking, HA sensor names, folders and tree (including rescan and the scan state), file streaming, waveform and info, editing, app modes and the scan schedule, settings validation, parked actions | Automated tests pass (33) |
 | Web UI against the live API (headless Chromium) | Checked: pages load, no script errors, folder toggle, parked adjust and sort, settings save |
 | Directories rescan | REST endpoint tested; UI checked in jsdom (tab open starts a scan, Rescan button and result message, tree updates) |

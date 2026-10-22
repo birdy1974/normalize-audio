@@ -188,6 +188,9 @@ pre {
 
 /* ---------- run status ---------- */
 .run-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.dashboard-mode { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.dashboard-mode > span { font-size: 13px; }
+.mode-buttons button { min-width: 88px; }
 .mode-line { margin: 6px 0 0; }
 .run-state { display: flex; align-items: center; gap: 10px; font-size: 15px; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }

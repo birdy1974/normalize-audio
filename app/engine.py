@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from . import ffmpeg as ff
-from . import folders, schedule, state, stats
+from . import schedule, state, stats
 from .config import Config, tool_path
 from .decide import decide
 from .media import DEFAULT_KBPS, MEDIA, audio_family
@@ -74,15 +74,15 @@ class Engine:
         return state.get_settings(self.db)["general"]["mode"]
 
     def scan_interval(self) -> int:
-        """Minutes between two looks for new, changed and removed files (Settings > Scheduling)."""
+        """Minutes between automatic looks for new, changed and removed files."""
         return state.get_schedule(self.db)["scanEvery"]
 
     def last_scan(self) -> str | None:
         return state.get_run(self.db).get("lastScan")
 
     def next_scan(self) -> str | None:
-        """When the folders are looked at next; None when the app is off."""
-        if self.mode() == "off":
+        """When the next automatic scan is due; only Automatic mode has one."""
+        if self.mode() != "auto":
             return None
         last = self.last_scan()
         if not last:
@@ -231,13 +231,13 @@ class Engine:
             return None
 
     def _scan_loop(self) -> None:
-        """Look for new, changed and removed files every `scanEvery` minutes, unless the app is off.
+        """In Automatic mode, look for new, changed and removed files every `scanEvery` minutes.
 
-        The loop wakes up every two seconds, so turning the app off, changing the interval in the
-        settings or starting automatic mode takes effect at once instead of after the old wait.
+        Bulk runs work on the library already loaded by a manual scan; they have no periodic scan.
+        The loop wakes up every two seconds, so changing the mode or interval takes effect at once.
         """
         while not self._stop.is_set():
-            if self.mode() == "off":
+            if self.mode() != "auto":
                 self._stop.wait(2.0)
                 continue
             due = self._scan_due()
@@ -291,10 +291,10 @@ class Engine:
             for m in MEDIA:
                 if not (run["types"].get(m) and open_[m]):
                     continue
-                enabled = folders.enabled_set(self.db, m)
                 rows = self.db.query(
-                    "SELECT id, dir FROM files WHERE media = ? AND status = 'pending' ORDER BY id LIMIT 300", (m,))
-                picks += [(r["id"], False, m) for r in rows if r["dir"] in enabled]
+                    "SELECT f.id FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
+                    "WHERE f.media = ? AND f.status = 'pending' AND d.enabled = 1 ORDER BY f.id LIMIT 300", (m,))
+                picks += [(r["id"], False, m) for r in rows]
 
         for fid, approved, _media in picks:
             with self._lock:
