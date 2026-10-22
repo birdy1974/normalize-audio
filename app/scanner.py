@@ -14,6 +14,12 @@ from .media import EXTENSIONS, MEDIA
 SKIP_PREFIXES = (".", "@", "#")
 
 
+def _is_storable(name: str) -> bool:
+    """SQLite (and UTF-8 in general) cannot store the lone surrogates Python uses
+    (via surrogateescape) to represent file names that are not valid UTF-8 on disk."""
+    return not any(0xD800 <= ord(c) <= 0xDFFF for c in name)
+
+
 class Scanner:
     def __init__(self, cfg, db: Database):
         self.cfg = cfg
@@ -28,8 +34,17 @@ class Scanner:
         dirs: dict[str, str] = {}      # folder relpath -> parent relpath
         files: dict[str, tuple] = {}   # file relpath -> (dir, name, ext, size, mtime_ns)
         wanted = EXTENSIONS[media]
+        skipped = 0
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if not d.startswith(SKIP_PREFIXES))
+            good_dirnames = []
+            for d in dirnames:
+                if d.startswith(SKIP_PREFIXES):
+                    continue
+                if not _is_storable(d):
+                    skipped += 1
+                    continue
+                good_dirnames.append(d)
+            dirnames[:] = sorted(good_dirnames)
             here = os.path.relpath(dirpath, root).replace(os.sep, "/")
             if here == ".":
                 here = "."
@@ -38,6 +53,9 @@ class Scanner:
                 dirs[child] = here
             for name in filenames:
                 if name.startswith(SKIP_PREFIXES) or "." not in name:
+                    continue
+                if not _is_storable(name):
+                    skipped += 1
                     continue
                 ext = name.rsplit(".", 1)[1].lower()
                 if ext not in wanted:
@@ -103,11 +121,25 @@ class Scanner:
             if removed:
                 parts.append(f"{removed} removed")
             self.db.log("info", f"Scan: {', '.join(parts)} {media} file(s)", media)
+        if skipped:
+            self.db.log(
+                "error",
+                f"Scan: skipped {skipped} {media} file(s)/folder(s) with a name that is not valid UTF-8; "
+                "rename them on disk to include them.",
+                media,
+            )
         return {"available": True, "files": len(files), "new": new, "changed": changed,
-                "removed": removed, "folders": len(dirs)}
+                "removed": removed, "folders": len(dirs), "skipped": skipped}
 
     def scan_all(self) -> dict:
-        return {m: self.scan(m) for m in MEDIA}
+        results = {}
+        for m in MEDIA:
+            try:
+                results[m] = self.scan(m)
+            except Exception as exc:
+                self.db.log("error", f"Scan failed for {m}: {exc}", m)
+                results[m] = {"available": False}
+        return results
 
 
 ROOT_KEY = "."

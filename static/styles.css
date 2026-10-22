@@ -58,7 +58,8 @@ body {
 
 .sidebar-top { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; padding: 4px 6px; white-space: nowrap; min-width: 0; }
-.logo { width: 12px; height: 12px; background: var(--accent); border-radius: 3px; display: inline-block; flex: none; }
+.logo { width: 24px; height: 24px; border-radius: 6px; display: inline-block; flex: none; object-fit: contain; }
+.app.is-rail .logo, .app.auto-rail .logo { width: 22px; height: 22px; }
 .menu-tools { display: flex; gap: 4px; flex: none; justify-content: flex-end; }
 .icon-btn {
   width: 28px; height: 28px; padding: 0;
