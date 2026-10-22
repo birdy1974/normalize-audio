@@ -4,7 +4,7 @@ Self-hosted web app that brings the loudness of audio files (MP3, FLAC, M4A, WAV
 track of AVI, MKV and MP4 files) in a chosen folder tree to one common level, without changing the audio quality.
 Designed for Docker on a Synology DS918+.
 
-**Status: version 0.1.0, implemented.** Checked in a Linux sandbox: 47 automated tests (decision rules, pipeline with
+**Status: version 0.1.0, implemented.** Checked in a Linux sandbox: 48 automated tests (decision rules, pipeline with
 real ffmpeg, REST API), a live run on a demo library, and the web UI in headless Chromium.
 **Not yet verified:** the Docker image build, the `aacgain` package in Debian, the mp3gain/aacgain command-line
 options on a real file, a run on the NAS, and the Home Assistant integration. See "Verification status" below.
@@ -34,6 +34,8 @@ options on a real file, a run on the NAS, and the Home Assistant integration. Se
   (or pauses at once, selectable).
 - Home Assistant: a token-protected REST endpoint (`/api/v1/ha/status`) for RESTful sensors, with the YAML and the
   Lovelace card configuration generated in the UI.
+- An activity indicator in the menu shows on every page what the app is doing right now: scanning the folders,
+  checking the level of a file, saving, a running normalization (with the current file) or idle.
 
 ## Install on the NAS (Container Manager or docker compose)
 
@@ -69,9 +71,10 @@ Environment variables: `AUDIO_ROOT`, `VIDEO_ROOT`, `CONFIG_DIR`, `FFMPEG_BIN`, `
 |---|---|
 | Decision rules (gain, park, skip, lossy) | Automated tests pass (13) |
 | Pipeline with real ffmpeg: volume, re-encode, backup, output, dry run, silent, park/approve, restart, window, folders | Automated tests pass (15) |
-| REST API: HA auth and token masking, HA sensor names, folders and tree (including rescan), settings validation, parked actions | Automated tests pass (18) |
+| REST API: HA auth and token masking, HA sensor names, folders and tree (including rescan and the scan state), settings validation, parked actions | Automated tests pass (19) |
 | Web UI against the live API (headless Chromium) | Checked: pages load, no script errors, folder toggle, parked adjust and sort, settings save |
 | Directories rescan | REST endpoint tested; UI checked in jsdom (tab open starts a scan, Rescan button and result message, tree updates) |
+| Activity indicator and folder tree layout | UI checked in jsdom (scan, level check with counter, run and idle states; one line per folder) |
 | Docker image build | **Not verified** (no Docker in the sandbox) |
 | `aacgain` in Debian bookworm | **Not verified**. Build falls back to no AAC gain if the package is missing |
 | mp3gain and aacgain command-line options (`-q`, `-p`, `-g`) | **Not verified** on real files (tools not installed in the sandbox) |

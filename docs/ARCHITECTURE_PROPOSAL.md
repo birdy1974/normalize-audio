@@ -81,6 +81,7 @@ audio-normalizer/
 | State | **SQLite** in `/config` | Survives restarts; stores per-file fingerprint (path, size, mtime, hash), status, gain, history. |
 | Scheduler | Own weekly-window logic (not cron) | Simple "days + hours" grid in the UI; no external daemon. |
 | Frontend | Vanilla JS (as in the mock-up) | No build step, small image, easy to maintain on a NAS. |
+| Busy state | Client actions + `/api/dashboard.scanning` | The menu shows what the app is doing (scan, level check, save, run) on every page. |
 | HA integration | REST endpoint `/api/v1/ha/status` (bearer token) | Works with HA's built-in RESTful sensors without custom code. |
 
 ### 2.2 Processing pipeline (per file)

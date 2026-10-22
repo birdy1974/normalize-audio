@@ -140,6 +140,7 @@ def dashboard(engine=Engine):
         "last_finished": run["lastFinished"],
         "progress_percent": int(round(100 * checked / total)) if total else 0,
         "current_file": engine.current_file(),
+        "scanning": engine.scanning(),
         "dry_run": settings["general"]["dryRun"],
         "media": media,
         "log": db.log_list(60),

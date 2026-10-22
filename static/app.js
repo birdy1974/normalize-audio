@@ -17,6 +17,8 @@
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const ALL = ['audio', 'video'];
   const PARK_RANGE = 12;                                  // dB, both ways (the server clamps the same way)
+  let busySeq = 0;                                        // ids for state.busy
+  const folderTail = (path) => String(path || '').split('/').filter(Boolean).slice(-2).join('/');
 
   const MEDIA = {
     audio: { label: 'Audio', root: '/data/audio', host: '/volume1/music' },
@@ -75,6 +77,85 @@
     toast.timer = setTimeout(() => t.classList.remove('show'), 2800);
   }
 
+  /* ------------------------------------------------------------- activity
+     What the app is doing right now, shown on every page: work started from this
+     browser (a level check, a rescan, a save) and work the server reports (a
+     running normalization, the periodic scan). */
+  function startBusy(text) {
+    const id = 'b' + (++busySeq);
+    state.busy[id] = { text, secs: null };
+    showActivity();
+    return id;
+  }
+
+  /* a live counter for actions that take a while, e.g. "Checking the level of x · 12 s" */
+  function tickBusy(id) {
+    const started = Date.now();
+    const update = () => {
+      const b = state.busy[id];
+      if (!b) return false;
+      b.secs = Math.max(0, Math.round((Date.now() - started) / 1000));
+      showActivity();
+      return true;
+    };
+    update();
+    const timer = setInterval(update, 1000);
+    return { stop: () => clearInterval(timer) };
+  }
+
+  function endBusy(id) {
+    if (state.busy[id] === undefined) return;
+    delete state.busy[id];
+    showActivity();
+  }
+
+  function serverWork() {
+    const d = state.dash;
+    if (!d) return [];
+    const out = [];
+    if (d.status === 'running') {
+      out.push({ text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
+    } else if (d.status === 'paused') {
+      out.push({ text: 'Paused', sub: 'the run is paused' });
+    } else if (d.status === 'waiting_window') {
+      out.push({ text: 'Waiting for schedule', sub: 'the run continues in the next window' });
+    } else if (d.scanning) {
+      out.push({ text: 'Scanning folders', sub: 'looking for new, changed and removed files' });
+    }
+    return out;
+  }
+
+  function activity() {
+    const ids = Object.keys(state.busy);
+    const server = serverWork();
+    if (ids.length) {
+      const first = state.busy[ids[0]];
+      const more = ids.length > 1 ? '+' + (ids.length - 1) + ' more in this browser' : '';
+      return {
+        busy: true,
+        title: first.text,
+        sub: [first.secs === null ? '' : first.secs + ' s', more].filter(Boolean).join(' · '),
+      };
+    }
+    if (server.length) return { busy: server[0].text !== 'Paused', title: server[0].text, sub: server[0].sub };
+    if (!state.dash) return { busy: true, title: 'Loading', sub: 'reading the status' };
+    return { busy: false, title: 'Idle', sub: 'nothing to do right now' };
+  }
+
+  function showActivity() {
+    const box = document.getElementById('activity');
+    if (!box) return;
+    const now = activity();
+    const main = document.getElementById('activity-main');
+    const sub = document.getElementById('activity-sub');
+    /* a running timer updates the label without re-rendering the page */
+    if (main.textContent !== now.title) main.textContent = now.title;
+    if (sub.textContent !== now.sub) sub.textContent = now.sub;
+    box.classList.toggle('is-busy', now.busy);
+    box.setAttribute('aria-busy', String(now.busy));
+    box.title = now.title + (now.sub ? ' · ' + now.sub : '');
+  }
+
   /* ------------------------------------------------------------------ API */
   async function api(path, options) {
     const opts = options || {};
@@ -111,6 +192,7 @@
     selected: { audio: null, video: null },// selected folder (relpath) per media type
     browse: { media: null, rel: null, rows: null, loading: false },
     scanning: { audio: false, video: false },  // a rescan of the base location is running
+    busy: {},                       // what this browser is doing now: id -> { text, secs }
     parked: { audio: null, video: null },  // GET /api/parked
     parkSel: [],                    // selected parked file ids
     parkSort: 'order',
@@ -205,6 +287,7 @@
       if (currentRoute() === 'dashboard') render();
       else updateNavBadge();
     }
+    showActivity();                 // the run state lives in the dashboard data
   }
 
   async function loadBrowse(rel) {
@@ -241,6 +324,7 @@
   function scanDirectories(t, notify) {
     if (scans[t]) return scans[t];
     state.scanning[t] = true;
+    const busy = startBusy('Scanning ' + MEDIA[t].label.toLowerCase() + ' folders');
     scans[t] = api('/scan', { method: 'POST', body: { media: t } })
       .then((r) => {
         const res = (r && r[t]) || null;
@@ -254,6 +338,7 @@
       .finally(() => {
         state.scanning[t] = false;
         scans[t] = null;
+        endBusy(busy);
         invalidate('dir:' + t);
         if (state.browse.media === t) state.browse = { media: null, rel: null, rows: null, loading: false };
         const done = () => { if (currentRoute() === 'directories') render(); };
@@ -425,7 +510,8 @@
         + '<a class="btn btn-sm" href="#/settings" data-action="baseline-done">Back to Settings</a></div>';
     }
     if (m && m.state === 'measuring') {
-      html += '<div class="measure"><span>Measuring <strong>' + esc(m.name) + '</strong> … (integrated loudness, EBU R128, file not changed)</span></div>';
+      html += '<div class="measure is-busy"><span class="working" aria-hidden="true"></span>'
+        + '<span>Measuring <strong>' + esc(m.name) + '</strong> … (integrated loudness, EBU R128, file not changed)</span></div>';
     } else if (m) {
       const v = baselineValue(m.lufs);
       html += '<div class="measure">'
@@ -450,7 +536,8 @@
         + '<button class="caret' + (hasKids ? '' : ' leaf') + '" data-action="tree-toggle" data-rel="' + esc(n.rel) + '" aria-label="Expand or collapse ' + esc(n.name) + '">'
         + (n.open ? '▾' : '▸') + '</button>'
         + '<input type="checkbox" data-check="' + esc(n.rel) + '" aria-label="Include ' + esc(n.name) + '"' + (st === 'on' ? ' checked' : '') + '>'
-        + '<button class="folder' + (active ? ' active' : '') + '" data-action="tree-browse" data-rel="' + esc(n.rel) + '">' + esc(n.name) + '</button>'
+        + '<button class="folder' + (active ? ' active' : '') + '" data-action="tree-browse" data-rel="' + esc(n.rel) + '" title="' + esc(n.rel) + '">'
+        + '<span class="folder-name">' + esc(n.name) + '</span></button>'
         + '<span class="count">' + fmt(n.files) + ' files</span>'
         + '</div>'
         + (hasKids && n.open ? '<ul>' + renderTree(n.children) + '</ul>' : '')
@@ -472,12 +559,17 @@
     }
     const rows = b.rows.map((f, i) => {
       const ext = String(f.name).split('.').pop();
-      return '<tr><td>' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
+      const checking = !!(state.measure && state.measure.relpath === f.relpath && state.measure.state === 'measuring');
+      const button = checking
+        ? '<span class="row-busy"><span class="working" aria-hidden="true"></span>Checking…</span>'
+        : '<button class="btn btn-sm" data-action="check-level" data-idx="' + i + '">Check level</button>';
+      return '<tr' + (checking ? ' class="is-busy-row"' : '') + '>'
+        + '<td>' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
         + '<td class="num">' + fmtLufs(f.lufs) + '</td>'
         + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
         + '<td>' + statusLabel(f.status) + '</td>'
-        + '<td class="actions-cell"><button class="btn btn-sm" data-action="check-level" data-idx="' + i + '">Check level</button></td></tr>';
+        + '<td class="actions-cell">' + button + '</td></tr>';
     }).join('');
     return head
       + '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level'
@@ -892,6 +984,7 @@
       else a.removeAttribute('aria-current');
     });
     updateNavBadge();
+    showActivity();
     const keys = keysFor(route);
     const failed = keys.map((k) => state.errors[k]).find(Boolean);
     if (failed) {
@@ -945,9 +1038,14 @@
       scanDirectories(t, true);       // the button shows Scanning… until the fresh tree is read
       render();
     } else if (a === 'select-all' || a === 'select-none') {
-      await api('/folders/all', { method: 'POST', body: { media: t, enabled: a === 'select-all' } });
-      invalidate('dir:' + t);
-      await refreshDash();
+      const busy = startBusy(a === 'select-all' ? 'Including all folders' : 'Excluding all folders');
+      try {
+        await api('/folders/all', { method: 'POST', body: { media: t, enabled: a === 'select-all' } });
+        invalidate('dir:' + t);
+        await refreshDash();
+      } finally {
+        endBusy(busy);
+      }
       render();
     } else if (a === 'expand-all' || a === 'collapse-all') {
       walk(tree(t).roots, (n) => { n.open = a === 'expand-all'; });
@@ -994,6 +1092,8 @@
       const f = state.browse.rows[Number(el.dataset.idx)];
       if (!f) return;
       state.measure = { media: t, relpath: f.relpath, name: f.name, state: 'measuring' };
+      const busy = startBusy('Checking the level of ' + f.name);
+      const elapsed = tickBusy(busy);
       render();
       try {
         const r = await api('/files/measure', { method: 'POST', body: { media: t, relpath: f.relpath } });
@@ -1001,6 +1101,9 @@
       } catch (err) {
         state.measure = null;
         toast(err.message);
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
       }
       const node = tree(t) && tree(t).map.get(state.selected[t]);
       if (node) await loadBrowse(node.rel);
@@ -1024,10 +1127,16 @@
       state.baselineFrom = null;
     } else if (a === 'settings-save') {
       const d = state.draft;
-      state.settings = await api('/settings', { method: 'PUT', body: { general: { dryRun: d.general.dryRun }, audio: d.audio, video: d.video } });
-      state.draft = clone(state.settings);
-      toast('Settings saved');
-      await refreshDash();
+      const busy = startBusy('Saving the settings');
+      render();
+      try {
+        state.settings = await api('/settings', { method: 'PUT', body: { general: { dryRun: d.general.dryRun }, audio: d.audio, video: d.video } });
+        state.draft = clone(state.settings);
+        toast('Settings saved');
+        await refreshDash();
+      } finally {
+        endBusy(busy);
+      }
       render();
     } else if (a === 'settings-reset') {
       state.draft[t] = clone(DEFAULTS[t]);
@@ -1035,19 +1144,33 @@
     } else if (a === 'ha-save') {
       const body = { url: state.haDraft.url };
       if (state.haDraft.token.trim()) body.token = state.haDraft.token.trim();
-      state.ha = await api('/ha', { method: 'PUT', body: body });
-      state.haDraft = { url: state.ha.url, token: '' };
-      state.haTest = '';
-      toast('Home Assistant settings saved');
+      const busy = startBusy('Saving the Home Assistant settings');
       render();
-    } else if (a === 'ha-test') {
-      if (state.haDraft.token.trim()) {
-        const body = { url: state.haDraft.url, token: state.haDraft.token.trim() };
+      try {
         state.ha = await api('/ha', { method: 'PUT', body: body });
         state.haDraft = { url: state.ha.url, token: '' };
+        state.haTest = '';
+        toast('Home Assistant settings saved');
+      } finally {
+        endBusy(busy);
       }
-      const r = await api('/ha/test', { method: 'POST' });
-      state.haTest = r.message;
+      render();
+    } else if (a === 'ha-test') {
+      const busy = startBusy('Testing the Home Assistant connection');
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        if (state.haDraft.token.trim()) {
+          const body = { url: state.haDraft.url, token: state.haDraft.token.trim() };
+          state.ha = await api('/ha', { method: 'PUT', body: body });
+          state.haDraft = { url: state.ha.url, token: '' };
+        }
+        const r = await api('/ha/test', { method: 'POST' });
+        state.haTest = r.message;
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
       render();
     } else if (a === 'sensor-reset') {
       const sensor = state.ha.sensors.find((x) => x.path === el.dataset.path);
@@ -1057,8 +1180,14 @@
       }
     } else if (a === 'ha-rotate') {
       if (!window.confirm('The current endpoint token stops working at once. Continue?')) return;
-      state.ha = await api('/ha/rotate-token', { method: 'POST' });
-      state.haTest = 'New endpoint token created. Paste the new configuration into Home Assistant.';
+      const busy = startBusy('Creating a new endpoint token');
+      render();
+      try {
+        state.ha = await api('/ha/rotate-token', { method: 'POST' });
+        state.haTest = 'New endpoint token created. Paste the new configuration into Home Assistant.';
+      } finally {
+        endBusy(busy);
+      }
       render();
     }
   }
@@ -1079,9 +1208,14 @@
     if (el.dataset.check !== undefined) {
       if (!committed) return;
       const t = state.media;
-      await api('/folders/toggle', { method: 'POST', body: { media: t, relpath: el.dataset.check, enabled: el.checked } });
-      invalidate('dir:' + t);
-      await refreshDash();
+      const busy = startBusy('Updating the folders');
+      try {
+        await api('/folders/toggle', { method: 'POST', body: { media: t, relpath: el.dataset.check, enabled: el.checked } });
+        invalidate('dir:' + t);
+        await refreshDash();
+      } finally {
+        endBusy(busy);
+      }
       render();
       return;
     }

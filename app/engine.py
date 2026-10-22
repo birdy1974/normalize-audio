@@ -34,6 +34,8 @@ class Engine:
         self.scanner = Scanner(cfg, db)
         self.tools = {name for name in GAIN_TOOLS if tool_path(getattr(cfg, name))}
         self._lock = threading.Lock()
+        self._scan_lock = threading.Lock()
+        self._scanning = 0                     # scans running (the periodic one and manual ones)
         self._inflight: dict[int, dict] = {}    # file id -> {future, relpath, media, approved}
         self._cancel: set[int] = set()
         self._had_work = False
@@ -59,6 +61,11 @@ class Engine:
     def inflight_count(self) -> int:
         with self._lock:
             return len(self._inflight)
+
+    def scanning(self) -> bool:
+        """True while the disk is being walked for new, changed and removed files."""
+        with self._scan_lock:
+            return self._scanning > 0
 
     def current_file(self) -> str | None:
         with self._lock:
@@ -137,7 +144,7 @@ class Engine:
     def _scan_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self.scanner.scan_all()
+                self.scan_now()
             except Exception as exc:
                 log.exception("scan failed")
                 self.db.log("error", f"Scan failed: {exc}")
@@ -145,9 +152,15 @@ class Engine:
             self._stop.wait(minutes * 60)
 
     def scan_now(self, media: str | None = None) -> dict:
-        if media:
-            return {media: self.scanner.scan(media)}
-        return self.scanner.scan_all()
+        with self._scan_lock:
+            self._scanning += 1
+        try:
+            if media:
+                return {media: self.scanner.scan(media)}
+            return self.scanner.scan_all()
+        finally:
+            with self._scan_lock:
+                self._scanning -= 1
 
     # ------------------------------------------------------------ scheduler
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -122,6 +124,33 @@ def test_rescan_makes_new_folders_and_files_visible(client, cfg):
     assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
     names = {d["relpath"] for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
     assert "Old/Deep" not in names
+
+
+def test_dashboard_reports_that_a_scan_is_running(client, cfg):
+    """The web UI shows the periodic scan in its activity indicator."""
+    _scan_library(cfg, client)
+    assert client.get("/api/dashboard").json()["scanning"] is False
+
+    engine = client.app_state.engine
+    original = engine.scanner.scan
+    started, release = threading.Event(), threading.Event()
+
+    def slow_scan(media):
+        started.set()
+        release.wait(5)
+        return original(media)
+
+    engine.scanner.scan = slow_scan
+    worker = threading.Thread(target=lambda: engine.scan_now("audio"))
+    worker.start()
+    try:
+        assert started.wait(5)
+        assert client.get("/api/dashboard").json()["scanning"] is True
+    finally:
+        release.set()
+        worker.join(5)
+        engine.scanner.scan = original
+    assert client.get("/api/dashboard").json()["scanning"] is False
 
 
 # ------------------------------------------------------------ settings
