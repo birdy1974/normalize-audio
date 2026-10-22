@@ -9,7 +9,8 @@ from . import schedule, stats, state
 from .media import MEDIA
 
 MAIN_NAME = "Audio Normalizer"
-MAIN_ATTRS = ["progress_percent", "errors", "current_file", "last_run_finished", "audio", "video"]
+MAIN_ATTRS = ["mode", "progress_percent", "errors", "current_file", "last_run_finished",
+              "scan_every", "last_scan", "next_scan", "audio", "video"]
 ENTITY = "sensor.audio_normalizer"
 
 
@@ -42,6 +43,8 @@ def payload(engine) -> dict:
         errors += s["files_errors"]
     return {
         "status": engine.status(),
+        # off / bulk / auto, and how the automatic side is doing
+        **engine.scan_status(),
         "progress_percent": int(round(100 * checked / total)) if total else 0,
         "errors": errors,
         "current_file": engine.current_file(),

@@ -188,10 +188,12 @@ pre {
 
 /* ---------- run status ---------- */
 .run-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.mode-line { margin: 6px 0 0; }
 .run-state { display: flex; align-items: center; gap: 10px; font-size: 15px; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
 .dot-running { background: var(--accent); }
 .dot-paused { background: transparent; border: 1.5px solid var(--warn); box-sizing: border-box; }
+.dot-watching { background: transparent; border: 1.5px solid var(--accent); box-sizing: border-box; }
 .progress { height: 6px; background: var(--track); border-radius: 999px; margin: 18px 0 10px; overflow: hidden; }
 .progress > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width .5s linear; }
 .run-meta { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }

@@ -12,7 +12,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from . import ffmpeg as ff
@@ -48,6 +48,7 @@ class Engine:
         self._inflight: dict[int, dict] = {}    # file id -> {future, relpath, media, approved}
         self._cancel: set[int] = set()
         self._had_work = False
+        self._mode_seen: str | None = None     # the app mode (off / bulk / auto) last applied
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._pool = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="normalizer")
@@ -55,6 +56,7 @@ class Engine:
         db.execute("UPDATE files SET status = 'pending' WHERE status = 'processing'")
         self._remove_stale_temp_files()
         state.get_ha(db)                         # creates the endpoint token on first start
+        self.apply_mode()                        # off stops a run left over from before the restart; auto starts one
 
     # ------------------------------------------------------------ helpers
 
@@ -66,6 +68,63 @@ class Engine:
 
     def window_open(self, media: str, when: datetime | None = None) -> bool:
         return schedule.in_window(state.get_schedule(self.db)[media], when or self.now())
+
+    def mode(self) -> str:
+        """What the app does on its own: 'off', 'bulk' (only a started run works) or 'auto'."""
+        return state.get_settings(self.db)["general"]["mode"]
+
+    def scan_interval(self) -> int:
+        """Minutes between two looks for new, changed and removed files (Settings > Scheduling)."""
+        return state.get_schedule(self.db)["scanEvery"]
+
+    def last_scan(self) -> str | None:
+        return state.get_run(self.db).get("lastScan")
+
+    def next_scan(self) -> str | None:
+        """When the folders are looked at next; None when the app is off."""
+        if self.mode() == "off":
+            return None
+        last = self.last_scan()
+        if not last:
+            return self.now().replace(microsecond=0).isoformat(timespec="seconds")
+        try:
+            when = datetime.fromisoformat(last) + timedelta(minutes=self.scan_interval())
+        except ValueError:
+            return self.now().replace(microsecond=0).isoformat(timespec="seconds")
+        return when.isoformat(timespec="seconds")
+
+    def scan_status(self) -> dict:
+        """The automatic side of the app, for the dashboard and Home Assistant."""
+        return {"mode": self.mode(), "scan_every": self.scan_interval(),
+                "last_scan": self.last_scan(), "next_scan": self.next_scan()}
+
+    def apply_mode(self) -> str:
+        """Bring the run in line with the mode setting. Called on start and on every tick."""
+        mode = self.mode()
+        previous, self._mode_seen = self._mode_seen, mode
+        if previous == mode:
+            return mode
+        run = state.get_run(self.db)
+        if mode == "off":
+            if run["mode"] != "stopped" or run["paused"]:
+                state.set_run(self.db, mode="stopped", paused=False)
+            with self._lock:                 # stop the work that only the automatic run would do
+                for fid, item in self._inflight.items():
+                    if not item["approved"]:
+                        self._cancel.add(fid)
+            if previous is not None:
+                self.db.log("info", "Mode off: scanning and normalizing are stopped")
+        elif mode == "bulk":
+            if previous == "auto" and run["mode"] == "active":
+                state.set_run(self.db, mode="stopped", paused=False)
+                self.db.log("info", "Bulk mode: the automatic run is stopped, press Start to normalize the files that are here")
+        else:                                # auto
+            # switching to automatic starts at once; a restart keeps a pause the user left in place
+            state.set_run(self.db, mode="active", **({"paused": False} if previous is not None else {}))
+            self.db.log("info", f"Automatic mode is on: new files are checked and normalized every "
+                                f"{self.scan_interval()} minutes")
+        self._had_work = False
+        return mode
 
     def inflight_count(self) -> int:
         with self._lock:
@@ -82,9 +141,12 @@ class Engine:
             return items[0]["relpath"] if items else None
 
     def status(self) -> str:
+        mode = self.mode()
+        if mode == "off":
+            return "off"
         run = state.get_run(self.db)
-        if run["mode"] != "active":
-            return "stopped"
+        if run["mode"] != "active" and mode != "auto":
+            return "stopped"            # auto keeps the run active by itself, also before the first tick
         if run["paused"]:
             return "paused"
         types = [m for m in MEDIA if run["types"].get(m)]
@@ -100,10 +162,17 @@ class Engine:
     # ------------------------------------------------------------ run control
 
     def start(self) -> None:
+        if self.mode() == "off":
+            raise ValueError("The app is off: choose Bulk or Automatic mode in Settings first")
+        # a run that starts with nothing to do finishes at once (and in bulk mode stops itself)
+        self._had_work = True
         state.set_run(self.db, mode="active", paused=False)
-        self.db.log("info", "Run started")
+        self.db.log("info", "Bulk run started" if self.mode() == "bulk" else "Run started")
 
     def stop(self) -> None:
+        if self.mode() == "auto":
+            raise ValueError("Automatic mode keeps watching for new files; pause the run to hold it, "
+                             "or choose Off or Bulk in Settings")
         state.set_run(self.db, mode="stopped", paused=False)
         with self._lock:
             for fid, item in self._inflight.items():
@@ -117,7 +186,8 @@ class Engine:
             return
         paused = not run["paused"]
         state.set_run(self.db, paused=paused)
-        self.db.log("info", "Run paused" if paused else "Run resumed")
+        what = "Automatic mode" if self.mode() == "auto" else "Run"
+        self.db.log("info", f"{what} paused" if paused else f"{what} resumed")
 
     def set_types(self, changes: dict) -> None:
         run = state.get_run(self.db)
@@ -150,15 +220,35 @@ class Engine:
                 log.exception("scheduler tick failed")
             self._stop.wait(1.0)
 
+    def _scan_due(self) -> datetime | None:
+        """When the next periodic scan is due; None right after a restart."""
+        last = self.last_scan()
+        if not last:
+            return None
+        try:
+            return datetime.fromisoformat(last) + timedelta(minutes=self.scan_interval())
+        except ValueError:
+            return None
+
     def _scan_loop(self) -> None:
+        """Look for new, changed and removed files every `scanEvery` minutes, unless the app is off.
+
+        The loop wakes up every two seconds, so turning the app off, changing the interval in the
+        settings or starting automatic mode takes effect at once instead of after the old wait.
+        """
         while not self._stop.is_set():
-            try:
-                self.scan_now()
-            except Exception as exc:
-                log.exception("scan failed")
-                self.db.log("error", f"Scan failed: {exc}")
-            minutes = state.get_schedule(self.db)["scanEvery"]
-            self._stop.wait(minutes * 60)
+            if self.mode() == "off":
+                self._stop.wait(2.0)
+                continue
+            due = self._scan_due()
+            if due is None or self.now() >= due:
+                try:
+                    self.scan_now()
+                except Exception as exc:  # keep the loop alive; the next scan comes at the next interval
+                    log.exception("scan failed")
+                    self.db.log("error", f"Scan failed: {exc}")
+                continue
+            self._stop.wait(min(2.0, max(0.05, (due - self.now()).total_seconds())))
 
     def scan_now(self, media: str | None = None) -> dict:
         with self._scan_lock:
@@ -170,10 +260,15 @@ class Engine:
         finally:
             with self._scan_lock:
                 self._scanning -= 1
+            # a manual Rescan counts as a scan: the next automatic one starts a full interval later
+            state.set_run(self.db, lastScan=self.now().replace(microsecond=0).isoformat(timespec="seconds"))
 
     # ------------------------------------------------------------ scheduler
 
     def tick(self) -> None:
+        mode = self.apply_mode()
+        if mode == "off":
+            return
         run = state.get_run(self.db)
         sched = state.get_schedule(self.db)
         now = self.now()
@@ -217,7 +312,12 @@ class Engine:
             if left == 0:
                 self._had_work = False
                 state.set_run(self.db, lastFinished=now.isoformat(timespec="seconds"))
-                self.db.log("info", "Run finished: nothing left to check in the enabled folders")
+                if mode == "bulk":
+                    # a bulk run works through what is there now; files found later wait for the next Start
+                    state.set_run(self.db, mode="stopped")
+                    self.db.log("info", "Bulk run finished: nothing left to check; new files wait for the next Start")
+                else:
+                    self.db.log("info", "Run finished: nothing left to check; automatic mode keeps watching")
 
     def _submit(self, fid: int, approved: bool) -> None:
         row = self.db.one("SELECT relpath, media FROM files WHERE id = ?", (fid,))

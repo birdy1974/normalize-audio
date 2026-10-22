@@ -32,9 +32,11 @@
     volume: 'lossless gain', mp3gain: 'gain only (mp3gain)', aacgain: 'gain only (aacgain)',
     reencode: 're-encode, same bitrate',
   };
-  const RUN_LABEL = {
-    running: 'Running', paused: 'Paused', stopped: 'Stopped', idle: 'Idle, nothing to check',
-    waiting_window: 'Waiting for the schedule window',
+  const MODE_LABEL = { off: 'Off', bulk: 'Bulk', auto: 'Automatic' };
+  const MODE_SHORT = {
+    off: 'nothing is scanned or normalized',
+    bulk: 'a run normalizes the files that are here',
+    auto: 'new files are normalized by themselves',
   };
   const PARK_SORTS = {
     order: 'File order',
@@ -43,7 +45,7 @@
     size_desc: 'Size of change, largest first',
   };
   const DEFAULTS = {
-    general: { dryRun: false, preserveMtime: true },
+    general: { dryRun: false, preserveMtime: true, mode: 'bulk' },
     audio: { target: -16, truePeak: -1, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
     video: { target: -16, truePeak: -1, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
   };
@@ -113,14 +115,19 @@
     const d = state.dash;
     if (!d) return [];
     const out = [];
+    const auto = d.mode === 'auto';
     if (d.status === 'running') {
-      out.push({ text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
+      out.push({ busy: true, text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
     } else if (d.status === 'paused') {
-      out.push({ text: 'Paused', sub: 'the run is paused' });
+      out.push({ busy: false, text: 'Paused', sub: auto ? 'automatic mode is paused' : 'the run is paused' });
     } else if (d.status === 'waiting_window') {
-      out.push({ text: 'Waiting for schedule', sub: 'the run continues in the next window' });
+      out.push({ busy: true, text: 'Waiting for schedule', sub: 'the run continues in the next window' });
     } else if (d.scanning) {
-      out.push({ text: 'Scanning folders', sub: 'looking for new, changed and removed files' });
+      out.push({ busy: true, text: 'Scanning folders', sub: 'looking for new, changed and removed files' });
+    } else if (d.status === 'off') {
+      out.push({ busy: false, text: 'Off', sub: 'not scanning and not normalizing' });
+    } else if (d.status === 'idle' && auto) {
+      out.push({ busy: false, text: 'Watching', sub: 'new files are normalized automatically' });
     }
     return out;
   }
@@ -137,7 +144,7 @@
         sub: [first.secs === null ? '' : first.secs + ' s', more].filter(Boolean).join(' · '),
       };
     }
-    if (server.length) return { busy: server[0].text !== 'Paused', title: server[0].text, sub: server[0].sub };
+    if (server.length) return { busy: server[0].busy, title: server[0].text, sub: server[0].sub };
     if (!state.dash) return { busy: true, title: 'Loading', sub: 'reading the status' };
     return { busy: false, title: 'Idle', sub: 'nothing to do right now' };
   }
@@ -1196,6 +1203,24 @@
     return DAYS[(x.getDay() + 6) % 7] + ' ' + pad2(x.getHours()) + ':00';
   }
 
+  function dayAndClock(iso) {
+    if (!iso) return 'never';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return 'never';
+    const today = new Date();
+    const sameDay = d.toDateString() === today.toDateString();
+    return (sameDay ? '' : DAYS[(d.getDay() + 6) % 7] + ' ') + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  /* last scan: "14:02" today, "Tue 22:15" otherwise */
+  function scanLine(d) {
+    if (d.mode === 'off') return 'Not scanning while the app is off.';
+    const every = d.scan_every ? 'every ' + d.scan_every + ' min' : 'periodically';
+    return 'Looking for new files ' + every
+      + ' · last ' + (d.last_scan ? dayAndClock(d.last_scan) : 'not yet')
+      + ' · next ' + (d.next_scan ? dayAndClock(d.next_scan) : '—');
+  }
+
   function scheduleText(t) {
     const m = dashMedia(t);
     if (!m) return '';
@@ -1262,12 +1287,69 @@
       + '</section>';
   }
 
+  function runCard(d, checked, total, pct, noTypes, outside) {
+    const mode = MODE_LABEL[d.mode] ? d.mode : 'bulk';
+    const isOff = mode === 'off';
+    const isAuto = mode === 'auto';
+    const status = d.status;
+    const dotClass = status === 'running' ? 'dot-running' : status === 'paused' ? 'dot-paused'
+      : (isAuto && status === 'idle') ? 'dot-watching' : '';
+    const stateText = isOff ? 'the app is not doing anything'
+      : status === 'running' ? (isAuto ? 'normalizing a new file' : 'normalizing')
+        : status === 'paused' ? 'paused by you'
+          : status === 'waiting_window' ? 'waiting for the schedule window'
+            : status === 'idle' ? (isAuto ? 'watching for new files' : 'idle')
+              : (isAuto ? 'starting' : 'not started');
+    const startOn = !isOff && !isAuto && status === 'stopped' && !noTypes;
+    const pauseOn = !isOff && status !== 'stopped';
+    let buttons = '';
+    if (isOff) {
+      buttons = '<a class="btn" href="#/settings">Change the mode in Settings</a>';
+    } else if (isAuto) {
+      buttons = '<button class="btn' + (status === 'paused' ? ' btn-primary' : '') + '" data-action="run" data-path="pause">'
+        + (status === 'paused' ? 'Resume' : 'Pause') + '</button>';
+    } else {
+      buttons = '<button class="btn btn-primary" data-action="run" data-path="start"' + (startOn ? '' : ' disabled') + '>Start</button>'
+        + '<button class="btn" data-action="run" data-path="pause"' + (pauseOn ? '' : ' disabled') + '>'
+        + (status === 'paused' ? 'Resume' : 'Pause') + '</button>'
+        + '<button class="btn" data-action="run" data-path="stop"' + (pauseOn ? '' : ' disabled') + '>Stop</button>';
+    }
+    buttons += '<a class="btn" href="#/directories">Browse folders</a>';
+    const explanation = isOff
+      ? 'The app is off: folders are not scanned and no file is normalized. Rescan and Check level still work when you use them.'
+      : isAuto
+        ? 'Automatic: new and changed files are found and normalized by themselves, within the schedule and the folders that are included here.'
+        : 'Bulk: press Start to check and normalize the files that are in the library now. Files that appear later wait for the next Start.';
+    const typesLocked = !isOff && mode === 'bulk' && status !== 'stopped';   // no switches during a bulk run
+    return '<section class="card">'
+      + '<div class="run-top"><div class="run-state"><span class="dot ' + dotClass + '"></span>'
+      + '<strong>' + esc(MODE_LABEL[mode]) + '</strong>'
+      + '<span class="muted">· ' + esc(stateText) + '</span>'
+      + '</div><div class="btns">' + buttons + '</div></div>'
+      + '<p class="small muted mode-line">' + esc(explanation) + '</p>'
+      + '<p class="small muted mode-line">' + esc(scanLine(d)) + '</p>'
+      + '<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '"><div style="width:' + pct + '%"></div></div>'
+      + '<div class="run-meta"><span><strong style="color:var(--text)">' + pct + '%</strong> complete</span>'
+      + '<span>' + fmt(checked) + ' of ' + fmt(total) + ' files checked</span>'
+      + '<span class="mono">current: ' + (d.current_file ? esc(d.current_file) : '—') + '</span></div>'
+      + '<div class="run-types"><span class="muted">Process</span>'
+      + tip(isAuto ? 'A switched-off type is left alone by automatic mode as well.'
+        : 'Switches can be changed while the run is stopped. A switched-off type is not processed.')
+      + ALL.map((t) => '<label class="inline"><input class="switch" type="checkbox" data-run-type="' + t + '"'
+        + (d.types[t] ? ' checked' : '') + (typesLocked ? ' disabled' : '') + '> ' + MEDIA[t].label + '</label>').join('')
+      + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '')
+      + '</div>'
+      + (d.dry_run ? '<div class="notice info">Dry run is on: files are checked, nothing is written.</div>' : '')
+      + (outside.length ? '<div class="notice">Running outside the schedule of ' + outside.map((t) => MEDIA[t].label).join(' and ')
+        + ' (started manually). Stop the run to return to the schedule.</div>' : '')
+      + '</section>';
+  }
+
   function renderDashboard() {
     const d = state.dash;
     const s = state.settings;
     const status = d.status;
-    const label = RUN_LABEL[status] || status;
-    const dotClass = status === 'running' ? 'dot-running' : status === 'paused' ? 'dot-paused' : '';
+    const mode = MODE_LABEL[d.mode] ? d.mode : 'bulk';
     const types = enabledTypes();
     const noTypes = types.length === 0;
     const total = types.reduce((a, t) => a + dashMedia(t).files_total, 0);
@@ -1291,32 +1373,15 @@
     const pct = d.progress_percent;
 
     app().innerHTML = pageHead('Dashboard', 'Audio and video are tracked separately: each has its own folders, schedule, settings and counters.', '')
-      + '<section class="card">'
-      + '<div class="run-top"><div class="run-state"><span class="dot ' + dotClass + '"></span>'
-      + '<strong>' + esc(label) + '</strong>'
-      + (status === 'stopped' && total && checked === total ? '<span class="muted">· all files checked</span>' : '')
-      + '</div><div class="btns">'
-      + '<button class="btn btn-primary" data-action="run" data-path="start"' + (status !== 'stopped' || noTypes ? ' disabled' : '') + '>Start</button>'
-      + '<button class="btn" data-action="run" data-path="pause"' + (status === 'stopped' ? ' disabled' : '') + '>' + (status === 'paused' ? 'Resume' : 'Pause') + '</button>'
-      + '<button class="btn" data-action="run" data-path="stop"' + (status === 'stopped' ? ' disabled' : '') + '>Stop</button>'
-      + '<a class="btn" href="#/directories">Browse folders</a>'
-      + '</div></div>'
-      + '<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '"><div style="width:' + pct + '%"></div></div>'
-      + '<div class="run-meta"><span><strong style="color:var(--text)">' + pct + '%</strong> complete</span>'
-      + '<span>' + fmt(checked) + ' of ' + fmt(total) + ' files checked</span>'
-      + '<span class="mono">current: ' + (d.current_file ? esc(d.current_file) : '—') + '</span></div>'
-      + '<div class="run-types"><span class="muted">Process</span>' + tip('Switches can be changed while the run is stopped. A switched-off type is not processed.')
-      + ALL.map((t) => '<label class="inline"><input class="switch" type="checkbox" data-run-type="' + t + '"'
-        + (d.types[t] ? ' checked' : '') + (status !== 'stopped' ? ' disabled' : '') + '> ' + MEDIA[t].label + '</label>').join('')
-      + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '')
-      + '</div>'
-      + (d.dry_run ? '<div class="notice info">Dry run is on: files are checked, nothing is written.</div>' : '')
-      + (outside.length ? '<div class="notice">Running outside the schedule of ' + outside.map((t) => MEDIA[t].label).join(' and ')
-        + ' (started manually). Stop the run to return to the schedule.</div>' : '')
-      + '</section>'
+      + runCard(d, checked, total, pct, noTypes, outside)
       + '<div class="split-2">' + mediaPanel('audio') + mediaPanel('video') + '</div>'
       + '<div class="split-2">'
       + '<section class="card"><h2 style="margin-bottom:12px">Needs attention</h2><dl class="rows">'
+      + '<div><dt>Mode</dt><dd>' + esc(MODE_LABEL[mode]) + ' <span class="muted">· ' + esc(MODE_SHORT[mode]) + '</span>'
+      + ' · <a href="#/settings">change</a></dd></div>'
+      + '<div><dt>Look for new files</dt><dd>' + (mode === 'off' ? '<span class="muted">off</span>'
+        : 'every ' + fmt(d.scan_every) + ' min · last ' + esc(d.last_scan ? dayAndClock(d.last_scan) : 'not yet')
+          + ' · next ' + esc(d.next_scan ? dayAndClock(d.next_scan) : '—')) + '</dd></div>'
       + '<div><dt>Parked for review</dt><dd><a href="#/parked">Audio ' + dashMedia('audio').files_parked + ' · Video ' + dashMedia('video').files_parked + '</a>'
       + (parkedTotal ? '' : ' <span class="muted">(none)</span>') + '</dd></div>'
       + '<div><dt>Errors</dt><dd>' + errors + '</dd></div>'
@@ -1671,13 +1736,34 @@
       + writeOptions('video') + '</section>';
   }
 
+  function modeCard() {
+    const g = state.draft.general;
+    const every = state.sched ? state.sched.scanEvery : 15;
+    const mode = g.mode || 'bulk';
+    const options = [
+      ['auto', 'Automatic', 'New and changed files are checked and normalized by themselves. The folders are looked at every ' + every + ' minutes, within the schedule and the folders that are included.'],
+      ['bulk', 'Bulk', 'Nothing happens until you press Start on the dashboard: then the files that are in the library are checked and normalized. Files that appear later wait for the next Start.'],
+      ['off', 'Off', 'Nothing is scanned and nothing is normalized. Rescan, Check level and the audio editor still work when you use them.'],
+    ].map(([v, title, d, def]) => '<label class="opt"><input type="radio" name="app-mode" value="' + v + '"'
+      + ' data-scope="general" data-setting="mode"' + (mode === v ? ' checked' : '') + '>'
+      + '<span><strong style="font-weight:500">' + title + '</strong>'
+      + (v === 'bulk' ? '<span class="tag">default</span>' : '') + tip(d) + '</span></label>').join('');
+    return '<section class="card"><div class="card-head"><div><h2>Mode</h2>'
+      + '<div class="sub">Off, Bulk (you start it) or Automatic (new files are normalized for you)</div></div></div>'
+      + '<div class="field" style="margin:0"><span class="lbl">Mode' + tip('Switches the whole app: Off, Bulk (start a run yourself) or Automatic (new files are found and normalized for you).') + '</span>'
+      + options
+      + '<p class="small muted" style="margin-top:10px">Automatic mode uses Settings, Scheduling: new files are looked for every '
+      + every + ' minutes.</p>'
+      + '</div></section>';
+  }
+
   function scheduleOptions() {
     const sc = state.sched;
     return '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Scheduling</h2>'
       + '<div class="sub">Applies to audio and video. The time windows are set on the Schedule tab.</div></div></div>'
       + '<div class="split-2" style="margin-top:0">'
       + '<div class="field" style="margin:0"><label class="lbl" for="scan-every">Look for new or changed files every'
-      + tip('New files are found automatically, also after a restart of the app.') + '</label>'
+      + tip('Used by Automatic mode: the folders are scanned this often and new or changed files are normalized. A manual Rescan also counts, so the next scan starts a full interval later. Also runs in Bulk mode, so the list of files stays current.') + '</label>'
       + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + sc.scanEvery + '">'
       + '<span class="muted small">minutes</span></div>'
       + '</div>'
@@ -1696,6 +1782,7 @@
       'Level and output are set separately for audio and video. Changes take effect when you press Save.',
       '<button class="btn" data-action="settings-reset">Reset ' + MEDIA[t].label.toLowerCase() + '</button>'
       + '<button class="btn btn-primary" data-action="settings-save">Save</button>', true)
+      + modeCard()
       + '<section class="card"><div class="check-list">'
       + '<label class="check" style="padding-top:0"><input class="switch" type="checkbox" data-scope="general" data-setting="dryRun"' + (g.dryRun ? ' checked' : '') + '>'
       + '<span><strong>Dry run</strong>' + tip('Analyse and report only. Nothing is written. Recommended for the first run on a real library.') + '</span></label>'
@@ -2015,7 +2102,7 @@
       const busy = startBusy('Saving the settings');
       render();
       try {
-        state.settings = await api('/settings', { method: 'PUT', body: { general: { dryRun: d.general.dryRun }, audio: d.audio, video: d.video } });
+        state.settings = await api('/settings', { method: 'PUT', body: { general: d.general, audio: d.audio, video: d.video } });
         state.draft = clone(state.settings);
         toast('Settings saved');
         await refreshDash();

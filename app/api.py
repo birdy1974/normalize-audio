@@ -144,10 +144,14 @@ def dashboard(engine=Engine):
             checked += s["files_checked"]
     return {
         "status": engine.status(),
-        "mode": run["mode"],
+        "mode": settings["general"]["mode"],      # off / bulk / auto: what the app does on its own
+        "run_mode": run["mode"],                  # the run engine: active / stopped
         "paused": run["paused"],
         "types": run["types"],
         "last_finished": run["lastFinished"],
+        "scan_every": sched["scanEvery"],         # minutes between two looks for new files
+        "last_scan": run.get("lastScan"),
+        "next_scan": engine.next_scan(),          # None when the app is off
         "progress_percent": int(round(100 * checked / total)) if total else 0,
         "current_file": engine.current_file(),
         "scanning": engine.scanning(),
@@ -453,7 +457,9 @@ def get_settings(engine=Engine):
 
 @router.put("/settings")
 def put_settings(body: dict, engine=Engine):
-    return state.put_settings(engine.db, body)
+    settings = state.put_settings(engine.db, body)
+    engine.apply_mode()               # off stops the run, automatic starts it, bulk stops an automatic one
+    return settings
 
 
 @router.get("/schedule")
@@ -463,7 +469,7 @@ def get_schedule(engine=Engine):
 
 @router.put("/schedule")
 def put_schedule(body: dict, engine=Engine):
-    return state.put_schedule(engine.db, body)
+    return state.put_schedule(engine.db, body)     # the scan loop picks a new interval up within two seconds
 
 
 # ------------------------------------------------------------ Home Assistant

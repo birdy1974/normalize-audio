@@ -3,11 +3,17 @@ from __future__ import annotations
 
 import copy
 import secrets
+import threading
 
 from .db import Database
 
 DEFAULT_SETTINGS = {
-    "general": {"dryRun": False, "preserveMtime": True},
+    # mode: what the app does on its own
+    #   off   nothing is scanned or normalized (manual reads still work)
+    #   bulk  new files are found every "scanEvery" minutes, but only a run started by the user
+    #         checks and normalizes the files that are there
+    #   auto  new and changed files are found every "scanEvery" minutes and normalized by themselves
+    "general": {"dryRun": False, "preserveMtime": True, "mode": "bulk"},
     "audio": {
         "target": -16.0, "truePeak": -1.0, "threshold": 6.0, "override": False,
         "lossy": "gain", "writeMode": "inplace", "outputDir": "/data/normalized-audio",
@@ -19,14 +25,19 @@ DEFAULT_SETTINGS = {
 }
 
 RANGES = {"target": (-30.0, -10.0), "truePeak": (-6.0, -1.0), "threshold": (1.0, 12.0)}
+MODES = ("off", "bulk", "auto")
 LOSSY_MODES = ("gain", "reencode", "skip")
 WRITE_MODES = ("inplace", "backup", "output")
 ON_CLOSE = ("finish", "pause")
 
-DEFAULT_RUN = {"mode": "stopped", "paused": False, "types": {"audio": True, "video": True}, "lastFinished": None}
+DEFAULT_RUN = {"mode": "stopped", "paused": False, "types": {"audio": True, "video": True},
+               "lastFinished": None, "lastScan": None}
 
 DEFAULT_SENSORS = [
     {"path": "status", "name": "Status", "unit": "", "deviceClass": "", "icon": "mdi:waveform", "enabled": True, "group": "Overall"},
+    {"path": "mode", "name": "Mode", "unit": "", "deviceClass": "", "icon": "mdi:cog-sync-outline", "enabled": True, "group": "Overall"},
+    {"path": "last_scan", "name": "Last file scan", "unit": "", "deviceClass": "timestamp", "icon": "mdi:folder-search-outline", "enabled": False, "group": "Overall"},
+    {"path": "next_scan", "name": "Next file scan", "unit": "", "deviceClass": "timestamp", "icon": "mdi:magnify-scan", "enabled": False, "group": "Overall"},
     {"path": "progress_percent", "name": "Progress", "unit": "%", "deviceClass": "", "icon": "mdi:progress-check", "enabled": True, "group": "Overall"},
     {"path": "errors", "name": "Errors", "unit": "errors", "deviceClass": "", "icon": "mdi:alert-circle", "enabled": True, "group": "Overall"},
     {"path": "current_file", "name": "Current file", "unit": "", "deviceClass": "", "icon": "mdi:file-music-outline", "enabled": False, "group": "Overall"},
@@ -68,6 +79,10 @@ def _validate(key: str, value):
         return round(number, 1)
     if key in ("override", "dryRun", "preserveMtime"):
         return bool(value)
+    if key == "mode":
+        if value not in MODES:
+            raise ValueError("mode must be off, bulk or auto")
+        return value
     if key == "lossy":
         if value not in LOSSY_MODES:
             raise ValueError("lossy must be gain, reencode or skip")
@@ -153,11 +168,15 @@ def get_run(db: Database) -> dict:
     return out
 
 
+_run_lock = threading.Lock()      # the scheduler, the scanner and the API all update the run state
+
+
 def set_run(db: Database, **changes) -> dict:
-    run = get_run(db)
-    run.update(changes)
-    db.set_json("run", run)
-    return run
+    with _run_lock:                # read-merge-write, so two threads cannot drop each other's change
+        run = get_run(db)
+        run.update(changes)
+        db.set_json("run", run)
+        return run
 
 
 # ---------------------------------------------------------------- Home Assistant

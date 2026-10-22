@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 import time
+from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -46,8 +47,10 @@ def test_ha_status_returns_payload_with_the_right_token(client):
     r = client.get("/api/v1/ha/status", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 200
     body = r.json()
-    for key in ("status", "progress_percent", "errors", "current_file", "last_run_finished", "audio", "video"):
+    for key in ("status", "mode", "scan_every", "last_scan", "next_scan",
+                "progress_percent", "errors", "current_file", "last_run_finished", "audio", "video"):
         assert key in body, key
+    assert body["mode"] == "bulk" and body["scan_every"] == 15
     for media in ("audio", "video"):
         for key in ("in_schedule_window", "directories_total", "directories_enabled", "files_total",
                     "files_pending", "files_checked", "files_changed", "files_parked"):
@@ -529,3 +532,87 @@ def test_sensor_name_validation_and_yaml_quoting(client):
     assert '- name: "Files \\"parked\\""' in r.json()["yaml"]
     # unknown paths are ignored
     assert client.put("/api/ha", json={"sensors": [{"path": "evil.path", "name": "x"}]}).status_code == 200
+
+
+# ------------------------------------------------------------ app modes (off / bulk / auto)
+
+def test_dashboard_reports_the_mode_and_the_scan_schedule(client, cfg):
+    d = client.get("/api/dashboard").json()
+    assert d["mode"] == "bulk" and d["run_mode"] == "stopped" and d["status"] == "stopped"
+    assert d["scan_every"] == 15 and d["last_scan"] is None
+    assert d["next_scan"]                                  # planned as soon as the app can scan
+
+    _scan_library(cfg, client)
+    d = client.get("/api/dashboard").json()
+    last, nxt = d["last_scan"], d["next_scan"]
+    assert last and nxt
+    gap = datetime.fromisoformat(nxt) - datetime.fromisoformat(last)
+    assert gap == timedelta(minutes=15)                    # the interval from Settings > Scheduling
+
+    # a shorter interval is used at once
+    assert client.put("/api/schedule", json={"scanEvery": 5}).status_code == 200
+    d = client.get("/api/dashboard").json()
+    assert d["scan_every"] == 5
+    assert datetime.fromisoformat(d["next_scan"]) - datetime.fromisoformat(d["last_scan"]) == timedelta(minutes=5)
+
+
+def test_the_mode_setting_switches_the_app_on_and_off(client, cfg):
+    _scan_library(cfg, client)
+
+    # off: nothing is scanned or normalized, and a run cannot be started
+    r = client.put("/api/settings", json={"general": {"mode": "off"}})
+    assert r.status_code == 200 and r.json()["general"]["mode"] == "off"
+    d = client.get("/api/dashboard").json()
+    assert d["mode"] == "off" and d["status"] == "off" and d["run_mode"] == "stopped"
+    assert d["next_scan"] is None                          # no scan is planned
+    refused = client.post("/api/run/start")
+    assert refused.status_code == 400 and "off" in refused.json()["detail"].lower()
+
+    # automatic: the run starts itself, so Start is not needed and Stop is not how it is turned off
+    assert client.put("/api/settings", json={"general": {"mode": "auto"}}).status_code == 200
+    d = client.get("/api/dashboard").json()
+    assert d["mode"] == "auto" and d["run_mode"] == "active"
+    assert d["next_scan"]
+    stopped = client.post("/api/run/stop")
+    assert stopped.status_code == 400 and "automatic" in stopped.json()["detail"].lower()
+    assert client.post("/api/run/pause").json()["status"] == "paused"
+    assert client.post("/api/run/pause").json()["status"] in ("idle", "running", "waiting_window")
+
+    # bulk: the automatic run stops and the user starts a run by hand
+    assert client.put("/api/settings", json={"general": {"mode": "bulk"}}).status_code == 200
+    d = client.get("/api/dashboard").json()
+    assert d["mode"] == "bulk" and d["status"] == "stopped" and d["run_mode"] == "stopped"
+    assert client.post("/api/run/start").status_code == 200
+    assert client.get("/api/dashboard").json()["run_mode"] == "active"
+    assert client.post("/api/run/stop").status_code == 200
+
+    # only the three modes exist
+    assert client.put("/api/settings", json={"general": {"mode": "always"}}).status_code == 400
+
+
+def test_the_lovelace_card_copy_matches_the_one_the_app_serves():
+    """The card is shipped twice (served by the app and downloaded from GitHub); they must not drift."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "audio-normalizer-card.js"), "rb") as fh:
+        served = fh.read()
+    with open(os.path.join(root, "lovelace", "audio-normalizer-card.js"), "rb") as fb:
+        published = fb.read()
+    assert served == published
+
+
+def test_ha_exposes_the_mode_and_the_scan_times(client, cfg):
+    token = _ha_token(client)
+    view = client.get("/api/ha").json()
+    mode_sensor = _sensor(view, "mode")
+    assert mode_sensor["name"] == "Mode" and mode_sensor["enabled"] is True
+    assert '- name: "Mode"' in view["yaml"] and "value_json.mode" in view["yaml"]
+    assert "          - mode" in view["yaml"]              # an attribute of the main entity as well
+    assert _sensor(view, "last_scan")["deviceClass"] == "timestamp"
+    assert _sensor(view, "next_scan")["enabled"] is False  # optional, like the other timestamps
+
+    headers = {"Authorization": f"Bearer {token}"}
+    body = client.get("/api/v1/ha/status", headers=headers).json()
+    assert body["mode"] == "bulk"
+    client.put("/api/settings", json={"general": {"mode": "off"}})
+    body = client.get("/api/v1/ha/status", headers=headers).json()
+    assert body["status"] == "off" and body["mode"] == "off" and body["next_scan"] is None

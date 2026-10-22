@@ -30,7 +30,10 @@ The J3455 is a 4-core, low-power CPU (1.5 GHz base, 2.3 GHz burst). The first fu
 
 - runs a configurable **concurrency limit** (default 1 file at a time, max 2);
 - processes only inside the **schedule windows**;
-- caches analysis results so that each file is analysed once per version.
+- caches analysis results so that each file is analysed once per version;
+- lets the user choose what happens without them: **Off**, **Bulk** (only a run they start) or **Automatic**
+  (new files are found on the *Look for new or changed files every* interval and normalized on their own).
+  The interval is one setting for both, and the mode is part of the dashboard and the Home Assistant payload.
 
 Real throughput must be measured on the DS918+ during the prototype phase. No speed numbers are assumed here.
 
@@ -80,6 +83,7 @@ audio-normalizer/
 | Lossy gain | **mp3gain / aacgain** (default lossy strategy, Q1) | Lossless gain change for MP3/AAC. |
 | State | **SQLite** in `/config` | Survives restarts; stores per-file fingerprint (path, size, mtime, hash), status, gain, history. |
 | Scheduler | Own weekly-window logic (not cron) | Simple "days + hours" grid in the UI; no external daemon. |
+| App modes | `general.mode`: `off` / `bulk` / `auto` in the settings; the run state in SQLite follows it | One switch instead of two overlapping ones (run + automatic); Off really stops everything, Bulk is one-shot, Automatic is hands-off. |
 | Frontend | Vanilla JS (as in the mock-up) | No build step, small image, easy to maintain on a NAS. |
 | Busy state | Client actions + `/api/dashboard.scanning` | The menu shows what the app is doing (scan, level check, save, edit, run) on every page. |
 | Waveform | ffmpeg decode to 8 kHz mono PCM, reduced to min/max buckets, LRU cached by path/mtime/size/window | One cheap decode per window; zoom and scroll reuse the cache instead of the browser decoding the whole file, and a long file is only decoded where it is shown. |
@@ -89,6 +93,10 @@ audio-normalizer/
 
 1. **Detect** — periodic scan of enabled directories (default every 15 min); opening the Directories tab or pressing Rescan scans at once. A file is "new/changed" when path, size or mtime differ from the database. inotify is **not** used as the primary mechanism: it is unreliable on Synology shares and bind mounts. (Optional inotify later.)
 2. **Analyse** — ffmpeg `ebur128` → integrated loudness (LUFS) and true peak (dBTP). Result cached by file fingerprint.
+   In **Bulk** mode the scan runs on the same interval (so the file list stays current) but nothing is processed until
+   the user presses Start; that run ends by itself when the queue is empty, so files that appear later wait for the
+   next Start. In **Automatic** mode the run keeps itself active and the files found by the scan are processed within
+   the schedule. In **Off** mode no scan and no run happen; Rescan and Check level still work as manual actions.
 3. **Decide** — `gain = target − measured`, limited so the true peak stays below the ceiling (default −1 dBTP).
    - |gain| < 0.5 dB → `ok` (no change).
    - |gain| > threshold (default 6 dB) and override off → **`parked`** (not changed; the run continues with the next file).
@@ -162,6 +170,9 @@ volumes:
 | Quality not changed | Default gain-only strategy for lossy files; lossless gain for FLAC/WAV; user can choose re-encode or skip (see §1.3, Q1). |
 | Schedule (days, weeks, times) | Weekly 7×24 grid with presets; "finish current file" or "pause now" at window end. |
 | New files detected, persistent | Periodic scan + SQLite fingerprints; state survives restarts. |
+| New files without pressing anything | **Automatic mode**: the periodic scan (interval from Settings, Scheduling) finds new and changed files; the run is kept active by the engine, so they are measured and normalized within the schedule. Status, next scan and the mode are on the dashboard and in the HA payload (`mode`, `scan_every`, `last_scan`, `next_scan`). |
+| Check the existing library in one go | **Bulk mode**: Start works through everything that is pending, then the run stops itself with `lastFinished`; later files wait for the next Start. |
+| Switch the app off | **Off mode**: no scan, no run; `/run/start` is refused with a clear message. |
 | Warning + park large changes, no waiting | Files above the threshold get status `parked`; the run continues; review page. |
 | Review of parked files (mock-up v4.1) | Each parked file shows the original and the new change needed; adjust it by ±0.1 dB (buttons or a −12…+12 dB slider), or several at once via multi-select; then apply or skip. Changes are stored as an offset from the measured gain. |
 | Baseline from a file (mock-up v4.2) | Directories: Check level on a file shows its integrated loudness and true peak (measured, file unchanged); Use as target sets the target level. Settings, Level links to this. |
@@ -190,6 +201,10 @@ Example payload (structure taken from the mock-up; values are sample numbers):
 ```json
 {
   "status": "running",
+  "mode": "auto",
+  "scan_every": 15,
+  "last_scan": "2026-10-20T23:00:01+02:00",
+  "next_scan": "2026-10-20T23:15:01+02:00",
   "progress_percent": 52.6,
   "errors": 8,
   "current_file": "/data/audio/Music/Rock/04 Cold Front 1.mp3",
@@ -221,7 +236,10 @@ Example payload (structure taken from the mock-up; values are sample numbers):
 }
 ```
 
-Sensors use dotted paths, for example `audio.files_total` → `{{ value_json.audio.files_total }}`. The mock-up's Home Assistant page groups sensors into Overall, Audio and Video.
+`status` is `running`, `paused`, `waiting_window`, `idle`, `stopped` or `off`; `mode` is `off`, `bulk` or `auto`
+(`next_scan` is `null` when the app is off). Sensors use dotted paths, for example `audio.files_total` →
+`{{ value_json.audio.files_total }}`; `mode`, `last_scan` and `next_scan` are top-level values. The mock-up's Home
+Assistant page groups sensors into Overall, Audio and Video.
 
 Home Assistant side: RESTful sensors (generated YAML snippet is shown on the Home Assistant page of the mock-up). Decided for v1: **REST only** (Q4). MQTT discovery or a HACS custom integration are not planned for v1.
 
