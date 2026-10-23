@@ -198,7 +198,7 @@ class Engine:
                 queued += self.db.execute(
                     "UPDATE files SET status = 'pending', reason = NULL, lufs = NULL, true_peak = NULL, "
                     "measured_at = NULL, gain_db = NULL, adjust_db = 0, applied_db = NULL, method = NULL, "
-                    "changed_at = NULL "
+                    "changed_at = NULL, silent_sections = 0, silent_duration = 0, silence_trimmed = 0 "
                     "WHERE media = ? AND status != 'processing' "
                     "AND dir IN (SELECT relpath FROM dirs WHERE media = ? AND enabled = 1)",
                     (m, m),
@@ -458,9 +458,15 @@ class Engine:
                    hysteresis=cfg_m.get("hysteresis", 0.5))
         if d.action == "error":
             raise ff.ToolError(f"unsupported audio codec '{probe.codec}'")
-        self.db.execute("UPDATE files SET gain_db = ?, method = ? WHERE id = ?", (d.gain, d.method, fid))
+        all_cuts = self._detect_empty_sections(media, src, lufs, probe, st["general"], cancel) if d.action != "skip" else []
+        sil_count = len(all_cuts)
+        sil_dur = round(sum(ce - cs for cs, ce in all_cuts), 2)
+        self.db.execute(
+            "UPDATE files SET gain_db = ?, method = ?, silent_sections = ?, silent_duration = ? WHERE id = ?",
+            (d.gain, d.method, sil_count, sil_dur, fid),
+        )
 
-        cuts = self._silent_cuts(media, src, lufs, probe, st["general"], cancel) if d.action != "skip" else []
+        cuts = all_cuts if st["general"].get("trimSilence") else []
         if st["general"]["dryRun"]:
             self.db.execute("UPDATE files SET status = 'dryrun' WHERE id = ?", (fid,))
             extra = f", {len(cuts)} silent section(s)" if cuts else ""
@@ -482,9 +488,9 @@ class Engine:
         else:
             self._apply(row, cfg_m, st, d.method, d.gain, probe, family, cancel, cuts=cuts)
 
-    def _silent_cuts(self, media: str, src: str, lufs: float, probe: ff.Probe,
-                     gen: dict, cancel) -> list[tuple[float, float]]:
-        if media != "audio" or not gen.get("trimSilence") or not probe.duration:
+    def _detect_empty_sections(self, media: str, src: str, lufs: float, probe: ff.Probe,
+                               gen: dict, cancel) -> list[tuple[float, float]]:
+        if media != "audio" or not probe.duration or lufs <= -60:
             return []
         cuts = ff.detect_silent_sections(
             self.cfg.ffmpeg, src, lufs=lufs,
@@ -496,6 +502,12 @@ class Engine:
         if not cuts or not ff.kept_segments(probe.duration, cuts):
             return []
         return cuts
+
+    def _silent_cuts(self, media: str, src: str, lufs: float, probe: ff.Probe,
+                     gen: dict, cancel) -> list[tuple[float, float]]:
+        if not gen.get("trimSilence"):
+            return []
+        return self._detect_empty_sections(media, src, lufs, probe, gen, cancel)
 
     def _apply_approved(self, row: dict, cancel) -> None:
         media = row["media"]
@@ -558,15 +570,19 @@ class Engine:
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
-        self.db.execute(
-            "UPDATE files SET status = 'changed', applied_db = ?, gain_db = ?, method = ?, reason = NULL, "
-            "changed_at = ? WHERE id = ?",
-            (applied, gain, method, time.time(), fid))
         if has_cuts:
-            removed = sum(ce - cs for cs, ce in cuts)
+            removed = round(sum(ce - cs for cs, ce in cuts), 2)
+            self.db.execute(
+                "UPDATE files SET status = 'changed', applied_db = ?, gain_db = ?, method = ?, reason = NULL, "
+                "changed_at = ?, silence_trimmed = 1, silent_sections = ?, silent_duration = ? WHERE id = ?",
+                (applied, gain, method, time.time(), len(cuts), removed, fid))
             self.db.log("ok", f"{name}: changed by {applied:+.1f} dB ({method}), "
                               f"removed {len(cuts)} silent section(s) (-{removed:.1f} s)", media)
         else:
+            self.db.execute(
+                "UPDATE files SET status = 'changed', applied_db = ?, gain_db = ?, method = ?, reason = NULL, "
+                "changed_at = ? WHERE id = ?",
+                (applied, gain, method, time.time(), fid))
             self.db.log("ok", f"{name}: changed by {applied:+.1f} dB ({method})", media)
 
     def _commit(self, src: str, tmp: str, final: str, media: str, rel: str, mode: str, preserve: bool) -> None:
@@ -680,7 +696,8 @@ class Engine:
         self.db.execute(
             "UPDATE files SET status = 'pending', reason = NULL, size = ?, mtime_ns = ?, seen_at = ?, "
             "lufs = NULL, true_peak = NULL, measured_at = NULL, gain_db = NULL, adjust_db = 0, "
-            "applied_db = NULL, method = NULL, changed_at = NULL WHERE id = ?",
+            "applied_db = NULL, method = NULL, changed_at = NULL, "
+            "silent_sections = 0, silent_duration = 0, silence_trimmed = 0 WHERE id = ?",
             (st.st_size, st.st_mtime_ns, time.time(), row["id"]))
         what = []
         if fade_in:
@@ -700,8 +717,79 @@ class Engine:
             raise ValueError("file not found")
         lufs, true_peak, probe = ff.measure_and_probe(self.cfg.ffmpeg, src)
         name = os.path.basename(rel)
-        self.db.execute("UPDATE files SET lufs = ?, true_peak = ?, measured_at = ?, codec = ? "
-                        "WHERE media = ? AND relpath = ? AND status != 'processing'",
-                        (lufs, true_peak, time.time(), probe.codec, media, rel))
-        self.db.log("info", f"Level checked: {name} {lufs:.1f} LUFS, true peak {true_peak:.1f} dBTP", media)
-        return {"name": name, "relpath": rel, "lufs": lufs, "true_peak": true_peak, "codec": probe.codec}
+        st = state.get_settings(self.db)
+        cfg_m = st[media]
+        family = audio_family(probe.codec)
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        strategy = cfg_m.get("lossy", "reencode") if media == "audio" else "reencode"
+        d = decide(media=media, ext=ext, family=family, measured=lufs, true_peak=true_peak,
+                   target=cfg_m["target"], ceiling=cfg_m["truePeak"], threshold=cfg_m["threshold"],
+                   override=cfg_m["override"], strategy=strategy, tools=self.tools,
+                   hysteresis=cfg_m.get("hysteresis", 0.5))
+        gain_db = 0.0 if d.action == "ok" else d.gain
+        cuts = self._detect_empty_sections(media, src, lufs, probe, st["general"], None)
+        sil_count = len(cuts)
+        sil_dur = round(sum(ce - cs for cs, ce in cuts), 2)
+        self.db.execute(
+            "UPDATE files SET lufs = ?, true_peak = ?, gain_db = ?, method = ?, "
+            "silent_sections = ?, silent_duration = ?, measured_at = ?, codec = ?, family = ? "
+            "WHERE media = ? AND relpath = ? AND status != 'processing'",
+            (lufs, true_peak, gain_db, d.method, sil_count, sil_dur, time.time(),
+             probe.codec, family, media, rel),
+        )
+        self.db.log("info", f"Level checked: {name} {lufs:.1f} LUFS, true peak {true_peak:.1f} dBTP"
+                            + (f", {sil_count} empty section(s) ({sil_dur:.1f} s)" if sil_count else ""), media)
+        return {"name": name, "relpath": rel, "lufs": lufs, "true_peak": true_peak,
+                "gain_db": gain_db, "silent_sections": sil_count, "silent_duration": sil_dur,
+                "codec": probe.codec}
+
+    def _target_rows(self, media: str, ids: list[int] | None, dir_rel: str | None) -> list[dict]:
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            return self.db.query(
+                f"SELECT * FROM files WHERE media = ? AND id IN ({placeholders}) ORDER BY name",
+                [media, *ids],
+            )
+        if dir_rel is not None:
+            return self.db.query(
+                "SELECT * FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
+                (media, dir_rel),
+            )
+        return []
+
+    def check_files(self, media: str, ids: list[int] | None = None, dir_rel: str | None = None) -> dict:
+        """Check level and empty sections for the selected files (or all files in dir_rel)."""
+        rows = self._target_rows(media, ids, dir_rel)
+        checked = 0
+        empty = 0
+        for r in rows:
+            if r["status"] == "processing":
+                continue
+            try:
+                res = self.measure(media, r["relpath"])
+                checked += 1
+                if res.get("silent_sections", 0) > 0:
+                    empty += 1
+            except Exception as exc:
+                self.db.log("error", f"{r['name']}: {exc}", media)
+        return {"checked": checked, "empty_sections": empty}
+
+    def execute_files(self, media: str, ids: list[int] | None = None, dir_rel: str | None = None) -> dict:
+        """Execute normalization (and empty-section removal when enabled) on the selected files."""
+        rows = self._target_rows(media, ids, dir_rel)
+        executed = 0
+        changed = 0
+        for r in rows:
+            if r["status"] == "processing":
+                continue
+            fid = r["id"]
+            if r["status"] == "parked" and r["gain_db"] is not None:
+                self.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
+            else:
+                self.db.execute("UPDATE files SET status = 'pending' WHERE id = ?", (fid,))
+            self._process(fid)
+            executed += 1
+            after = self.db.one("SELECT status FROM files WHERE id = ?", (fid,))
+            if after and after["status"] == "changed":
+                changed += 1
+        return {"executed": executed, "changed": changed}

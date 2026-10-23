@@ -1036,6 +1036,7 @@
     trees: { audio: null, video: null },   // { roots, map, rootFiles } built from /api/folders/tree
     selected: { audio: null, video: null },// selected folder (relpath) per media type
     browse: { media: null, rel: null, rows: null, loading: false },
+    fileSel: [],                    // selected file ids in the Directories files pane
     scanning: { audio: false, video: false },  // a rescan of the base location is running
     busy: {},                       // what this browser is doing now: id -> { text, secs }
     parked: { audio: null, video: null },  // GET /api/parked
@@ -1302,6 +1303,7 @@
       + stat('3 · Checked', fmt(m.files_checked), 'files with a measured level')
       + stat('4 · Actually changed', fmt(m.files_changed), 'level set to ' + Number(m.target).toFixed(1) + ' LUFS')
       + stat('5 · Parked', fmt(m.files_parked), '<a href="#/parked">waiting for your decision</a>')
+      + stat('6 · Empty sections changed', fmt(m.files_empty_changed || 0), fmt(m.files_empty_sections || 0) + ' detected with empty sections')
       + '</div>'
       + '<p class="small muted" style="margin-top:12px">' + esc(scheduleText(t)) + '</p>'
       + '</section>';
@@ -1404,6 +1406,8 @@
         : '<span class="muted">manual only (Rescan or opening Directories)</span>') + '</dd></div>'
       + '<div><dt>Parked for review</dt><dd><a href="#/parked">Audio ' + dashMedia('audio').files_parked + ' · Video ' + dashMedia('video').files_parked + '</a>'
       + (parkedTotal ? '' : ' <span class="muted">(none)</span>') + '</dd></div>'
+      + '<div><dt>Empty sections changed</dt><dd>Audio ' + fmt(dashMedia('audio').files_empty_changed || 0)
+      + ' <span class="muted">(' + fmt(dashMedia('audio').files_empty_sections || 0) + ' detected)</span></dd></div>'
       + '<div><dt>Errors</dt><dd>' + errors + '</dd></div>'
       + '<div><dt>Last run finished</dt><dd>' + (d.last_finished ? new Date(d.last_finished).toLocaleString('en-GB') : 'never') + '</dd></div>'
       + '<div><dt>Write mode</dt><dd>Audio: ' + writeLabel('audio') + ' · Video: ' + writeLabel('video') + '</dd></div>'
@@ -1432,11 +1436,14 @@
         + '<span>Measuring <strong>' + esc(m.name) + '</strong> … (integrated loudness, EBU R128, file not changed)</span></div>';
     } else if (m) {
       const v = baselineValue(m.lufs);
+      const chg = m.gain_db !== undefined ? m.gain_db : round1(target - m.lufs);
+      const emp = m.silent_sections ? m.silent_sections + ' (' + Number(m.silent_duration || 0).toFixed(1) + ' s)' : 'none';
       html += '<div class="measure">'
         + '<div><div class="stat-label">Checked file</div><strong>' + esc(m.name) + '</strong></div>'
         + '<div><div class="stat-label">Integrated loudness</div><strong>' + m.lufs.toFixed(1) + ' LUFS</strong></div>'
         + '<div><div class="stat-label">True peak</div><strong>' + Number(m.tp).toFixed(1) + ' dBTP</strong></div>'
-        + '<div><div class="stat-label">Change needed at target ' + Number(target).toFixed(1) + '</div><strong>' + fmtDb(round1(target - m.lufs)) + '</strong></div>'
+        + '<div><div class="stat-label">Change needed at target ' + Number(target).toFixed(1) + '</div><strong>' + fmtDb(round1(chg)) + '</strong></div>'
+        + '<div><div class="stat-label">Empty sections</div><strong>' + esc(emp) + '</strong></div>'
         + '<span class="grow"></span>'
         + '<button class="btn btn-primary" data-action="use-baseline">Use ' + v.toFixed(1) + ' LUFS as target' + (v !== Math.round(m.lufs * 2) / 2 ? ' (slider limit)' : '') + '</button>'
         + '<button class="btn" data-action="measure-close">Dismiss</button></div>';
@@ -1463,21 +1470,44 @@
     }).join('');
   }
 
+  function emptyLabel(f) {
+    if (f.silence_trimmed) {
+      return '<span class="st st-changed">removed (' + Number(f.silent_duration || 0).toFixed(1) + ' s)</span>';
+    }
+    if (f.silent_sections > 0) {
+      return '<span class="st st-parked">' + f.silent_sections + ' (' + Number(f.silent_duration || 0).toFixed(1) + ' s)</span>';
+    }
+    if (f.measured_at) return '<span class="dim">none</span>';
+    return '—';
+  }
+
   function renderBrowse(node) {
     const t = node.type;
     const b = state.browse;
+    const rowIds = b.rows ? b.rows.map((f) => f.id) : [];
+    const sel = state.fileSel.filter((id) => rowIds.includes(id));
+    state.fileSel = sel;
+    const hasRows = !!(b.rows && b.rows.length);
+    const selSuffix = sel.length ? ' (' + sel.length + ')' : '';
+    const batchBtns = hasRows
+      ? '<button class="btn btn-sm" data-action="check-all-files" title="Check level and empty sections for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check all' + selSuffix + '</button>'
+        + '<button class="btn btn-sm btn-primary" data-action="execute-files" title="Execute normalization for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Execute' + selSuffix + '</button>'
+      : '';
     const head = '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
       + '<div class="sub">' + node.directFiles + ' files directly in this folder · ' + (subtree(node).length - 1) + ' sub-folders'
       + ' · Play listens to the original · Edit fades or cuts a part</div></div>'
-      + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div>';
+      + '<div class="btns">' + batchBtns
+      + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div></div>';
     if (b.loading || b.media !== t || b.rel !== node.rel || !b.rows) {
       return head + '<p class="muted">Loading files…</p>';
     }
     if (!b.rows.length) {
       return head + '<p class="muted">No files directly in this folder. Open a sub-folder in the tree.</p>';
     }
+    const allOn = b.rows.length > 0 && b.rows.every((f) => sel.includes(f.id));
     const rows = b.rows.map((f, i) => {
       const ext = String(f.name).split('.').pop();
+      const on = sel.includes(f.id);
       const checking = !!(state.measure && state.measure.relpath === f.relpath && state.measure.state === 'measuring');
       const playing = PLAY.media === t && PLAY.relpath === f.relpath && PLAY.playing;
       const editing = t === 'audio' && !!f.playable
@@ -1494,19 +1524,25 @@
       const check = checking
         ? '<span class="row-busy"><span class="working" aria-hidden="true"></span>Checking…</span>'
         : '<button class="btn btn-sm" data-action="check-level" data-idx="' + i + '">Check level</button>';
-      const cls = checking ? 'is-busy-row' : playing ? 'is-playing-row' : '';
+      const cls = [checking ? 'is-busy-row' : playing ? 'is-playing-row' : '', on ? 'row-sel' : ''].filter(Boolean).join(' ');
       return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>'
+        + '<td class="pick"><input type="checkbox" data-file-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
         + '<td class="file-cell">' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
         + '<td class="num">' + fmtLufs(f.lufs) + '</td>'
         + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
+        + '<td>' + emptyLabel(f) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
         + '<td>' + statusLabel(f.status) + '</td>'
         + '<td class="actions-cell">' + listen + editing + check + '</td></tr>';
     }).join('');
     return head
-      + '<div class="table-wrap files-table-wrap"><table class="files-table"><thead><tr><th>File</th><th>Format</th><th class="num">Level'
+      + '<div class="table-wrap files-table-wrap"><table class="files-table"><thead><tr>'
+      + '<th class="pick"><input type="checkbox" data-file-all aria-label="Select all files in this folder"' + (allOn ? ' checked' : '') + '></th>'
+      + '<th>File</th><th>Format</th><th class="num">Level'
       + tip('Integrated loudness of the whole file (EBU R128), measured without changing the file. Check level measures one file again.')
-      + '</th><th class="num">Change</th><th>Method</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+      + '</th><th class="num">Change</th><th>Empty'
+      + tip('Long silent ("no sound") sections detected in the file based on the thresholds in Settings.')
+      + '</th><th>Method</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
       + (b.rows.length >= 500 ? '<p class="small muted" style="margin-top:10px">Showing the first 500 files.</p>' : '');
   }
 
@@ -2151,7 +2187,11 @@
       render();
       try {
         const r = await api('/files/measure', { method: 'POST', body: { media: t, relpath: f.relpath } });
-        state.measure = { media: t, relpath: f.relpath, name: r.name, state: 'done', lufs: r.lufs, tp: r.true_peak };
+        state.measure = {
+          media: t, relpath: f.relpath, name: r.name, state: 'done',
+          lufs: r.lufs, tp: r.true_peak, gain_db: r.gain_db,
+          silent_sections: r.silent_sections, silent_duration: r.silent_duration,
+        };
       } catch (err) {
         state.measure = null;
         toast(err.message);
@@ -2161,6 +2201,45 @@
       }
       const node = tree(t) && tree(t).map.get(state.selected[t]);
       if (node) await loadBrowse(node.rel);
+      else render();
+    } else if (a === 'check-all-files') {
+      const b = state.browse;
+      if (!b || !b.rows || !b.rows.length) return;
+      const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
+      const busy = startBusy('Checking ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        const r = await api('/files/check-batch', { method: 'POST', body: { media: t, ids: ids, dir: b.rel } });
+        toast('Checked ' + r.checked + ' file' + (r.checked === 1 ? '' : 's')
+              + (r.empty_sections ? ' · ' + r.empty_sections + ' with empty sections' : ''));
+        await refreshDash();
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      if (b.rel) await loadBrowse(b.rel);
+      else render();
+    } else if (a === 'execute-files') {
+      const b = state.browse;
+      if (!b || !b.rows || !b.rows.length) return;
+      const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
+      const busy = startBusy('Executing ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        const r = await api('/files/execute-batch', { method: 'POST', body: { media: t, ids: ids, dir: b.rel } });
+        toast('Executed ' + r.executed + ' file' + (r.executed === 1 ? '' : 's') + ' (' + r.changed + ' changed)');
+        await refreshDash();
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      if (b.rel) await loadBrowse(b.rel);
       else render();
     } else if (a === 'measure-close') {
       state.measure = null;
@@ -2291,6 +2370,19 @@
       if (!committed) return;
       state.parkSort = el.value;
       invalidate('parked:' + state.media);
+      render();
+      return;
+    }
+
+    if (el.dataset.fileCheck !== undefined || el.dataset.fileAll !== undefined) {
+      if (!committed) return;
+      const list = (state.browse && state.browse.rows) || [];
+      if (el.dataset.fileAll !== undefined) {
+        state.fileSel = el.checked ? list.map((f) => f.id) : [];
+      } else {
+        const id = Number(el.dataset.fileCheck);
+        state.fileSel = el.checked ? state.fileSel.concat(id) : state.fileSel.filter((x) => x !== id);
+      }
       render();
       return;
     }
