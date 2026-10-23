@@ -46,7 +46,11 @@
     size_desc: 'Size of change, largest first',
   };
   const DEFAULTS = {
-    general: { dryRun: false, preserveMtime: true, mode: 'bulk' },
+    general: {
+      dryRun: false, preserveMtime: true, mode: 'bulk',
+      trimSilence: false, silenceLevelPct: 2.0, silencePeakDb: -40.0,
+      silenceMinDuration: 5.0, silenceFadeOut: 0.5, silenceFadeIn: 0.5,
+    },
     audio: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
     video: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
   };
@@ -1797,6 +1801,48 @@
       + '</div></div></section>';
   }
 
+  function silenceCard() {
+    const g = state.draft.general;
+    const pct = g.silenceLevelPct ?? 2.0;
+    const peak = g.silencePeakDb ?? -40.0;
+    const minDur = g.silenceMinDuration ?? 5.0;
+    const fadeOut = g.silenceFadeOut ?? 0.5;
+    const fadeIn = g.silenceFadeIn ?? 0.5;
+    return '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Empty sections (no sound)</h2>'
+      + '<div class="sub">Automatically detect and delete long silent sections in audio files, applying fade-out and fade-in instead of a hard cut.</div></div></div>'
+      + '<label class="check" style="padding-top:0;border-bottom:1px solid var(--line);margin-bottom:16px">'
+      + '<input class="switch" type="checkbox" data-scope="general" data-setting="trimSilence"' + (g.trimSilence ? ' checked' : '') + '>'
+      + '<span><strong>Remove large empty sections of no sound</strong>'
+      + tip('General option: when enabled, audio sections that meet the "no sound" criteria and are longer than the allowed time are automatically deleted during a run.')
+      + '</span></label>'
+      + '<div class="split-2" style="margin-top:0">'
+      + '<div>'
+      + '<div class="field"><label class="lbl" for="sil-pct">No-sound level (below % of file average)'
+      + tip('A section is considered "no sound" when its RMS level stays below this percentage of the file\'s average loudness. Higher numbers catch slightly louder background hiss; lower numbers only match near-total silence.') + '</label>'
+      + '<div class="slider-row"><input id="sil-pct" type="range" min="0.5" max="20" step="0.5" value="' + pct + '" data-scope="general" data-setting="silenceLevelPct">'
+      + '<div class="val"><span data-out="general.silenceLevelPct">' + Number(pct).toFixed(1) + '</span> %</div></div></div>'
+      + '<div class="field"><label class="lbl" for="sil-peak">Maximum peak level during "no sound"'
+      + tip('Peaks inside a "no sound" section may not be higher than this ceiling. Higher numbers (closer to 0, such as −25 dB) allow louder background noise to still count as no sound; lower numbers (more negative, such as −60 dB) require stricter silence.') + '</label>'
+      + '<div class="slider-row"><input id="sil-peak" type="range" min="-70" max="-20" step="1" value="' + peak + '" data-scope="general" data-setting="silencePeakDb">'
+      + '<div class="val"><span data-out="general.silencePeakDb">' + Number(peak).toFixed(1) + '</span> dB</div></div></div>'
+      + '<div class="field" style="margin-bottom:0"><label class="lbl" for="sil-dur">Allowed "no sound" time (only longer sections are deleted)'
+      + tip('Normal pauses up to this duration are kept. Only continuous "no sound" sections strictly longer than this time are deleted.') + '</label>'
+      + '<div class="slider-row"><input id="sil-dur" type="range" min="1" max="60" step="0.5" value="' + minDur + '" data-scope="general" data-setting="silenceMinDuration">'
+      + '<div class="val"><span data-out="general.silenceMinDuration">' + Number(minDur).toFixed(1) + '</span> s</div></div></div>'
+      + '</div>'
+      + '<div>'
+      + '<div class="field"><label class="lbl" for="sil-fo">Fade-out time before cut'
+      + tip('Instead of a sudden hard cut at the start of a deleted silent section, the audio fades out smoothly over this time (0.0 s = clear cut).') + '</label>'
+      + '<div class="slider-row"><input id="sil-fo" type="range" min="0" max="10" step="0.1" value="' + fadeOut + '" data-scope="general" data-setting="silenceFadeOut">'
+      + '<div class="val"><span data-out="general.silenceFadeOut">' + Number(fadeOut).toFixed(1) + '</span> s</div></div></div>'
+      + '<div class="field" style="margin-bottom:0"><label class="lbl" for="sil-fi">Fade-in time after cut'
+      + tip('Instead of a sudden hard cut after a deleted silent section, the audio fades back in smoothly over this time (0.0 s = clear cut).') + '</label>'
+      + '<div class="slider-row"><input id="sil-fi" type="range" min="0" max="10" step="0.1" value="' + fadeIn + '" data-scope="general" data-setting="silenceFadeIn">'
+      + '<div class="val"><span data-out="general.silenceFadeIn">' + Number(fadeIn).toFixed(1) + '</span> s</div></div></div>'
+      + '</div>'
+      + '</div></section>';
+  }
+
   function renderSettings() {
     const t = state.media;
     const g = state.draft.general;
@@ -1811,6 +1857,7 @@
       + '<p class="small muted" style="padding-top:12px;border-top:1px solid var(--line)">Web access has no login (local network only, as chosen). '
       + 'Do not forward the port to the internet. The Home Assistant API still requires its access token.</p>'
       + '</div></section>'
+      + silenceCard()
       + scheduleOptions()
       + '<div class="split-2">' + levelCard(t) + outputCard(t) + '</div>';
   }

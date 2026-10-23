@@ -629,3 +629,47 @@ def test_measure_and_probe_matches_separate_calls(tmp_path):
         assert abs(tp - tp_sep) < 0.01
         assert info == info_sep
 
+
+def test_trim_silence_removes_long_silent_sections_with_fades(lib):
+    cfg, engine, db = lib
+    # 2s tone + 4s silence + 2s tone = 8s total
+    long_gap = make(
+        os.path.join(cfg.audio_root, "long_gap.flac"),
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]",
+        "-map", "[a]", "-c:a", "flac",
+    )
+    # 2s tone + 1s silence + 2s tone = 5s total (pause shorter than allowed 2.5s)
+    short_gap = make(
+        os.path.join(cfg.audio_root, "short_gap.flac"),
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]",
+        "-map", "[a]", "-c:a", "flac",
+    )
+    set_settings(db, target=-16.0, threshold=12.0)
+    state.put_settings(db, {
+        "general": {
+            "trimSilence": True,
+            "silenceLevelPct": 2.0,
+            "silencePeakDb": -40.0,
+            "silenceMinDuration": 2.5,
+            "silenceFadeOut": 0.4,
+            "silenceFadeIn": 0.4,
+        }
+    })
+    open_windows(db)
+    engine.scan_now("audio")
+    engine.start()
+    run_until_idle(engine, db)
+
+    assert row(db, "long_gap.flac")["status"] == "changed"
+    assert abs((ff.probe(FFMPEG, long_gap).duration or 0.0) - 4.0) < 0.3
+
+    assert row(db, "short_gap.flac")["status"] == "changed"
+    assert abs((ff.probe(FFMPEG, short_gap).duration or 0.0) - 5.0) < 0.3
+
+
