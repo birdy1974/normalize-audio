@@ -17,6 +17,7 @@ DEFAULT_SETTINGS = {
         "dryRun": False, "preserveMtime": True, "mode": "bulk",
         "trimSilence": False, "silenceLevelPct": 2.0, "silencePeakDb": -40.0,
         "silenceMinDuration": 5.0, "silenceFadeOut": 0.5, "silenceFadeIn": 0.5,
+        "coverAuto": False, "coverSources": "both", "discogsToken": "", "useLocalCover": True,
     },
     "audio": {
         "target": -16.0, "truePeak": -1.0, "hysteresis": 0.5, "threshold": 6.0, "override": False,
@@ -37,6 +38,7 @@ MODES = ("off", "bulk", "force", "auto")
 LOSSY_MODES = ("gain", "reencode", "skip")
 WRITE_MODES = ("inplace", "backup", "output")
 ON_CLOSE = ("finish", "pause")
+COVER_SOURCES = ("both", "discogs", "open")
 
 DEFAULT_RUN = {"mode": "stopped", "paused": False, "types": {"audio": True, "video": True},
                "lastFinished": None, "lastScan": None}
@@ -85,8 +87,14 @@ def _validate(key: str, value):
         if not lo <= number <= hi:
             raise ValueError(f"{key} must be between {lo:g} and {hi:g}")
         return round(number, 1)
-    if key in ("override", "dryRun", "preserveMtime", "trimSilence"):
+    if key in ("override", "dryRun", "preserveMtime", "trimSilence", "coverAuto", "useLocalCover"):
         return bool(value)
+    if key == "coverSources":
+        if value not in COVER_SOURCES:
+            raise ValueError("coverSources must be both, discogs or open")
+        return value
+    if key == "discogsToken":
+        return str(value or "").strip()
     if key == "mode":
         if value not in MODES:
             raise ValueError("mode must be off, bulk, force or auto")
@@ -262,3 +270,75 @@ def rotate_endpoint_token(db: Database) -> dict:
     current["endpointToken"] = secrets.token_urlsafe(32)
     db.set_json("ha", {k: current[k] for k in ("url", "token", "endpointToken", "sensors")})
     return get_ha(db)
+
+
+# ---------------------------------------------------------------- Metadata check options
+
+METADATA_FIELDS = ("artist", "title", "album", "album_artist", "year", "track", "genre", "cover")
+METADATA_SOURCES = ("discogs", "musicbrainz", "open")
+
+DEFAULT_METADATA_OPTIONS = {
+    "fields": {f: True for f in METADATA_FIELDS},
+    "checkPath": True,
+    "sources": {s: True for s in METADATA_SOURCES},
+}
+
+
+def _normalize_meta_options(raw: dict) -> dict:
+    fields_map = {f: True for f in METADATA_FIELDS}
+    raw_fields = raw.get("fields")
+    if isinstance(raw_fields, dict):
+        for f in METADATA_FIELDS:
+            if f in raw_fields:
+                fields_map[f] = bool(raw_fields[f])
+    elif isinstance(raw_fields, (list, tuple, set)):
+        chosen = {str(x) for x in raw_fields if str(x) in METADATA_FIELDS}
+        fields_map = {f: (f in chosen) for f in METADATA_FIELDS}
+
+    check_path = True
+    if "check_path_vs_tags" in raw and raw["check_path_vs_tags"] is not None:
+        check_path = bool(raw["check_path_vs_tags"])
+    elif "checkPath" in raw and raw["checkPath"] is not None:
+        check_path = bool(raw["checkPath"])
+
+    sources_map = {s: True for s in METADATA_SOURCES}
+    raw_sources = raw.get("sources")
+    if isinstance(raw_sources, dict):
+        for s in METADATA_SOURCES:
+            if s in raw_sources:
+                sources_map[s] = bool(raw_sources[s])
+    elif isinstance(raw_sources, (list, tuple, set)):
+        chosen_s = {str(x) for x in raw_sources if str(x) in METADATA_SOURCES}
+        sources_map = {s: (s in chosen_s) for s in METADATA_SOURCES}
+
+    return {
+        "fields": [f for f in METADATA_FIELDS if fields_map.get(f, True)],
+        "fields_map": fields_map,
+        "check_path_vs_tags": check_path,
+        "checkPath": check_path,
+        "sources": [s for s in METADATA_SOURCES if sources_map.get(s, True)],
+        "sources_map": sources_map,
+    }
+
+
+def get_metadata_options(db: Database) -> dict:
+    stored = db.get_json("metadata_options", {})
+    return _normalize_meta_options(stored if isinstance(stored, dict) else {})
+
+
+def put_metadata_options(db: Database, patch: dict) -> dict:
+    stored = db.get_json("metadata_options", {})
+    merged = dict(stored if isinstance(stored, dict) else {})
+    if isinstance(patch, dict):
+        merged.update(patch)
+    norm = _normalize_meta_options(merged)
+    db.set_json(
+        "metadata_options",
+        {
+            "fields": norm["fields_map"],
+            "checkPath": norm["checkPath"],
+            "sources": norm["sources_map"],
+        },
+    )
+    return norm
+

@@ -5,6 +5,7 @@ Parked files wait for the user; the run continues with the next file.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -15,7 +16,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from . import ffmpeg as ff
+from . import cover, ffmpeg as ff, metadata
 from . import schedule, state, stats
 from .config import Config, tool_path
 from .decide import decide
@@ -516,6 +517,8 @@ class Engine:
         )
 
         cuts = all_cuts if st["general"].get("trimSilence") else []
+        if media == "audio":
+            self.inspect_file_cover(row)
         if st["general"]["dryRun"]:
             self.db.execute("UPDATE files SET status = 'dryrun' WHERE id = ?", (fid,))
             extra = f", {len(cuts)} silent section(s)" if cuts else ""
@@ -536,6 +539,13 @@ class Engine:
                 self.db.log("warn", f"{row['name']}: change {d.gain:+.1f} dB is large, parked for review", media)
         else:
             self._apply(row, cfg_m, st, d.method, d.gain, probe, family, cancel, cuts=cuts)
+
+        if media == "audio" and st["general"].get("coverAuto"):
+            fresh = self.db.one("SELECT * FROM files WHERE id = ?", (fid,)) or row
+            try:
+                self.check_file_cover(fresh, st, online=True)
+            except Exception as exc:
+                log.debug("cover check during run failed for %s: %s", rel, exc)
 
     def _detect_empty_sections(self, media: str, src: str, lufs: float, probe: ff.Probe,
                                gen: dict, cancel) -> list[tuple[float, float]]:
@@ -597,6 +607,7 @@ class Engine:
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
         applied = round(gain, 2) if abs(gain) >= 0.05 else 0.0
         gen = st["general"]
+        prior_cover = cover.extract_cover(src) if media == "audio" and method not in GAIN_TOOLS else None
         try:
             if method in GAIN_TOOLS:
                 steps = math.floor(gain / 1.5) if gain > 0 else round(gain / 1.5)
@@ -616,6 +627,12 @@ class Engine:
             expected_dur = sum(e - s for s, e, _, _ in kept) if has_cuts else None
             ff.verify(self.cfg.ffmpeg, tmp, probe, cancel, expected_duration=expected_dur)
             self._commit(src, tmp, final, media, rel, mode, st["general"]["preserveMtime"])
+            if prior_cover and not cover.inspect_audio(final)["has_cover"]:
+                try:
+                    cover.embed_cover(final, prior_cover[0], mime=prior_cover[1],
+                                      preserve_mtime=st["general"]["preserveMtime"])
+                except Exception:
+                    pass
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -787,6 +804,13 @@ class Engine:
             (lufs, true_peak, gain_db, d.method, sil_count, sil_dur, time.time(),
              probe.codec, family, media, rel),
         )
+        if media == "audio":
+            row = self.db.one("SELECT * FROM files WHERE media = ? AND relpath = ?", (media, rel))
+            if row:
+                if st["general"].get("coverAuto") and not st["general"].get("dryRun"):
+                    self.check_file_cover(row, st, online=True)
+                else:
+                    self.inspect_file_cover(row)
         self.db.log("info", f"Level checked: {name} {lufs:.1f} LUFS, true peak {true_peak:.1f} dBTP"
                             + (f", {sil_count} empty section(s) ({sil_dur:.1f} s)" if sil_count else ""), media)
         return {"name": name, "relpath": rel, "lufs": lufs, "true_peak": true_peak,
@@ -843,3 +867,685 @@ class Engine:
             if after and after["status"] == "changed":
                 changed += 1
         return {"executed": executed, "changed": changed}
+
+    # ------------------------------------------------------------ cover art
+
+    def inspect_file_cover(self, row: dict) -> dict:
+        """Read local audio tags and embedded cover presence, resolving search metadata
+        (including overriding ID3 tags with folder/file name when totally different)."""
+        if row.get("media", "audio") != "audio":
+            return {"has_cover": 0, "cover_status": None, "artist": "", "album": "", "title": "", "source": ""}
+        src = self.abs_path("audio", row["relpath"])
+        info = cover.inspect_audio(src)
+        meta = cover.resolve_search_metadata(row["relpath"], info)
+        has_cover = 1 if info["has_cover"] else 0
+        prior_status = row.get("cover_status")
+        if has_cover:
+            c_status = "embedded" if prior_status == "embedded" else "ok"
+            c_candidates = None
+        else:
+            c_status = prior_status if prior_status in ("choices", "not_found", "skipped") else "missing"
+            c_candidates = row.get("cover_candidates") if c_status == "choices" else None
+        self.db.execute(
+            "UPDATE files SET has_cover = ?, cover_status = ?, cover_candidates = ?, "
+            "tag_artist = ?, tag_album = ?, tag_title = ?, cover_query_source = ? WHERE id = ?",
+            (has_cover, c_status, c_candidates, meta["artist"], meta["album"], meta["title"], meta["source"], row["id"]),
+        )
+        return {
+            "has_cover": has_cover,
+            "cover_status": c_status,
+            **meta,
+        }
+
+    def _embed_into_row(self, row: dict, image_bytes: bytes, mime: str, st: dict) -> None:
+        src = self.abs_path("audio", row["relpath"])
+        if not os.path.isfile(src):
+            raise ValueError("file not found on disk")
+        if st["audio"]["writeMode"] == "backup":
+            self._backup(src, "audio", row["relpath"])
+        cover.embed_cover(src, image_bytes, mime=mime, preserve_mtime=st["general"].get("preserveMtime", True))
+        self.db.execute(
+            "UPDATE files SET has_cover = 1, cover_status = 'embedded', cover_candidates = NULL WHERE id = ?",
+            (row["id"],),
+        )
+
+    def check_file_cover(self, row: dict, st: dict | None = None, *,
+                         online: bool = True, force_refresh: bool = False) -> dict:
+        """Inspect a file's cover; if missing and online=True, search Discogs/open sources.
+        Single match -> auto-embed; multiple matches -> park in cover_status='choices'."""
+        if row["media"] != "audio":
+            return {"status": "unsupported", "has_cover": 0, "candidates": []}
+        inspected = self.inspect_file_cover(row)
+        if inspected["has_cover"] and not force_refresh:
+            return {"status": inspected["cover_status"], "has_cover": 1, "candidates": [], **inspected}
+        if not online:
+            return {"status": inspected["cover_status"], "has_cover": 0, "candidates": [], **inspected}
+
+        st = st or state.get_settings(self.db)
+        gen = st["general"]
+        src = self.abs_path("audio", row["relpath"])
+
+        if gen.get("useLocalCover", True) and not force_refresh:
+            local = cover.find_local_cover(src)
+            if local:
+                if not gen.get("dryRun", False):
+                    data, mime = cover.download_cover(local["image_url"])
+                    self._embed_into_row(row, data, mime, st)
+                    self.db.log("ok", f"{row['name']}: embedded cover art from {local['title']}", "audio")
+                    return {"status": "embedded", "has_cover": 1, "candidates": [local], **inspected}
+
+        candidates = cover.search_covers(
+            inspected["artist"], inspected["album"], inspected["title"],
+            st, db=self.db, force_refresh=force_refresh,
+        )
+        if len(candidates) == 1:
+            cand = candidates[0]
+            if gen.get("dryRun", False):
+                self.db.log("info", f"{row['name']}: dry run, would embed cover '{cand['title']}' ({cand['source']})", "audio")
+                return {"status": "dryrun", "has_cover": 0, "candidates": candidates, **inspected}
+            try:
+                data, mime = cover.download_cover(cand["image_url"], token=gen.get("discogsToken", ""))
+                self._embed_into_row(row, data, mime, st)
+                self.db.log("ok", f"{row['name']}: embedded cover art '{cand['title']}' ({cand['source']})", "audio")
+                return {"status": "embedded", "has_cover": 1, "candidates": candidates, **inspected}
+            except Exception as exc:
+                self.db.log("error", f"{row['name']}: cover download failed ({exc})", "audio")
+                return {"status": "error", "has_cover": 0, "candidates": candidates, **inspected}
+
+        if len(candidates) > 1:
+            self.db.execute(
+                "UPDATE files SET has_cover = 0, cover_status = 'choices', cover_candidates = ? WHERE id = ?",
+                (json.dumps(candidates), row["id"]),
+            )
+            self.db.log(
+                "warn",
+                f"{row['name']}: {len(candidates)} cover pictures found, parked for cover selection",
+                "audio",
+            )
+            return {"status": "choices", "has_cover": 0, "candidates": candidates, **inspected}
+
+        self.db.execute(
+            "UPDATE files SET has_cover = 0, cover_status = 'not_found', cover_candidates = '[]' WHERE id = ?",
+            (row["id"],),
+        )
+        return {"status": "not_found", "has_cover": 0, "candidates": [], **inspected}
+
+    def search_file_covers(self, fid: int, *, artist: str | None = None, album: str | None = None,
+                           title: str | None = None, source_mode: str | None = None,
+                           force_refresh: bool = False) -> dict:
+        """Interactive cover search for a file or album (used by the Cover Picker modal)."""
+        row = self.db.one("SELECT * FROM files WHERE id = ?", (fid,))
+        if not row or row["media"] != "audio":
+            raise ValueError("audio file not found")
+        inspected = self.inspect_file_cover(row)
+        q_artist = inspected["artist"] if artist is None else artist.strip()
+        q_album = inspected["album"] if album is None else album.strip()
+        q_title = inspected["title"] if title is None else title.strip()
+
+        st = state.get_settings(self.db)
+        if source_mode in ("both", "discogs", "open"):
+            st = {**st, "general": {**st["general"], "coverSources": source_mode}}
+
+        candidates = []
+        src = self.abs_path("audio", row["relpath"])
+        local = cover.find_local_cover(src)
+        if local:
+            candidates.append(local)
+        online = cover.search_covers(q_artist, q_album, q_title, st, db=self.db, force_refresh=force_refresh)
+        seen_urls = {c["image_url"] for c in candidates}
+        for c in online:
+            if c["image_url"] not in seen_urls:
+                candidates.append(c)
+                seen_urls.add(c["image_url"])
+
+        if not inspected["has_cover"]:
+            new_status = "choices" if len(candidates) > 1 else ("not_found" if not candidates else row.get("cover_status") or "missing")
+            self.db.execute(
+                "UPDATE files SET cover_status = ?, cover_candidates = ?, tag_artist = ?, tag_album = ?, tag_title = ? WHERE id = ?",
+                (new_status, json.dumps(candidates) if candidates else "[]", q_artist, q_album, q_title, fid),
+            )
+        # Count how many files belong to the same album/folder for the "Apply to album" button
+        album_rows = self._album_rows_for(row, q_album)
+        return {
+            "file_id": fid,
+            "name": row["name"],
+            "relpath": row["relpath"],
+            "dir": row["dir"],
+            "has_cover": inspected["has_cover"],
+            "cover_status": row.get("cover_status"),
+            "artist": q_artist,
+            "album": q_album,
+            "title": q_title,
+            "query_source": inspected["source"],
+            "tag_artist": inspected["tag_artist"],
+            "tag_album": inspected["tag_album"],
+            "tag_title": inspected["tag_title"],
+            "path_artist": inspected["path_artist"],
+            "path_album": inspected["path_album"],
+            "path_title": inspected["path_title"],
+            "album_file_count": len(album_rows),
+            "candidates": candidates,
+        }
+
+    def _album_rows_for(self, row: dict, album_override: str | None = None) -> list[dict]:
+        """Return all audio files in the same album (same folder + matching album or all in folder)."""
+        album = (album_override if album_override is not None else (row.get("tag_album") or "")).strip()
+        folder_rows = self.db.query(
+            "SELECT * FROM files WHERE media = 'audio' AND dir = ? ORDER BY name",
+            (row["dir"],),
+        )
+        if not album or len(folder_rows) <= 1:
+            return folder_rows
+        matching = [r for r in folder_rows if (r.get("tag_album") or "").strip().lower() == album.lower()]
+        return matching if len(matching) >= 2 else folder_rows
+
+    def apply_cover(self, fid: int, image_url: str, scope: str = "file",
+                    target_ids: list[int] | None = None, only_missing: bool = False) -> dict:
+        """Download the selected cover picture and embed it into the file, album, or folder."""
+        row = self.db.one("SELECT * FROM files WHERE id = ?", (fid,))
+        if not row or row["media"] != "audio":
+            raise ValueError("audio file not found")
+        st = state.get_settings(self.db)
+        if st["general"].get("dryRun"):
+            raise ValueError("Dry run is on: turn it off in Settings to write cover art")
+        data, mime = cover.download_cover(image_url, token=st["general"].get("discogsToken", ""))
+
+        if target_ids:
+            placeholders = ",".join("?" for _ in target_ids)
+            targets = self.db.query(
+                f"SELECT * FROM files WHERE media = 'audio' AND id IN ({placeholders}) ORDER BY name",
+                target_ids,
+            )
+        elif scope in ("album", "dir"):
+            targets = (
+                self.db.query("SELECT * FROM files WHERE media = 'audio' AND dir = ? ORDER BY name", (row["dir"],))
+                if scope == "dir"
+                else self._album_rows_for(row)
+            )
+        else:
+            targets = [row]
+
+        if only_missing and len(targets) > 1:
+            targets = [r for r in targets if not r.get("has_cover")]
+
+        updated = 0
+        for r in targets:
+            if r["status"] == "processing":
+                continue
+            try:
+                self._embed_into_row(r, data, mime, st)
+                updated += 1
+            except Exception as exc:
+                self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
+
+        label = row["name"] if len(targets) == 1 else f"{row['dir']} ({updated} files)"
+        if updated:
+            self.db.log("ok", f"Cover art embedded: {label}", "audio")
+        return {"ok": True, "updated": updated, "scope": scope}
+
+    def skip_cover(self, ids: list[int]) -> dict:
+        if not ids:
+            return {"skipped": 0}
+        placeholders = ",".join("?" for _ in ids)
+        n = self.db.execute(
+            f"UPDATE files SET cover_status = 'skipped', cover_candidates = NULL "
+            f"WHERE media = 'audio' AND id IN ({placeholders})",
+            ids,
+        )
+        return {"skipped": n}
+
+    def check_covers_batch(self, ids: list[int] | None = None, dir_rel: str | None = None,
+                           enabled_only: bool = False) -> dict:
+        """Check and propose/embed missing cover art for selected files, a folder, or all enabled folders."""
+        st = state.get_settings(self.db)
+        if ids:
+            rows = self._target_rows("audio", ids, None)
+        elif dir_rel is not None:
+            rows = self._target_rows("audio", None, dir_rel)
+        elif enabled_only:
+            rows = self.db.query(
+                "SELECT f.* FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+                "WHERE d.media = 'audio' AND d.enabled = 1 ORDER BY f.dir, f.name"
+            )
+        else:
+            rows = []
+
+        checked = embedded = choices = not_found = present = 0
+        for r in rows:
+            if r["status"] == "processing":
+                continue
+            try:
+                res = self.check_file_cover(r, st, online=True)
+                checked += 1
+                st_code = res.get("status")
+                if st_code == "ok":
+                    present += 1
+                elif st_code == "embedded":
+                    embedded += 1
+                elif st_code == "choices":
+                    choices += 1
+                elif st_code == "not_found":
+                    not_found += 1
+            except Exception as exc:
+                self.db.log("error", f"{r['name']}: cover check failed ({exc})", "audio")
+        return {
+            "checked": checked,
+            "present": present,
+            "embedded": embedded,
+            "choices": choices,
+            "not_found": not_found,
+        }
+
+    def apply_first_cover_all(self, ids: list[int] | None = None) -> dict:
+        """Bulk-apply the primary (first) candidate cover to all or selected multi-choice files."""
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            rows = self.db.query(
+                f"SELECT * FROM files WHERE media = 'audio' AND cover_status = 'choices' AND id IN ({placeholders}) ORDER BY dir, name",
+                ids,
+            )
+        else:
+            rows = self.db.query(
+                "SELECT f.* FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+                "WHERE d.media = 'audio' AND d.enabled = 1 AND f.cover_status = 'choices' ORDER BY f.dir, f.name"
+            )
+        st = state.get_settings(self.db)
+        if st["general"].get("dryRun"):
+            raise ValueError("Dry run is on: turn it off in Settings to write cover art")
+        downloaded: dict[str, tuple[bytes, str]] = {}
+        updated = 0
+        for r in rows:
+            if r["status"] == "processing":
+                continue
+            try:
+                cands = json.loads(r.get("cover_candidates") or "[]")
+            except Exception:
+                cands = []
+            if not cands:
+                continue
+            url = cands[0].get("image_url")
+            if not url:
+                continue
+            try:
+                if url not in downloaded:
+                    downloaded[url] = cover.download_cover(url, token=st["general"].get("discogsToken", ""))
+                data, mime = downloaded[url]
+                self._embed_into_row(r, data, mime, st)
+                updated += 1
+            except Exception as exc:
+                self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
+        if updated:
+            self.db.log("ok", f"Bulk embedded cover art into {updated} file(s)", "audio")
+        return {"updated": updated}
+
+    # ------------------------------------------------------------ full metadata check & update
+
+    def check_file_metadata(self, row: dict, options: dict | None = None, st: dict | None = None, *,
+                            force_refresh: bool = False, custom_query: dict | None = None) -> dict:
+        """Check all enabled metadata fields for one audio file against folder/file name and internet sources."""
+        if row.get("media", "audio") != "audio":
+            raise ValueError("metadata checking is available for audio files only")
+        src = self.abs_path("audio", row["relpath"])
+        if not os.path.isfile(src):
+            raise ValueError("audio file not found on disk")
+
+        opts = options or state.get_metadata_options(self.db)
+        st = st or state.get_settings(self.db)
+
+        current = metadata.read_full_tags(src)
+        path_meta = metadata.parse_path_full(row["relpath"])
+        resolved = cover.resolve_search_metadata(row["relpath"], current)
+
+        q_artist = (custom_query.get("artist") if custom_query and "artist" in custom_query else resolved["artist"]) or ""
+        q_album = (custom_query.get("album") if custom_query and "album" in custom_query else resolved["album"]) or ""
+        q_title = (custom_query.get("title") if custom_query and "title" in custom_query else resolved["title"]) or ""
+        q_track = path_meta.get("track") or current.get("track") or ""
+
+        online_meta = metadata.lookup_online_metadata(
+            q_artist, q_album, q_title, q_track,
+            opts, st, db=self.db, force_refresh=force_refresh,
+        )
+        cmp = metadata.compare_file_metadata(row["relpath"], current, path_meta, online_meta, opts)
+        now_ts = time.time()
+
+        self.db.execute(
+            "INSERT INTO file_metadata (file_id, status, current_json, path_json, online_json, selected_json, diffs_json, path_diff, checked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(file_id) DO UPDATE SET status = excluded.status, current_json = excluded.current_json, "
+            "path_json = excluded.path_json, online_json = excluded.online_json, selected_json = excluded.selected_json, "
+            "diffs_json = excluded.diffs_json, path_diff = excluded.path_diff, checked_at = excluded.checked_at",
+            (
+                row["id"],
+                cmp["status"],
+                json.dumps(current),
+                json.dumps(path_meta),
+                json.dumps(online_meta),
+                json.dumps(cmp["selected"]),
+                json.dumps(cmp["diffs"]),
+                cmp["path_diff"],
+                now_ts,
+            ),
+        )
+        has_cov = 1 if current.get("cover") == "present" else 0
+        self.db.execute(
+            "UPDATE files SET has_cover = ?, tag_artist = ?, tag_album = ?, tag_title = ?, cover_query_source = ? WHERE id = ?",
+            (has_cov, resolved["artist"], resolved["album"], resolved["title"], resolved["source"], row["id"]),
+        )
+        album_rows = self._album_rows_for(row, q_album)
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "relpath": row["relpath"],
+            "dir": row["dir"],
+            "ext": row["ext"],
+            "has_cover": has_cov,
+            "status": cmp["status"],
+            "diffs": cmp["diffs"],
+            "diff_count": len(cmp["diffs"]),
+            "path_diff": bool(cmp["path_diff"]),
+            "path_diff_count": len(cmp["path_mismatches"]),
+            "path_mismatches": cmp["path_mismatches"],
+            "query_source": resolved["source"],
+            "online_source": online_meta.get("source") or "",
+            "online_score": online_meta.get("score") or 0,
+            "current": current,
+            "path": path_meta,
+            "online": online_meta,
+            "selected": cmp["selected"],
+            "fields": cmp["fields"],
+            "album_file_count": len(album_rows),
+            "checked_at": now_ts,
+        }
+
+    def check_metadata_batch(self, ids: list[int] | None = None, dir_rel: str | None = None,
+                             options: dict | None = None, *, force: bool = False) -> dict:
+        """Run metadata check across selected files, a directory, or all enabled audio directories."""
+        if options:
+            opts = state.put_metadata_options(self.db, options)
+        else:
+            opts = state.get_metadata_options(self.db)
+        st = state.get_settings(self.db)
+
+        if ids:
+            rows = self._target_rows("audio", ids, None)
+        elif dir_rel is not None:
+            rows = self._target_rows("audio", None, dir_rel)
+        else:
+            rows = self.db.query(
+                "SELECT f.* FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+                "WHERE d.media = 'audio' AND d.enabled = 1 ORDER BY f.dir, f.name"
+            )
+
+        checked = diff = ok = path_diff = 0
+        for r in rows:
+            if r["status"] == "processing":
+                continue
+            try:
+                res = self.check_file_metadata(r, opts, st, force_refresh=force)
+                checked += 1
+                if res["status"] == "diff":
+                    diff += 1
+                else:
+                    ok += 1
+                if res["path_diff"]:
+                    path_diff += 1
+            except Exception as exc:
+                self.db.log("error", f"{r['name']}: metadata check failed ({exc})", "audio")
+        self.db.log("info", f"Meta data checked: {checked} file(s), {diff} with differences", "audio")
+        return {"checked": checked, "diff": diff, "ok": ok, "path_diff": path_diff}
+
+    def get_metadata_results(self) -> dict:
+        """Return current metadata check options, summary counts, and comparison rows for enabled audio folders."""
+        opts = state.get_metadata_options(self.db)
+        rows = self.db.query(
+            "SELECT f.id, f.name, f.relpath, f.dir, f.ext, f.has_cover, f.cover_query_source, "
+            "m.status AS meta_status, m.current_json, m.path_json, m.online_json, "
+            "m.selected_json, m.diffs_json, m.path_diff, m.checked_at "
+            "FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+            "LEFT JOIN file_metadata m ON m.file_id = f.id "
+            "WHERE d.media = 'audio' AND d.enabled = 1 ORDER BY f.dir, f.name"
+        )
+        items: list[dict] = []
+        folders_set: set[str] = set()
+        total_in_scope = len(rows)
+        checked = diff = ok = path_diff = 0
+
+        for r in rows:
+            folders_set.add(r["dir"])
+            if not r["meta_status"]:
+                continue
+            checked += 1
+            try:
+                current = json.loads(r["current_json"] or "{}")
+                path_meta = json.loads(r["path_json"] or "{}")
+                online_meta = json.loads(r["online_json"] or "{}")
+                existing_sel = json.loads(r["selected_json"] or "{}")
+            except Exception:
+                continue
+            cmp = metadata.compare_file_metadata(r["relpath"], current, path_meta, online_meta, opts, existing_sel)
+            if cmp["status"] == "diff":
+                diff += 1
+            else:
+                ok += 1
+            if cmp["path_diff"]:
+                path_diff += 1
+            has_cov = 1 if current.get("cover") == "present" else int(r.get("has_cover") or 0)
+            items.append({
+                "id": r["id"],
+                "name": r["name"],
+                "relpath": r["relpath"],
+                "dir": r["dir"],
+                "ext": r["ext"],
+                "has_cover": has_cov,
+                "status": cmp["status"],
+                "diffs": cmp["diffs"],
+                "diff_count": len(cmp["diffs"]),
+                "path_diff": bool(cmp["path_diff"]),
+                "path_diff_count": len(cmp["path_mismatches"]),
+                "path_mismatches": cmp["path_mismatches"],
+                "query_source": r.get("cover_query_source") or cmp.get("query_source") or "tags",
+                "online_source": online_meta.get("source") or "",
+                "online_score": online_meta.get("score") or 0,
+                "current": current,
+                "path": path_meta,
+                "online": online_meta,
+                "selected": cmp["selected"],
+                "fields": cmp["fields"],
+                "checked_at": r["checked_at"],
+            })
+
+        dirs_stat = self.db.one(
+            "SELECT COUNT(*) AS total, COALESCE(SUM(enabled), 0) AS enabled "
+            "FROM dirs WHERE media = 'audio' AND relpath != '.'"
+        )
+        enabled_dirs = dirs_stat["enabled"] if dirs_stat else 0
+        total_dirs = dirs_stat["total"] if dirs_stat else 0
+        return {
+            "options": opts,
+            "files": items,
+            "folders": sorted(folders_set),
+            "enabled_folders": enabled_dirs,
+            "total_folders": total_dirs,
+            "total_files_in_scope": total_in_scope,
+            "checked_count": checked,
+            "diff_count": diff,
+            "path_diff_count": path_diff,
+            "counts": {
+                "total_in_scope": total_in_scope,
+                "checked": checked,
+                "diff": diff,
+                "ok": ok,
+                "path_diff": path_diff,
+                "directories_enabled": enabled_dirs,
+                "directories_total": total_dirs,
+            },
+        }
+
+    def select_metadata_choice(self, ids: list[int], field: str | None = None,
+                               choice: str = "online", custom_value: str | None = None) -> dict:
+        """Update the chosen source ('current', 'path', 'online', 'custom') for one field or all differing fields."""
+        if not ids:
+            return {"updated": 0}
+        if field == "all":
+            field = None
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.db.query(
+            f"SELECT file_id, current_json, path_json, online_json, selected_json, diffs_json "
+            f"FROM file_metadata WHERE file_id IN ({placeholders})",
+            ids,
+        )
+        updated = 0
+        for r in rows:
+            try:
+                current = json.loads(r["current_json"] or "{}")
+                path_meta = json.loads(r["path_json"] or "{}")
+                online_meta = json.loads(r["online_json"] or "{}")
+                selected = json.loads(r["selected_json"] or "{}")
+                diffs = json.loads(r["diffs_json"] or "[]")
+            except Exception:
+                continue
+
+            target_fields = [field] if field else (diffs or list(state.METADATA_FIELDS))
+            for f in target_fields:
+                if f not in state.METADATA_FIELDS:
+                    continue
+                if choice == "custom":
+                    val = str(custom_value if custom_value is not None else "").strip()
+                    selected[f] = {"choice": "custom", "value": val}
+                elif choice == "current":
+                    selected[f] = {"choice": "current", "value": str(current.get(f) or "").strip()}
+                elif choice == "path":
+                    p_val = str(path_meta.get(f) or "").strip()
+                    if p_val or field:
+                        selected[f] = {"choice": "path", "value": p_val}
+                elif choice == "online":
+                    o_val = str(online_meta.get(f) or "").strip()
+                    if o_val or field:
+                        selected[f] = {"choice": "online", "value": o_val}
+
+            self.db.execute(
+                "UPDATE file_metadata SET selected_json = ? WHERE file_id = ?",
+                (json.dumps(selected), r["file_id"]),
+            )
+            updated += 1
+        return {"updated": updated}
+
+    def apply_metadata(self, ids: list[int], field_overrides: dict | None = None,
+                       scope: str = "file") -> dict:
+        """Write selected metadata changes to the specified audio file(s) (or whole album),
+        strictly preserving each file's timestamp on disk."""
+        if not ids:
+            return {"updated": 0}
+        st = state.get_settings(self.db)
+        if st["general"].get("dryRun"):
+            raise ValueError("Dry run is on: turn it off in Settings to update metadata")
+        opts = state.get_metadata_options(self.db)
+        enabled_fields = opts.get("fields_map") or {f: True for f in state.METADATA_FIELDS}
+        token = st["general"].get("discogsToken", "")
+
+        if scope == "album" and len(ids) == 1:
+            first_row = self.db.one("SELECT * FROM files WHERE id = ?", (ids[0],))
+            if first_row:
+                album_rows = self._album_rows_for(first_row)
+                ids = [r["id"] for r in album_rows]
+
+        placeholders = ",".join("?" for _ in ids)
+        rows = self.db.query(
+            f"SELECT f.*, m.current_json, m.path_json, m.online_json, m.selected_json "
+            f"FROM files f LEFT JOIN file_metadata m ON m.file_id = f.id "
+            f"WHERE f.media = 'audio' AND f.id IN ({placeholders}) ORDER BY f.dir, f.name",
+            ids,
+        )
+        ALBUM_SHARED_FIELDS = ("artist", "album", "album_artist", "year", "genre", "cover")
+        updated = 0
+
+        for idx, r in enumerate(rows):
+            if r["status"] == "processing":
+                continue
+            src = self.abs_path("audio", r["relpath"])
+            if not os.path.isfile(src):
+                continue
+            try:
+                current = json.loads(r["current_json"] or "{}") if r.get("current_json") else metadata.read_full_tags(src)
+                path_meta = json.loads(r["path_json"] or "{}") if r.get("path_json") else metadata.parse_path_full(r["relpath"])
+                online_meta = json.loads(r["online_json"] or "{}") if r.get("online_json") else {}
+                selected = json.loads(r["selected_json"] or "{}") if r.get("selected_json") else {}
+            except Exception:
+                current = metadata.read_full_tags(src)
+                path_meta = metadata.parse_path_full(r["relpath"])
+                online_meta = {}
+                selected = {}
+
+            if field_overrides and isinstance(field_overrides, dict):
+                for fk, fv in field_overrides.items():
+                    if fk not in state.METADATA_FIELDS:
+                        continue
+                    # When applying to a multi-file album from a single file modal, only share album-level fields
+                    if scope == "album" and len(rows) > 1 and idx > 0 and fk not in ALBUM_SHARED_FIELDS:
+                        continue
+                    if isinstance(fv, dict):
+                        selected[fk] = fv
+                    else:
+                        selected[fk] = {"choice": "custom", "value": str(fv)}
+
+            updates: dict[str, Any] = {}
+            for f in state.METADATA_FIELDS:
+                if not enabled_fields.get(f, True) and not (field_overrides and f in field_overrides):
+                    continue
+                sel_item = selected.get(f)
+                if not sel_item or not isinstance(sel_item, dict):
+                    continue
+                choice = sel_item.get("choice", "current")
+                val = str(sel_item.get("value") or "").strip()
+                if choice == "current":
+                    continue
+                if val and metadata._values_differ(f, str(current.get(f) or ""), val):
+                    updates[f] = val
+
+            if not updates:
+                continue
+
+            try:
+                if st["audio"]["writeMode"] == "backup":
+                    self._backup(src, "audio", r["relpath"])
+                metadata.write_full_tags(src, updates, discogs_token=token)
+                new_current = metadata.read_full_tags(src)
+                cmp = metadata.compare_file_metadata(r["relpath"], new_current, path_meta, online_meta, opts)
+                self.db.execute(
+                    "INSERT INTO file_metadata (file_id, status, current_json, path_json, online_json, selected_json, diffs_json, path_diff, checked_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(file_id) DO UPDATE SET status = excluded.status, current_json = excluded.current_json, "
+                    "selected_json = excluded.selected_json, diffs_json = excluded.diffs_json, path_diff = excluded.path_diff",
+                    (
+                        r["id"],
+                        cmp["status"],
+                        json.dumps(new_current),
+                        json.dumps(path_meta),
+                        json.dumps(online_meta),
+                        json.dumps(cmp["selected"]),
+                        json.dumps(cmp["diffs"]),
+                        cmp["path_diff"],
+                        time.time(),
+                    ),
+                )
+                has_cov = 1 if new_current.get("cover") == "present" else 0
+                c_stat = "embedded" if ("cover" in updates and has_cov) else (r.get("cover_status") or ("ok" if has_cov else "missing"))
+                self.db.execute(
+                    "UPDATE files SET has_cover = ?, cover_status = ?, tag_artist = ?, tag_album = ?, tag_title = ? WHERE id = ?",
+                    (
+                        has_cov,
+                        c_stat,
+                        new_current.get("artist") or r.get("tag_artist") or "",
+                        new_current.get("album") or r.get("tag_album") or "",
+                        new_current.get("title") or r.get("tag_title") or "",
+                        r["id"],
+                    ),
+                )
+                updated += 1
+            except Exception as exc:
+                self.db.log("error", f"{r['name']}: failed to update metadata ({exc})", "audio")
+
+        if updated:
+            self.db.log("ok", f"Updated metadata for {updated} file(s)", "audio")
+        return {"updated": updated}
+

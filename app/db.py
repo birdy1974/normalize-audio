@@ -43,12 +43,42 @@ CREATE TABLE IF NOT EXISTS files (
     silent_sections INTEGER NOT NULL DEFAULT 0,
     silent_duration REAL NOT NULL DEFAULT 0,
     silence_trimmed INTEGER NOT NULL DEFAULT 0,
+    has_cover INTEGER,
+    cover_status TEXT,
+    cover_candidates TEXT,
+    tag_artist TEXT,
+    tag_album TEXT,
+    tag_title TEXT,
+    cover_query_source TEXT,
     seen_at REAL NOT NULL,
     UNIQUE (media, relpath)
 );
 CREATE INDEX IF NOT EXISTS files_status ON files(media, status);
 CREATE INDEX IF NOT EXISTS files_dir ON files(media, dir);
 CREATE INDEX IF NOT EXISTS files_dir_status ON files(media, dir, status);
+CREATE INDEX IF NOT EXISTS files_cover_status ON files(media, cover_status);
+CREATE TABLE IF NOT EXISTS cover_cache (
+    query_key TEXT PRIMARY KEY,
+    candidates TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_metadata (
+    file_id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'unchecked',
+    current_json TEXT NOT NULL DEFAULT '{}',
+    path_json TEXT NOT NULL DEFAULT '{}',
+    online_json TEXT NOT NULL DEFAULT '{}',
+    selected_json TEXT NOT NULL DEFAULT '{}',
+    diffs_json TEXT NOT NULL DEFAULT '[]',
+    path_diff INTEGER NOT NULL DEFAULT 0,
+    checked_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS file_metadata_status ON file_metadata(status);
+CREATE TABLE IF NOT EXISTS metadata_cache (
+    query_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -80,9 +110,17 @@ class Database:
                 ("silent_sections", "INTEGER NOT NULL DEFAULT 0"),
                 ("silent_duration", "REAL NOT NULL DEFAULT 0"),
                 ("silence_trimmed", "INTEGER NOT NULL DEFAULT 0"),
+                ("has_cover", "INTEGER"),
+                ("cover_status", "TEXT"),
+                ("cover_candidates", "TEXT"),
+                ("tag_artist", "TEXT"),
+                ("tag_album", "TEXT"),
+                ("tag_title", "TEXT"),
+                ("cover_query_source", "TEXT"),
             ):
                 if col not in cols:
                     self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} {ddl}")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS files_cover_status ON files(media, cover_status)")
 
     def query(self, sql: str, args=()) -> list[dict]:
         with self._lock:
