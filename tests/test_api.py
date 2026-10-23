@@ -590,7 +590,22 @@ def test_the_mode_setting_switches_the_app_on_and_off(client, cfg):
     assert client.get("/api/dashboard").json()["run_mode"] == "active"
     assert client.post("/api/run/stop").status_code == 200
 
-    # only the three modes exist
+    # force: stops an active run when selected, and re-queues files in enabled folders on Start
+    client.app_state.db.execute("UPDATE files SET status = 'ok', measured_at = 1")
+    assert client.post("/api/folders/toggle", json={"media": "audio", "relpath": "Old", "enabled": False}).status_code == 200
+    assert client.put("/api/settings", json={"general": {"mode": "force"}}).status_code == 200
+    d = client.get("/api/dashboard").json()
+    assert d["mode"] == "force" and d["status"] == "stopped" and d["run_mode"] == "stopped"
+    assert d["next_scan"] is None
+    assert client.post("/api/run/start").status_code == 200
+    d = client.get("/api/dashboard").json()
+    assert d["run_mode"] == "active"
+    assert d["media"]["audio"]["files_pending"] == 1         # Music/a.flac re-queued; Old/* left untouched
+    assert d["media"]["audio"]["files_checked"] == 0
+    assert client.app_state.db.one("SELECT status FROM files WHERE relpath = 'Old/b.flac'")["status"] == "ok"
+    assert client.post("/api/run/stop").status_code == 200
+
+    # only the four modes exist
     assert client.put("/api/settings", json={"general": {"mode": "always"}}).status_code == 400
 
 
@@ -617,6 +632,9 @@ def test_ha_exposes_the_mode_and_the_scan_times(client, cfg):
     headers = {"Authorization": f"Bearer {token}"}
     body = client.get("/api/v1/ha/status", headers=headers).json()
     assert body["mode"] == "bulk"
+    client.put("/api/settings", json={"general": {"mode": "force"}})
+    body = client.get("/api/v1/ha/status", headers=headers).json()
+    assert body["status"] == "stopped" and body["mode"] == "force" and body["next_scan"] is None
     client.put("/api/settings", json={"general": {"mode": "off"}})
     body = client.get("/api/v1/ha/status", headers=headers).json()
     assert body["status"] == "off" and body["mode"] == "off" and body["next_scan"] is None

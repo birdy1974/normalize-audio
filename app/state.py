@@ -11,6 +11,7 @@ DEFAULT_SETTINGS = {
     # mode: what the app does on its own
     #   off   nothing is scanned or normalized (manual reads still work)
     #   bulk  only a run started by the user checks and normalizes enabled folders; no periodic scan
+    #   force like bulk, but a started run checks and normalizes all files in enabled folders again (even if already checked)
     #   auto  new and changed files are found every "scanEvery" minutes and normalized by themselves
     "general": {"dryRun": False, "preserveMtime": True, "mode": "bulk"},
     "audio": {
@@ -24,7 +25,7 @@ DEFAULT_SETTINGS = {
 }
 
 RANGES = {"target": (-30.0, -10.0), "truePeak": (-6.0, -1.0), "threshold": (1.0, 12.0)}
-MODES = ("off", "bulk", "auto")
+MODES = ("off", "bulk", "force", "auto")
 LOSSY_MODES = ("gain", "reencode", "skip")
 WRITE_MODES = ("inplace", "backup", "output")
 ON_CLOSE = ("finish", "pause")
@@ -80,7 +81,7 @@ def _validate(key: str, value):
         return bool(value)
     if key == "mode":
         if value not in MODES:
-            raise ValueError("mode must be off, bulk or auto")
+            raise ValueError("mode must be off, bulk, force or auto")
         return value
     if key == "lossy":
         if value not in LOSSY_MODES:

@@ -43,13 +43,15 @@ class Engine:
         self.scanner = Scanner(cfg, db)
         self.tools = {name for name in GAIN_TOOLS if tool_path(getattr(cfg, name))}
         self._lock = threading.Lock()
+        self._tick_lock = threading.Lock()
         self._scan_lock = threading.Lock()
         self._scanning = 0                     # scans running (the periodic one and manual ones)
         self._inflight: dict[int, dict] = {}    # file id -> {future, relpath, media, approved}
         self._cancel: set[int] = set()
         self._had_work = False
-        self._mode_seen: str | None = None     # the app mode (off / bulk / auto) last applied
+        self._mode_seen: str | None = None     # the app mode (off / bulk / force / auto) last applied
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._threads: list[threading.Thread] = []
         self._pool = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="normalizer")
         # restart recovery: files that were being processed go back to the queue
@@ -70,7 +72,7 @@ class Engine:
         return schedule.in_window(state.get_schedule(self.db)[media], when or self.now())
 
     def mode(self) -> str:
-        """What the app does on its own: 'off', 'bulk' (only a started run works) or 'auto'."""
+        """What the app does on its own: 'off', 'bulk', 'force' (only a started run works) or 'auto'."""
         return state.get_settings(self.db)["general"]["mode"]
 
     def scan_interval(self) -> int:
@@ -115,16 +117,36 @@ class Engine:
             if previous is not None:
                 self.db.log("info", "Mode off: scanning and normalizing are stopped")
         elif mode == "bulk":
-            if previous == "auto" and run["mode"] == "active":
+            if previous in ("auto", "force") and (run["mode"] == "active" or run["paused"]):
                 state.set_run(self.db, mode="stopped", paused=False)
-                self.db.log("info", "Bulk mode: the automatic run is stopped, press Start to normalize the files that are here")
+                with self._lock:
+                    for fid, item in self._inflight.items():
+                        if not item["approved"]:
+                            self._cancel.add(fid)
+                self.db.log("info", "Bulk mode: the automatic run is stopped, press Start to normalize the files that are here"
+                                    if previous == "auto" else
+                                    "Bulk mode: the force run is stopped, press Start to normalize the files that are here")
+        elif mode == "force":
+            if previous in ("auto", "bulk") and (run["mode"] == "active" or run["paused"]):
+                state.set_run(self.db, mode="stopped", paused=False)
+                with self._lock:
+                    for fid, item in self._inflight.items():
+                        if not item["approved"]:
+                            self._cancel.add(fid)
+                self.db.log("info", "Force mode: the automatic run is stopped, press Start to check and normalize all files in enabled folders again"
+                                    if previous == "auto" else
+                                    "Force mode: the bulk run is stopped, press Start to check and normalize all files in enabled folders again")
         else:                                # auto
             # switching to automatic starts at once; a restart keeps a pause the user left in place
             state.set_run(self.db, mode="active", **({"paused": False} if previous is not None else {}))
             self.db.log("info", f"Automatic mode is on: new files are checked and normalized every "
                                 f"{self.scan_interval()} minutes")
         self._had_work = False
+        self._wake.set()
         return mode
+
+    def wake(self) -> None:
+        self._wake.set()
 
     def inflight_count(self) -> int:
         with self._lock:
@@ -140,7 +162,7 @@ class Engine:
             items = sorted(self._inflight.values(), key=lambda item: item["approved"])
             return items[0]["relpath"] if items else None
 
-    def status(self) -> str:
+    def status(self, media_stats: dict | None = None) -> str:
         mode = self.mode()
         if mode == "off":
             return "off"
@@ -156,29 +178,65 @@ class Engine:
         if not open_types:
             return "waiting_window"
         # only work in a type whose window is open counts as running
-        busy = self.inflight_count() > 0 or any(stats.media_stats(self.db, m)["files_pending"] for m in open_types)
+        if self.inflight_count() > 0:
+            return "running"
+        if media_stats is not None:
+            busy = any(media_stats[m]["files_pending"] for m in open_types)
+        else:
+            busy = any(stats.has_pending(self.db, m) for m in open_types)
         return "running" if busy else "idle"
 
     # ------------------------------------------------------------ run control
 
+    def _queue_force(self, types: dict) -> int:
+        """Queue every file in the enabled folders of the selected media types to be checked again."""
+        queued = 0
+        with self.db.tx():
+            for m in MEDIA:
+                if not types.get(m):
+                    continue
+                queued += self.db.execute(
+                    "UPDATE files SET status = 'pending', reason = NULL, lufs = NULL, true_peak = NULL, "
+                    "measured_at = NULL, gain_db = NULL, adjust_db = 0, applied_db = NULL, method = NULL, "
+                    "changed_at = NULL "
+                    "WHERE media = ? AND status != 'processing' "
+                    "AND dir IN (SELECT relpath FROM dirs WHERE media = ? AND enabled = 1)",
+                    (m, m),
+                )
+        return queued
+
     def start(self) -> None:
-        if self.mode() == "off":
-            raise ValueError("The app is off: choose Bulk or Automatic mode in Settings first")
-        # a run that starts with nothing to do finishes at once (and in bulk mode stops itself)
+        mode = self.mode()
+        if mode == "off":
+            raise ValueError("The app is off: choose Bulk, Force or Automatic mode in Settings first")
+        self.apply_mode()
+        run = state.get_run(self.db)
+        if mode == "force":
+            self._queue_force(run["types"])
+        # a run that starts with nothing to do finishes at once (and in bulk/force mode stops itself)
         self._had_work = True
         state.set_run(self.db, mode="active", paused=False)
-        self.db.log("info", "Bulk run started" if self.mode() == "bulk" else "Run started")
+        if mode == "bulk":
+            self.db.log("info", "Bulk run started")
+        elif mode == "force":
+            self.db.log("info", "Force run started: checking all files in enabled folders again")
+        else:
+            self.db.log("info", "Run started")
+        self._wake.set()
+        if self._threads:
+            self.tick()
 
     def stop(self) -> None:
         if self.mode() == "auto":
             raise ValueError("Automatic mode keeps watching for new files; pause the run to hold it, "
-                             "or choose Off or Bulk in Settings")
+                             "or choose Off, Bulk or Force in Settings")
         state.set_run(self.db, mode="stopped", paused=False)
         with self._lock:
             for fid, item in self._inflight.items():
                 if not item["approved"]:
                     self._cancel.add(fid)
         self.db.log("info", "Run stopped")
+        self._wake.set()
 
     def toggle_pause(self) -> None:
         run = state.get_run(self.db)
@@ -188,6 +246,9 @@ class Engine:
         state.set_run(self.db, paused=paused)
         what = "Automatic mode" if self.mode() == "auto" else "Run"
         self.db.log("info", f"{what} paused" if paused else f"{what} resumed")
+        self._wake.set()
+        if not paused and self._threads:
+            self.tick()
 
     def set_types(self, changes: dict) -> None:
         run = state.get_run(self.db)
@@ -195,6 +256,7 @@ class Engine:
             if m in MEDIA and value is not None:
                 run["types"][m] = bool(value)
         state.set_run(self.db, types=run["types"])
+        self._wake.set()
 
     # ------------------------------------------------------------ threads
 
@@ -206,6 +268,7 @@ class Engine:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self._wake.set()
         with self._lock:
             for fid, item in self._inflight.items():
                 if not item["approved"]:
@@ -214,11 +277,13 @@ class Engine:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            self._wake.clear()
             try:
                 self.tick()
             except Exception:  # keep the scheduler alive
                 log.exception("scheduler tick failed")
-            self._stop.wait(1.0)
+            if not self._stop.is_set():
+                self._wake.wait(1.0)
 
     def _scan_due(self) -> datetime | None:
         """When the next periodic scan is due; None right after a restart."""
@@ -266,6 +331,10 @@ class Engine:
     # ------------------------------------------------------------ scheduler
 
     def tick(self) -> None:
+        with self._tick_lock:
+            self._tick()
+
+    def _tick(self) -> None:
         mode = self.apply_mode()
         if mode == "off":
             return
@@ -280,42 +349,47 @@ class Engine:
                     if not item["approved"] and not open_[item["media"]]:
                         self._cancel.add(fid)
 
-        # (file id, approved by the user, media). Approved work runs at any time; automatic work
-        # only while the run is active, not paused, and the window of its media type is open.
-        picks: list[tuple[int, bool, str]] = [
-            (r["id"], True, r["media"]) for r in
-            self.db.query("SELECT id, media FROM files WHERE status = 'approved' ORDER BY id LIMIT 50")]
-
         automatic = run["mode"] == "active" and not run["paused"]
-        if automatic:
-            for m in MEDIA:
-                if not (run["types"].get(m) and open_[m]):
-                    continue
-                rows = self.db.query(
-                    "SELECT f.id FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
-                    "WHERE f.media = ? AND f.status = 'pending' AND d.enabled = 1 ORDER BY f.id LIMIT 300", (m,))
-                picks += [(r["id"], False, m) for r in rows]
+        inflight = self.inflight_count()
+        if inflight < self.cfg.concurrency:
+            limit = self.cfg.concurrency + inflight
+            # (file id, approved by the user, media). Approved work runs at any time; automatic work
+            # only while the run is active, not paused, and the window of its media type is open.
+            picks: list[tuple[int, bool, str]] = [
+                (r["id"], True, r["media"]) for r in
+                self.db.query("SELECT id, media FROM files WHERE status = 'approved' ORDER BY id LIMIT ?", (limit,))]
 
-        for fid, approved, _media in picks:
-            with self._lock:
-                if len(self._inflight) >= self.cfg.concurrency:
-                    break
-                if fid in self._inflight:
-                    continue
-            self._submit(fid, approved)
-            if not approved:
-                self._had_work = True
+            if automatic and len(picks) < limit:
+                for m in MEDIA:
+                    if not (run["types"].get(m) and open_[m]):
+                        continue
+                    rows = self.db.query(
+                        "SELECT f.id FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
+                        "WHERE f.media = ? AND f.status = 'pending' AND d.enabled = 1 ORDER BY f.id LIMIT ?",
+                        (m, limit))
+                    picks += [(r["id"], False, m) for r in rows]
+
+            for fid, approved, _media in picks:
+                with self._lock:
+                    if len(self._inflight) >= self.cfg.concurrency:
+                        break
+                    if fid in self._inflight:
+                        continue
+                self._submit(fid, approved)
+                if not approved:
+                    self._had_work = True
 
         # the run is finished when nothing is left to do in the enabled, scheduled types
         if automatic and self._had_work and self.inflight_count() == 0:
-            left = sum(stats.media_stats(self.db, m)["files_pending"] for m in MEDIA if run["types"].get(m))
-            if left == 0:
+            left = any(stats.has_pending(self.db, m) for m in MEDIA if run["types"].get(m))
+            if not left:
                 self._had_work = False
                 state.set_run(self.db, lastFinished=now.isoformat(timespec="seconds"))
-                if mode == "bulk":
-                    # a bulk run works through what is there now; files found later wait for the next Start
+                if mode in ("bulk", "force"):
+                    # a bulk or force run works through what is there now; files found later wait for the next Start
                     state.set_run(self.db, mode="stopped")
-                    self.db.log("info", "Bulk run finished: nothing left to check; new files wait for the next Start")
+                    what = "Force" if mode == "force" else "Bulk"
+                    self.db.log("info", f"{what} run finished: nothing left to check; new files wait for the next Start")
                 else:
                     self.db.log("info", "Run finished: nothing left to check; automatic mode keeps watching")
 
@@ -332,6 +406,7 @@ class Engine:
         with self._lock:
             self._inflight.pop(fid, None)
             self._cancel.discard(fid)
+        self._wake.set()
 
     # ------------------------------------------------------------ per-file work
 
@@ -367,8 +442,7 @@ class Engine:
             return
         st = state.get_settings(self.db)
         cfg_m = st[media]
-        lufs, true_peak = ff.measure(self.cfg.ffmpeg, src, cancel)
-        probe = ff.probe(self.cfg.ffmpeg, src, cancel)
+        lufs, true_peak, probe = ff.measure_and_probe(self.cfg.ffmpeg, src, cancel)
         family = audio_family(probe.codec)
         self.db.execute(
             "UPDATE files SET lufs = ?, true_peak = ?, measured_at = ?, codec = ?, family = ? WHERE id = ?",
@@ -584,8 +658,7 @@ class Engine:
         src = self.abs_path(media, rel)
         if not os.path.isfile(src):
             raise ValueError("file not found")
-        lufs, true_peak = ff.measure(self.cfg.ffmpeg, src)
-        probe = ff.probe(self.cfg.ffmpeg, src)
+        lufs, true_peak, probe = ff.measure_and_probe(self.cfg.ffmpeg, src)
         name = os.path.basename(rel)
         self.db.execute("UPDATE files SET lufs = ?, true_peak = ?, measured_at = ?, codec = ? "
                         "WHERE media = ? AND relpath = ? AND status != 'processing'",

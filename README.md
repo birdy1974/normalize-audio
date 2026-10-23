@@ -16,12 +16,15 @@ options on a real file, a run on the NAS, and the Home Assistant integration. Se
 
 ## What it does
 
-- Three modes, selected with buttons on the dashboard or in Settings (Mode card), and shown in Home Assistant:
+- Four modes, selected with buttons on the dashboard or in Settings (Mode card), and shown in Home Assistant:
   - **Automatic** — every *Look for new or changed files every* N minutes the folders are scanned and new or changed
     files are checked and normalized by themselves, within the schedule and the folders that are included.
   - **Bulk** (default) — there is no periodic scan and nothing is normalized until you press Start. A bulk run works
     through the pending files in enabled folders, within their schedule, and stops by itself; files that appear later
     wait for a manual scan and the next Start.
+  - **Force** — like Bulk, there is no periodic scan and nothing is normalized until you press Start. A force run
+    queues and checks/normalizes all files in the enabled folders again (even if they have already been checked before),
+    within their schedule, and stops by itself when finished.
   - **Off** — nothing is scanned and nothing is normalized. The app only shows what it already knows; Rescan,
     Check level and the audio editor still work when you use them, and Start is refused.
 - Scans two base locations (audio and video) including all sub-folders. Automatic mode finds new and changed files on
@@ -42,7 +45,7 @@ options on a real file, a run on the NAS, and the Home Assistant integration. Se
 - Schedule: a 7×24 grid per media type. When a window closes during a file, the file is finished and the run pauses
   (or pauses at once, selectable).
 - Home Assistant: a token-protected REST endpoint (`/api/v1/ha/status`) for RESTful sensors, with the YAML and the
-  Lovelace card configuration generated in the UI. The payload carries `mode` (off / bulk / auto), `scan_every`,
+  Lovelace card configuration generated in the UI. The payload carries `mode` (off / bulk / force / auto), `scan_every`,
   `last_scan` and `next_scan` next to the run status and the counters; the new *Mode*, *Last file scan* and
   *Next file scan* sensors can be enabled with one click.
 - An activity indicator in the menu shows on every page what the app is doing right now: scanning the folders,

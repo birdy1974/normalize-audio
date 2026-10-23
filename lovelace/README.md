@@ -1,7 +1,7 @@
 # Audio Normalizer — Lovelace card
 
 A native Home Assistant dashboard card that shows every value of the audio normalizer:
-run status and progress, the app mode (off / bulk / automatic) with the last and next file
+run status and progress, the app mode (off / bulk / force / automatic) with the last and next file
 scan, audio and video counters (folders, files in scope, to do, checked, changed, parked),
 target loudness, next schedule change, errors, current file and last run.
 
