@@ -31,7 +31,7 @@ The J3455 is a 4-core, low-power CPU (1.5 GHz base, 2.3 GHz burst). The first fu
 - runs a configurable **concurrency limit** (default 1 file at a time, max 2);
 - processes only inside the **schedule windows**;
 - caches analysis results so that each file is analysed once per version;
-- lets the user choose what happens without them: **Off**, **Bulk** (only a run they start) or **Automatic**
+- lets the user choose what happens without them: **Off**, **Bulk** (only a run they start), **Force** (a started run checks and normalizes all files in enabled folders again) or **Automatic**
   (new files are found on the *Look for new or changed files every* interval and normalized on their own).
   The automatic scan interval is shared by audio and video, and the mode is part of the dashboard and the Home Assistant payload.
 
@@ -83,7 +83,7 @@ audio-normalizer/
 | Lossy gain | **mp3gain / aacgain** (default lossy strategy, Q1) | Lossless gain change for MP3/AAC. |
 | State | **SQLite** in `/config` | Survives restarts; stores per-file fingerprint (path, size, mtime, hash), status, gain, history. |
 | Scheduler | Own weekly-window logic (not cron) | Simple "days + hours" grid in the UI; no external daemon. |
-| App modes | `general.mode`: `off` / `bulk` / `auto` in the settings; the run state in SQLite follows it | One switch instead of two overlapping ones (run + automatic); Off really stops everything, Bulk is one-shot, Automatic is hands-off. |
+| App modes | `general.mode`: `off` / `bulk` / `force` / `auto` in the settings; the run state in SQLite follows it | One switch instead of two overlapping ones (run + automatic); Off really stops everything, Bulk is one-shot for pending files, Force re-checks all files in enabled folders, Automatic is hands-off. |
 | Frontend | Vanilla JS (as in the mock-up) | No build step, small image, easy to maintain on a NAS. |
 | Busy state | Client actions + `/api/dashboard.scanning` | The menu shows what the app is doing (scan, level check, save, edit, run) on every page. |
 | Waveform | ffmpeg decode to 8 kHz mono PCM, reduced to min/max buckets, LRU cached by path/mtime/size/window | One cheap decode per window; zoom and scroll reuse the cache instead of the browser decoding the whole file, and a long file is only decoded where it is shown. |
@@ -236,7 +236,7 @@ Example payload (structure taken from the mock-up; values are sample numbers):
 }
 ```
 
-`status` is `running`, `paused`, `waiting_window`, `idle`, `stopped` or `off`; `mode` is `off`, `bulk` or `auto`
+`status` is `running`, `paused`, `waiting_window`, `idle`, `stopped` or `off`; `mode` is `off`, `bulk`, `force` or `auto`
 (`next_scan` is `null` unless the app is in Automatic mode). Sensors use dotted paths, for example `audio.files_total` →
 `{{ value_json.audio.files_total }}`; `mode`, `last_scan` and `next_scan` are top-level values. The mock-up's Home
 Assistant page groups sensors into Overall, Audio and Video.

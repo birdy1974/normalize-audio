@@ -42,8 +42,8 @@ def payload(engine) -> dict:
         checked += s["files_checked"]
         errors += s["files_errors"]
     return {
-        "status": engine.status(),
-        # off / bulk / auto, and how the automatic side is doing
+        "status": engine.status(out),
+        # off / bulk / force / auto, and how the automatic side is doing
         **engine.scan_status(),
         "progress_percent": int(round(100 * checked / total)) if total else 0,
         "errors": errors,

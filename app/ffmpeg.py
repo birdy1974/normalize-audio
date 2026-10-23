@@ -58,11 +58,12 @@ class Probe:
 
 _AUDIO = re.compile(r"Stream #\d+:\d+.*?: Audio: ([A-Za-z0-9_]+)")
 _FMT = re.compile(r"^(u8|s16|s32|s64|flt|fltp|dbl|dblp|s16p|s32p|u8p)(\s|$)")
+_INPUT_END = re.compile(r"^(?:Stream mapping:|Output #0)", re.M)
 
 
-def probe(ffmpeg: str, path: str, cancel: Cancel = None) -> Probe:
-    _, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-i", path], cancel)
-    lines = err.splitlines()
+def _parse_probe(err: str) -> Probe:
+    head = _INPUT_END.split(err, maxsplit=1)[0]
+    lines = head.splitlines()
     audio = [ln for ln in lines if re.search(r"Stream #\d+:\d+.*: Audio:", ln)]
     video = [ln for ln in lines if re.search(r"Stream #\d+:\d+.*: Video:", ln) and "attached pic" not in ln]
     codec = kbps = fmt = None
@@ -74,7 +75,7 @@ def probe(ffmpeg: str, path: str, cancel: Cancel = None) -> Probe:
         fmt = next((t.strip() for t in first.split(", ") if _FMT.match(t.strip())), None)
         fmt = _FMT.match(fmt).group(1) if fmt else None
     dur = None
-    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", err)
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", head)
     if m:
         dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
     if not audio:
@@ -82,12 +83,17 @@ def probe(ffmpeg: str, path: str, cancel: Cancel = None) -> Probe:
     return Probe(codec, kbps, fmt, dur, len(audio), len(video))
 
 
+def probe(ffmpeg: str, path: str, cancel: Cancel = None) -> Probe:
+    _, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-i", path], cancel)
+    return _parse_probe(err)
+
+
 _I = re.compile(r"I:\s+(-?\d+(?:\.\d+)?|-inf) LUFS")
 _TP = re.compile(r"True peak:\s+Peak:\s+(-?\d+(?:\.\d+)?|-inf) dBFS")
 
 
-def measure(ffmpeg: str, path: str, cancel: Cancel = None) -> tuple[float, float]:
-    """Integrated loudness (LUFS, EBU R128) and true peak (dBTP) of the first audio stream.
+def measure_and_probe(ffmpeg: str, path: str, cancel: Cancel = None) -> tuple[float, float, Probe]:
+    """Integrated loudness (LUFS, EBU R128), true peak (dBTP) and stream info in one ffmpeg pass.
 
     Silent files return (-70, -70). The file itself is not changed.
     """
@@ -101,6 +107,12 @@ def measure(ffmpeg: str, path: str, cancel: Cancel = None) -> tuple[float, float
         raise ToolError("analysis gave no result")
     lufs = -70.0 if i_vals[-1] == "-inf" else float(i_vals[-1])
     tp = -70.0 if tp_vals[-1] == "-inf" else float(tp_vals[-1])
+    return lufs, tp, _parse_probe(err)
+
+
+def measure(ffmpeg: str, path: str, cancel: Cancel = None) -> tuple[float, float]:
+    """Integrated loudness (LUFS, EBU R128) and true peak (dBTP) of the first audio stream."""
+    lufs, tp, _ = measure_and_probe(ffmpeg, path, cancel)
     return lufs, tp
 
 

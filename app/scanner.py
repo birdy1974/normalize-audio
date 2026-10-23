@@ -1,7 +1,8 @@
 """Walks a base location and keeps the files and folders tables in step with the disk.
 
-New files are queued; files whose size or time stamp changed are queued again;
-files that disappeared are removed. Hidden, Synology (@eaDir) and recycle folders are skipped.
+New files and folders are added; files and folders that disappeared are removed;
+files and folders that were already scanned are left untouched.
+Hidden, Synology (@eaDir) and recycle folders are skipped.
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ class Scanner:
             return {"available": False}
         now = time.time()
         dirs: dict[str, str] = {}      # folder relpath -> parent relpath
-        files: dict[str, tuple] = {}   # file relpath -> (dir, name, ext, size, mtime_ns)
+        files: dict[str, tuple] = {}   # file relpath -> (dir, name, ext)
         wanted = EXTENSIONS[media]
         skipped = 0
         for dirpath, dirnames, filenames in os.walk(root):
@@ -60,35 +61,19 @@ class Scanner:
                 ext = name.rsplit(".", 1)[1].lower()
                 if ext not in wanted:
                     continue
-                try:
-                    st = os.stat(os.path.join(dirpath, name))
-                except OSError:
-                    continue
                 rel = name if here == "." else f"{here}/{name}"
-                files[rel] = (here, name, ext, st.st_size, st.st_mtime_ns)
+                files[rel] = (here, name, ext)
 
-        new = changed = removed = 0
+        new = removed = 0
         with self.db.tx():
             existing = {r["relpath"]: r for r in self.db.query(
-                "SELECT id, relpath, size, mtime_ns, status FROM files WHERE media = ?", (media,))}
+                "SELECT id, relpath, status FROM files WHERE media = ?", (media,))}
             inserts = []
-            for rel, (here, name, ext, size, mtime) in files.items():
+            for rel, (here, name, ext) in files.items():
                 old = existing.pop(rel, None)
                 if old is None:
-                    inserts.append((media, rel, here, name, ext, size, mtime, now))
+                    inserts.append((media, rel, here, name, ext, 0, 0, now))
                     new += 1
-                elif old["size"] != size or old["mtime_ns"] != mtime:
-                    if old["status"] != "processing":
-                        self.db.execute(
-                            "UPDATE files SET dir=?, name=?, ext=?, size=?, mtime_ns=?, seen_at=?, status='pending', "
-                            "reason=NULL, codec=NULL, family=NULL, lufs=NULL, true_peak=NULL, measured_at=NULL, "
-                            "gain_db=NULL, adjust_db=0, applied_db=NULL, method=NULL WHERE id=?",
-                            (here, name, ext, size, mtime, now, old["id"]))
-                        changed += 1
-                    else:
-                        self.db.execute("UPDATE files SET seen_at=? WHERE id=?", (now, old["id"]))
-                else:
-                    self.db.execute("UPDATE files SET seen_at=? WHERE id=?", (now, old["id"]))
             if inserts:
                 self.db.executemany(
                     "INSERT INTO files (media, relpath, dir, name, ext, size, mtime_ns, status, seen_at) "
@@ -128,7 +113,7 @@ class Scanner:
                 "rename them on disk to include them.",
                 media,
             )
-        return {"available": True, "files": len(files), "new": new, "changed": changed,
+        return {"available": True, "files": len(files), "new": new, "changed": 0,
                 "removed": removed, "folders": len(dirs), "skipped": skipped}
 
     def scan_all(self) -> dict:

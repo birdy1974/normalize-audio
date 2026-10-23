@@ -2,7 +2,7 @@
  * Audio Normalizer — Lovelace card  (v1.2.0)
  *
  * Shows the values published by the audio-normalizer status entity:
- * run status, app mode (off / bulk / automatic) with the last and next file
+ * run status, app mode (off / bulk / force / automatic) with the last and next file
  * scan, progress, audio and video counters, parked files, errors,
  * target loudness, next schedule change, current file and last run.
  *
@@ -29,7 +29,7 @@
 
   const CARD_VERSION = '1.2.0';
   const CARD_TAG = 'audio-normalizer-card';
-  const MODE_NAMES = { off: 'Off', bulk: 'Bulk', auto: 'Automatic' };
+  const MODE_NAMES = { off: 'Off', bulk: 'Bulk', force: 'Force', auto: 'Automatic' };
 
   const DEFAULTS = {
     entity: 'sensor.audio_normalizer',

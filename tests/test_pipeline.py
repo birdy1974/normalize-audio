@@ -250,7 +250,7 @@ def test_restart_keeps_state_and_resets_interrupted_files(cfg):
     assert app2.state.engine.status() == "stopped"
 
 
-def test_new_and_changed_files_are_detected(lib):
+def test_new_files_are_detected_and_existing_files_are_kept(lib):
     cfg, engine, db = lib
     first = tone(os.path.join(cfg.audio_root, "one.flac"), 0, codec_args=("-c:a", "flac"))
     engine.scan_now("audio")
@@ -259,9 +259,10 @@ def test_new_and_changed_files_are_detected(lib):
     engine.scan_now("audio")
     assert row(db, "two.flac")["status"] == "pending"
     assert row(db, "one.flac")["status"] == "ok"
-    tone(first, 0, seconds=4.0, codec_args=("-c:a", "flac"))        # rewritten: different size
+    # Rescanning does not reset already-scanned files, even if their size on disk changed.
+    tone(first, 0, seconds=4.0, codec_args=("-c:a", "flac"))
     engine.scan_now("audio")
-    assert row(db, "one.flac")["status"] == "pending"
+    assert row(db, "one.flac")["status"] == "ok"
 
 
 def test_bulk_run_respects_the_schedule_window(lib):
@@ -560,6 +561,71 @@ def test_only_automatic_mode_runs_the_periodic_scanner(lib, monkeypatch):
     assert scans == []                                       # Off does not scan either
 
     stop.stopped = False
+    state.put_settings(db, {"general": {"mode": "force"}})
+    engine._scan_loop()
+    assert scans == []                                       # Force does not scan either
+
+    stop.stopped = False
     state.put_settings(db, {"general": {"mode": "auto"}})
     engine._scan_loop()
     assert len(scans) == 1                                   # Automatic scans immediately after a restart
+
+
+def test_force_mode_rechecks_and_changes_already_checked_files_in_enabled_folders(lib):
+    from app import folders
+    cfg, engine, db = lib
+    music = tone(os.path.join(cfg.audio_root, "Music", "a.flac"), -6, codec_args=("-c:a", "flac"))
+    old = tone(os.path.join(cfg.audio_root, "Old", "b.flac"), -6, codec_args=("-c:a", "flac"))
+    set_settings(db, target=-16.0, threshold=12.0)
+    open_windows(db)
+    engine.scan_now("audio")
+
+    # First run (dry run): both files are checked and marked dryrun.
+    state.put_settings(db, {"general": {"dryRun": True}})
+    engine.start()
+    run_until_idle(engine, db)
+    assert row(db, "a.flac")["status"] == "dryrun"
+    assert row(db, "b.flac")["status"] == "dryrun"
+
+    # Turn dry run off: in Bulk mode, already-checked files are not checked again.
+    state.put_settings(db, {"general": {"dryRun": False, "mode": "bulk"}})
+    engine.start()
+    run_until_idle(engine, db)
+    assert row(db, "a.flac")["status"] == "dryrun"
+    assert row(db, "b.flac")["status"] == "dryrun"
+
+    # Disable Old, switch to Force mode and press Start: only enabled folders are checked/changed again.
+    folders.set_enabled(db, "audio", "Old", False)
+    state.put_settings(db, {"general": {"mode": "force"}})
+    engine.start()
+    run_until_idle(engine, db)
+
+    assert row(db, "a.flac")["status"] == "changed"
+    assert abs(loudness(FFMPEG, music) - (-16.0)) < 0.7
+    assert row(db, "b.flac")["status"] == "dryrun"           # disabled folder is left untouched
+    assert state.get_run(db)["mode"] == "stopped"            # force run stops itself when done
+
+    # Change target loudness and run Force again: already-changed files in enabled folders are changed again.
+    set_settings(db, target=-12.0, threshold=12.0)
+    engine.start()
+    run_until_idle(engine, db)
+    assert row(db, "a.flac")["status"] == "changed"
+    assert abs(loudness(FFMPEG, music) - (-12.0)) < 0.7
+    assert row(db, "b.flac")["status"] == "dryrun"
+
+
+def test_measure_and_probe_matches_separate_calls(tmp_path):
+    audio = tone(str(tmp_path / "song.flac"), -6, codec_args=("-c:a", "flac"))
+    video = make(str(tmp_path / "clip.mkv"),
+                 "-f", "lavfi", "-i", "color=c=black:s=64x64:d=2",
+                 "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "192k")
+
+    for p in (audio, video):
+        lufs, tp, info = ff.measure_and_probe(FFMPEG, p)
+        lufs_sep, tp_sep = ff.measure(FFMPEG, p)
+        info_sep = ff.probe(FFMPEG, p)
+        assert abs(lufs - lufs_sep) < 0.01
+        assert abs(tp - tp_sep) < 0.01
+        assert info == info_sep
+

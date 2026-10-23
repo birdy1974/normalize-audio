@@ -32,10 +32,11 @@
     volume: 'lossless gain', mp3gain: 'gain only (mp3gain)', aacgain: 'gain only (aacgain)',
     reencode: 're-encode, same bitrate',
   };
-  const MODE_LABEL = { off: 'Off', bulk: 'Bulk', auto: 'Automatic' };
+  const MODE_LABEL = { off: 'Off', bulk: 'Bulk', force: 'Force', auto: 'Automatic' };
   const MODE_SHORT = {
     off: 'nothing is scanned or normalized',
     bulk: 'a run normalizes the files that are here',
+    force: 'a run checks and normalizes all enabled files again',
     auto: 'new files are normalized by themselves',
   };
   const PARK_SORTS = {
@@ -1098,6 +1099,9 @@
       if (!state.selected[t] || !tree.map.has(state.selected[t])) {
         state.selected[t] = tree.roots[0] ? tree.roots[0].rel : null;
       }
+      if (!tree.roots.length && !data.root_files && !state.scanning[t] && (!state.dash || !state.dash.last_scan)) {
+        scanDirectories(t, false);
+      }
     } else if (parts[0] === 'parked') {
       state.parked[parts[1]] = await loadParkedData(parts[1]);
     }
@@ -1154,10 +1158,9 @@
     }
     const found = [];
     if (r.new) found.push(r.new + ' new');
-    if (r.changed) found.push(r.changed + ' changed');
     if (r.removed) found.push(r.removed + ' removed');
-    const n = r.new + r.changed + r.removed;
-    const files = n ? found.join(', ') + ' file' + (n === 1 ? '' : 's') : 'no new or changed files';
+    const n = r.new + r.removed;
+    const files = n ? found.join(', ') + ' file' + (n === 1 ? '' : 's') : 'no new or removed files';
     return 'Rescan: ' + files + ' · ' + fmt(r.folders) + ' folders';
   }
 
@@ -1189,8 +1192,7 @@
 
   function openDirectories() {
     const t = state.media;
-    invalidate('dir:' + t);                 // read the tree again, also when the scan is slow
-    scanDirectories(t, false);              // new files and folders become visible when it finishes
+    invalidate('dir:' + t);                 // read the tree from the database; use Rescan to scan the disk
   }
 
   /* ----------------------------------------------------- derived helpers */
@@ -1215,9 +1217,11 @@
   /* last scan: "14:02" today, "Tue 22:15" otherwise */
   function scanLine(d) {
     if (d.mode === 'off') return 'Automatic discovery is off. Rescan and opening Directories still work.';
-    if (d.mode === 'bulk') {
-      return 'Bulk processes enabled folders only; no periodic scan. Use Rescan to find new files'
-        + ' · last scan ' + (d.last_scan ? dayAndClock(d.last_scan) : 'not yet');
+    if (d.mode === 'bulk' || d.mode === 'force') {
+      const text = d.mode === 'force'
+        ? 'Force checks and normalizes all files in enabled folders again; no periodic scan. Use Rescan to find new files'
+        : 'Bulk processes enabled folders only; no periodic scan. Use Rescan to find new files';
+      return text + ' · last scan ' + (d.last_scan ? dayAndClock(d.last_scan) : 'not yet');
     }
     const every = d.scan_every ? 'every ' + d.scan_every + ' min' : 'periodically';
     return 'Looking for new files ' + every
@@ -1276,7 +1280,7 @@
   /* ------------------------------------------------------------- dashboard */
   function modeButtons(mode) {
     return '<div class="seg mode-buttons" role="group" aria-label="Mode">'
-      + ['off', 'bulk', 'auto'].map((value) => '<button type="button" data-action="set-mode" data-mode="' + value + '"'
+      + ['off', 'bulk', 'force', 'auto'].map((value) => '<button type="button" data-action="set-mode" data-mode="' + value + '"'
         + ' class="' + (mode === value ? 'on' : '') + '" aria-pressed="' + (mode === value) + '">'
         + MODE_LABEL[value] + '</button>').join('')
       + '</div>';
@@ -1331,8 +1335,10 @@
       ? 'The app is off: folders are not scanned and no file is normalized. Rescan and Check level still work when you use them.'
       : isAuto
         ? 'Automatic: new and changed files are found and normalized by themselves, within the schedule and the folders that are included here.'
-        : 'Bulk: press Start to check and normalize the files that are in the library now, within the schedule and enabled folders. Files that appear later wait for the next Start.';
-    const typesLocked = !isOff && mode === 'bulk' && status !== 'stopped';   // no switches during a bulk run
+        : mode === 'force'
+          ? 'Force: press Start to check and normalize all files in the enabled folders again (also if they have been checked before), within the schedule.'
+          : 'Bulk: press Start to check and normalize the files that are in the library now, within the schedule and enabled folders. Files that appear later wait for the next Start.';
+    const typesLocked = !isOff && (mode === 'bulk' || mode === 'force') && status !== 'stopped';   // no switches during a bulk or force run
     return '<section class="card">'
       + '<div class="dashboard-mode"><span class="muted">Mode</span>' + modeButtons(mode) + '</div>'
       + '<div class="run-top"><div class="run-state"><span class="dot ' + dotClass + '"></span>'
@@ -1518,7 +1524,7 @@
       + '</span> in docker-compose.yml. Untick a folder to exclude it. Ticking or unticking applies to its sub-folders too.',
       '<button class="btn btn-sm' + (scanning ? ' is-busy' : '') + '" data-action="rescan"' + (scanning ? ' disabled' : '') + '>'
       + (scanning ? 'Scanning…' : 'Rescan') + '</button>'
-      + tip('Looks on disk for new, changed and removed files and folders, then updates this page. The same check runs when you open this tab.')
+      + tip('Updates the folder tree and file list with new and removed files and folders on disk, without resetting files that were already scanned.')
       + '<button class="btn btn-sm" data-action="select-all">Select all</button>'
       + '<button class="btn btn-sm" data-action="select-none">Select none</button>'
       + '<button class="btn btn-sm" data-action="expand-all">Expand all</button>'
@@ -1753,14 +1759,15 @@
     const options = [
       ['auto', 'Automatic', 'New and changed files are checked and normalized by themselves. The folders are looked at every ' + every + ' minutes, within the schedule and the folders that are included.'],
       ['bulk', 'Bulk', 'Nothing happens until you press Start on the dashboard: then the files that are in the library are checked and normalized. Files that appear later wait for the next Start.'],
+      ['force', 'Force', 'Nothing happens until you press Start on the dashboard: then all files in the enabled folders are checked and normalized again, also if they have been checked before.'],
       ['off', 'Off', 'Nothing is scanned and nothing is normalized. Rescan, Check level and the audio editor still work when you use them.'],
-    ].map(([v, title, d, def]) => '<label class="opt"><input type="radio" name="app-mode" value="' + v + '"'
+    ].map(([v, title, d]) => '<label class="opt"><input type="radio" name="app-mode" value="' + v + '"'
       + ' data-scope="general" data-setting="mode"' + (mode === v ? ' checked' : '') + '>'
       + '<span><strong style="font-weight:500">' + title + '</strong>'
       + (v === 'bulk' ? '<span class="tag">default</span>' : '') + tip(d) + '</span></label>').join('');
     return '<section class="card"><div class="card-head"><div><h2>Mode</h2>'
-      + '<div class="sub">Off, Bulk (you start it) or Automatic (new files are normalized for you)</div></div></div>'
-      + '<div class="field" style="margin:0"><span class="lbl">Mode' + tip('Switches the whole app: Off, Bulk (start a run yourself) or Automatic (new files are found and normalized for you).') + '</span>'
+      + '<div class="sub">Off, Bulk (you start it), Force (check all enabled files again) or Automatic (new files are normalized for you)</div></div></div>'
+      + '<div class="field" style="margin:0"><span class="lbl">Mode' + tip('Switches the whole app: Off, Bulk (start a run yourself), Force (check and normalize all files in enabled folders again) or Automatic (new files are found and normalized for you).') + '</span>'
       + options
       + '<p class="small muted" style="margin-top:10px">Automatic mode uses Settings, Scheduling: new files are looked for every '
       + every + ' minutes.</p>'
@@ -1773,7 +1780,7 @@
       + '<div class="sub">Applies to audio and video. The time windows are set on the Schedule tab.</div></div></div>'
       + '<div class="split-2" style="margin-top:0">'
       + '<div class="field" style="margin:0"><label class="lbl" for="scan-every">Look for new or changed files every'
-      + tip('Used only by Automatic mode: the folders are scanned this often and new or changed files are normalized. Bulk has no periodic scan. A manual Rescan also counts, so the next automatic scan starts a full interval later.') + '</label>'
+      + tip('Used only by Automatic mode: the folders are scanned this often and new or changed files are normalized. Bulk and Force have no periodic scan. A manual Rescan also counts, so the next automatic scan starts a full interval later.') + '</label>'
       + '<div class="input-row" style="max-width:300px"><input class="input" id="scan-every" type="number" min="1" max="1440" data-sched="scanEvery" value="' + sc.scanEvery + '">'
       + '<span class="muted small">minutes</span></div>'
       + '</div>'

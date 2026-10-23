@@ -143,8 +143,8 @@ def dashboard(engine=Engine):
             total += s["files_total"]
             checked += s["files_checked"]
     return {
-        "status": engine.status(),
-        "mode": settings["general"]["mode"],      # off / bulk / auto: what the app does on its own
+        "status": engine.status(media),
+        "mode": settings["general"]["mode"],      # off / bulk / force / auto: what the app does on its own
         "run_mode": run["mode"],                  # the run engine: active / stopped
         "paused": run["paused"],
         "types": run["types"],
@@ -381,6 +381,7 @@ def approve(fid: int, engine=Engine):
         raise HTTPException(409, "file is not parked")
     engine.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
     engine.db.log("info", f"{row['name']}: change approved", row["media"])
+    engine.wake()
     return {"ok": True}
 
 
@@ -432,6 +433,8 @@ def bulk(body: BulkBody, engine=Engine):
         else:
             _set_adjust(engine, row, AdjustBody(delta=body.delta or 0.0))
         done += 1
+    if body.action == "approve" and done:
+        engine.wake()
     return {"done": done}
 
 
@@ -445,6 +448,7 @@ def approve_all(body: ApproveAllBody, engine=Engine):
         engine.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
     if ids:
         engine.db.log("info", f"{len(ids)} parked file(s) approved", body.media)
+        engine.wake()
     return {"done": len(ids)}
 
 
@@ -458,7 +462,7 @@ def get_settings(engine=Engine):
 @router.put("/settings")
 def put_settings(body: dict, engine=Engine):
     settings = state.put_settings(engine.db, body)
-    engine.apply_mode()               # off stops the run, automatic starts it, bulk stops an automatic one
+    engine.apply_mode()               # off stops the run, automatic starts it, bulk/force stops an automatic one
     return settings
 
 

@@ -1,19 +1,27 @@
 """Numbers for the dashboard and Home Assistant: folders, files in scope, to do, checked, changed, parked."""
 from __future__ import annotations
 
-from . import folders
 from .db import Database
 
 
+def has_pending(db: Database, media: str) -> bool:
+    row = db.one(
+        "SELECT 1 FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
+        "WHERE f.media = ? AND f.status IN ('pending', 'approved', 'processing') AND d.enabled = 1 LIMIT 1",
+        (media,),
+    )
+    return row is not None
+
+
 def media_stats(db: Database, media: str) -> dict:
-    enabled = folders.enabled_set(db, media)
     total = pending = checked = changed = parked = skipped = errors = 0
     rows = db.query(
-        "SELECT dir, status, (measured_at IS NOT NULL) AS measured, COUNT(*) AS n "
-        "FROM files WHERE media = ? GROUP BY dir, status, measured", (media,))
+        "SELECT f.status, (f.measured_at IS NOT NULL) AS measured, COUNT(*) AS n "
+        "FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
+        "WHERE f.media = ? AND d.enabled = 1 GROUP BY f.status, measured",
+        (media,),
+    )
     for r in rows:
-        if r["dir"] not in enabled:
-            continue
         n = r["n"]
         total += n
         if r["measured"]:
@@ -29,10 +37,14 @@ def media_stats(db: Database, media: str) -> dict:
             skipped += n
         elif status == "error":
             errors += n
-    dirs = db.query("SELECT enabled FROM dirs WHERE media = ? AND relpath != '.'", (media,))
+    dirs = db.one(
+        "SELECT COUNT(*) AS total, COALESCE(SUM(enabled), 0) AS enabled "
+        "FROM dirs WHERE media = ? AND relpath != '.'",
+        (media,),
+    )
     return {
-        "directories_total": len(dirs),
-        "directories_enabled": sum(1 for d in dirs if d["enabled"]),
+        "directories_total": dirs["total"] if dirs else 0,
+        "directories_enabled": dirs["enabled"] if dirs else 0,
         "files_total": total,
         "files_pending": pending,
         "files_checked": checked,
