@@ -56,7 +56,6 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE INDEX IF NOT EXISTS files_status ON files(media, status);
 CREATE INDEX IF NOT EXISTS files_dir ON files(media, dir);
 CREATE INDEX IF NOT EXISTS files_dir_status ON files(media, dir, status);
-CREATE INDEX IF NOT EXISTS files_cover_status ON files(media, cover_status);
 CREATE TABLE IF NOT EXISTS cover_cache (
     query_key TEXT PRIMARY KEY,
     candidates TEXT NOT NULL,

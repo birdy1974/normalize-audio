@@ -301,3 +301,50 @@ def test_cover_auto_embeds_during_normalization_run_when_enabled(cfg, app_engine
     assert r["has_cover"] == 1
     assert r["cover_status"] == "embedded"
     assert cover.inspect_audio(p)["has_cover"] is True
+
+
+def test_legacy_database_migration_adds_cover_columns_and_index(tmp_path):
+    """Opening an existing SQLite database created before cover_status existed must migrate cleanly."""
+    import sqlite3
+    from app.db import Database
+
+    legacy_db_path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(legacy_db_path)
+    conn.executescript(
+        """
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            media TEXT NOT NULL,
+            relpath TEXT NOT NULL,
+            dir TEXT NOT NULL,
+            name TEXT NOT NULL,
+            ext TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT,
+            codec TEXT,
+            family TEXT,
+            lufs REAL,
+            true_peak REAL,
+            measured_at REAL,
+            gain_db REAL,
+            adjust_db REAL NOT NULL DEFAULT 0,
+            applied_db REAL,
+            method TEXT,
+            changed_at REAL,
+            seen_at REAL NOT NULL,
+            UNIQUE (media, relpath)
+        );
+        """
+    )
+    conn.close()
+
+    db = Database(legacy_db_path)
+    cols = {r["name"] for r in db.query("PRAGMA table_info(files)")}
+    assert "cover_status" in cols
+    assert "has_cover" in cols
+    assert "cover_candidates" in cols
+    assert "tag_artist" in cols
+    assert "cover_query_source" in cols
+
