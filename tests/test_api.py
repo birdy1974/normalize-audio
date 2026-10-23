@@ -371,6 +371,10 @@ def test_settings_are_validated(client):
     assert client.put("/api/settings", json={"audio": {"target": -31}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"hysteresis": -0.5}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"hysteresis": 6.5}}).status_code == 400
+    assert client.put("/api/settings", json={"general": {"silenceLevelPct": 0.0}}).status_code == 400
+    assert client.put("/api/settings", json={"general": {"silencePeakDb": -5.0}}).status_code == 400
+    assert client.put("/api/settings", json={"general": {"silenceMinDuration": 0.1}}).status_code == 400
+    assert client.put("/api/settings", json={"general": {"silenceFadeOut": -1.0}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"lossy": "transcode"}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"writeMode": "trash"}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"outputDir": "relative/path"}}).status_code == 400
@@ -379,13 +383,27 @@ def test_settings_are_validated(client):
 
 
 def test_valid_settings_are_saved_and_rounded(client):
-    r = client.put("/api/settings", json={"audio": {"target": -18.04, "hysteresis": 1.24, "lossy": "skip", "writeMode": "backup"}})
+    r = client.put("/api/settings", json={
+        "general": {
+            "trimSilence": True, "silenceLevelPct": 2.54, "silencePeakDb": -42.0,
+            "silenceMinDuration": 4.5, "silenceFadeOut": 0.8, "silenceFadeIn": 0.6,
+        },
+        "audio": {"target": -18.04, "hysteresis": 1.24, "lossy": "skip", "writeMode": "backup"},
+    })
     assert r.status_code == 200
-    saved = client.get("/api/settings").json()["audio"]
+    full = client.get("/api/settings").json()
+    saved = full["audio"]
     assert saved["target"] == -18.0
     assert saved["hysteresis"] == 1.2
     assert saved["lossy"] == "skip"
     assert saved["writeMode"] == "backup"
+    gen = full["general"]
+    assert gen["trimSilence"] is True
+    assert gen["silenceLevelPct"] == 2.5
+    assert gen["silencePeakDb"] == -42.0
+    assert gen["silenceMinDuration"] == 4.5
+    assert gen["silenceFadeOut"] == 0.8
+    assert gen["silenceFadeIn"] == 0.6
 
 
 # ------------------------------------------------------------ parked files

@@ -1,9 +1,12 @@
 """Calls to ffmpeg (and the optional mp3gain / aacgain tools). Each call can be cancelled."""
 from __future__ import annotations
 
+import array
+import math
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -116,6 +119,123 @@ def measure(ffmpeg: str, path: str, cancel: Cancel = None) -> tuple[float, float
     return lufs, tp
 
 
+SILENCE_RATE = 8000
+SILENCE_WIN = 400  # 0.05 s (50 ms) at 8000 Hz
+
+
+def detect_silent_sections(ffmpeg: str, path: str, *, lufs: float,
+                           level_pct: float = 2.0, peak_db: float = -40.0,
+                           min_duration: float = 5.0,
+                           cancel: Cancel = None) -> list[tuple[float, float]]:
+    """Find contiguous 'no sound' sections strictly longer than `min_duration` seconds.
+
+    A 50 ms window counts as 'no sound' when its RMS level is at most `level_pct`% of the
+    file's average sound level (`lufs`) and its highest sample peak is at most `peak_db` dBFS.
+    """
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
+           "-map", "0:a:0", "-ac", "1", "-ar", str(SILENCE_RATE), "-f", "s16le", "-"]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    avg_amp = 32768.0 * (10.0 ** (float(lufs) / 20.0))
+    rms_limit = avg_amp * (max(0.0, float(level_pct)) / 100.0)
+    peak_limit = 32768.0 * (10.0 ** (float(peak_db) / 20.0))
+    dt = SILENCE_WIN / SILENCE_RATE
+    rest = b""
+    win_idx = 0
+    run_start: float | None = None
+    cuts: list[tuple[float, float]] = []
+    try:
+        while True:
+            if cancel and cancel():
+                proc.kill()
+                proc.communicate()
+                raise Cancelled()
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            data = rest + chunk
+            usable = (len(data) // (SILENCE_WIN * 2)) * (SILENCE_WIN * 2)
+            if not usable:
+                rest = data
+                continue
+            rest = data[usable:]
+            samples = array.array("h")
+            samples.frombytes(data[:usable])
+            if sys.byteorder != "little":
+                samples.byteswap()
+            for offset in range(0, len(samples), SILENCE_WIN):
+                sl = samples[offset:offset + SILENCE_WIN]
+                hi, lo = max(sl), min(sl)
+                pk = hi if hi >= -lo else -lo
+                if pk > peak_limit:
+                    silent = False
+                elif pk <= rms_limit:
+                    silent = True
+                else:
+                    rms = math.sqrt(sum(x * x for x in sl) / SILENCE_WIN)
+                    silent = rms <= rms_limit
+                t0 = win_idx * dt
+                win_idx += 1
+                if silent:
+                    if run_start is None:
+                        run_start = t0
+                elif run_start is not None:
+                    t1 = t0
+                    if t1 - run_start > min_duration:
+                        cuts.append((round(run_start, 3), round(t1, 3)))
+                    run_start = None
+        if len(rest) >= 2:
+            samples = array.array("h")
+            samples.frombytes(rest[:(len(rest) // 2) * 2])
+            if sys.byteorder != "little":
+                samples.byteswap()
+            hi, lo = max(samples), min(samples)
+            pk = hi if hi >= -lo else -lo
+            if pk > peak_limit:
+                silent = False
+            elif pk <= rms_limit:
+                silent = True
+            else:
+                rms = math.sqrt(sum(x * x for x in samples) / len(samples))
+                silent = rms <= rms_limit
+            t0 = win_idx * dt
+            t_end = t0 + len(samples) / SILENCE_RATE
+            if silent:
+                if run_start is None:
+                    run_start = t0
+                if t_end - run_start > min_duration:
+                    cuts.append((round(run_start, 3), round(t_end, 3)))
+                run_start = None
+        if run_start is not None:
+            t_end = win_idx * dt
+            if t_end - run_start > min_duration:
+                cuts.append((round(run_start, 3), round(t_end, 3)))
+        _, err_bytes = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    if proc.returncode != 0:
+        err = (err_bytes or b"").decode("utf-8", errors="replace")
+        raise ToolError("silence analysis failed: " + _tail(err))
+    return cuts
+
+
+def kept_segments(duration: float, cuts: list[tuple[float, float]]) -> list[tuple[float, float, bool, bool]]:
+    """Return [(start, end, cut_before, cut_after), ...] for the non-silent parts of a file."""
+    kept: list[tuple[float, float, bool, bool]] = []
+    cursor = 0.0
+    for cs, ce in cuts:
+        cs = max(cursor, min(duration, cs))
+        ce = max(cs, min(duration, ce))
+        if cs - cursor >= 0.05:
+            kept.append((round(cursor, 3), round(cs, 3), cursor > 0.02, True))
+        cursor = ce
+    if duration - cursor >= 0.05:
+        kept.append((round(cursor, 3), round(duration, 3), cursor > 0.02, False))
+    return kept
+
+
 def temp_path(path: str) -> str:
     """Hidden temporary name in the same folder (same file system, so rename is atomic)."""
     folder, name = os.path.split(path)
@@ -126,11 +246,36 @@ def temp_path(path: str) -> str:
 
 
 def transcode_args(src: str, dst: str, *, ext: str, probe_: Probe, family: str, method: str,
-                   gain: float, kbps: int | None) -> list[str]:
-    """ffmpeg command: audio gain (volume filter), video and subtitle streams are copied."""
-    args = ["-map", "0:a", "-map", "0:v?", "-c:v", "copy", "-map_metadata", "0"]
-    if ext == "mkv":
-        args += ["-map", "0:s?", "-c:s", "copy"]
+                   gain: float, kbps: int | None, cuts: list[tuple[float, float]] | None = None,
+                   fade_in: float = 0.0, fade_out: float = 0.0) -> list[str]:
+    """ffmpeg command: audio gain (volume filter) and optional silence removal; video/subtitles copied."""
+    kept = kept_segments(probe_.duration or 0.0, cuts) if cuts and probe_.duration else []
+    if kept and cuts:
+        parts: list[str] = []
+        for idx, (s, e, cut_before, cut_after) in enumerate(kept):
+            seg_len = max(0.01, e - s)
+            chain = [f"atrim=start={s:.3f}:end={e:.3f}", "asetpts=PTS-STARTPTS"]
+            fi = min(max(0.0, float(fade_in)), seg_len * 0.5 if cut_after and fade_out > 0 else seg_len) if cut_before else 0.0
+            fo = min(max(0.0, float(fade_out)), seg_len * 0.5 if cut_before and fade_in > 0 else seg_len) if cut_after else 0.0
+            if fi >= 0.01:
+                chain.append(f"afade=t=in:st=0:d={fi:.3f}")
+            if fo >= 0.01:
+                chain.append(f"afade=t=out:st={max(0.0, seg_len - fo):.3f}:d={fo:.3f}")
+            parts.append(f"[0:a:0]{','.join(chain)}[s{idx}]")
+        if len(kept) == 1:
+            label = "[s0]"
+        else:
+            inputs = "".join(f"[s{i}]" for i in range(len(kept)))
+            parts.append(f"{inputs}concat=n={len(kept)}:v=0:a=1[cat]")
+            label = "[cat]"
+        if abs(gain) >= 0.05:
+            parts.append(f"{label}volume={gain:.2f}dB[out]")
+            label = "[out]"
+        args = ["-filter_complex", ";".join(parts), "-map", label, "-map_metadata", "0", "-map_chapters", "-1"]
+    else:
+        args = ["-map", "0:a", "-map", "0:v?", "-c:v", "copy", "-map_metadata", "0"]
+        if ext == "mkv":
+            args += ["-map", "0:s?", "-c:s", "copy"]
     if method == "volume":
         codec = probe_.codec
         args += ["-c:a", codec]
@@ -139,14 +284,17 @@ def transcode_args(src: str, dst: str, *, ext: str, probe_: Probe, family: str, 
     else:
         bitrate = kbps or DEFAULT_KBPS.get(family, 192)
         args += ["-c:a", ENCODER[family], "-b:a", f"{bitrate}k"]
-    args += ["-af", f"volume={gain:.2f}dB"]
+    if not (kept and cuts):
+        args += ["-af", f"volume={gain:.2f}dB"]
     return ["-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src, *args, dst]
 
 
 def transcode(ffmpeg: str, src: str, dst: str, *, ext: str, probe_: Probe, family: str, method: str,
-              gain: float, kbps: int | None, cancel: Cancel = None) -> None:
+              gain: float, kbps: int | None, cancel: Cancel = None,
+              cuts: list[tuple[float, float]] | None = None,
+              fade_in: float = 0.0, fade_out: float = 0.0) -> None:
     cmd = [ffmpeg, *transcode_args(src, dst, ext=ext, probe_=probe_, family=family, method=method,
-                                   gain=gain, kbps=kbps)]
+                                   gain=gain, kbps=kbps, cuts=cuts, fade_in=fade_in, fade_out=fade_out)]
     rc, err = run_tool(cmd, cancel)
     if rc != 0:
         raise ToolError("encoding failed: " + _tail(err))
@@ -232,16 +380,20 @@ def verify_edit(ffmpeg: str, path: str, source: Probe, expected_duration: float,
                         f"instead of {expected_duration:.1f} s")
 
 
-def verify(ffmpeg: str, path: str, source: Probe, cancel: Cancel = None) -> None:
-    """The new file must decode without errors and match the original length and streams."""
+def verify(ffmpeg: str, path: str, source: Probe, cancel: Cancel = None,
+           expected_duration: float | None = None) -> None:
+    """The new file must decode without errors and match the expected length and streams."""
     rc, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
                         "-map", "0:a", "-f", "null", "-"], cancel)
     if rc != 0 or err.strip():
         raise ToolError("verification failed: " + _tail(err))
     out = probe(ffmpeg, path, cancel)
-    if out.audio_streams != source.audio_streams:
+    if expected_duration is None and out.audio_streams != source.audio_streams:
+        raise ToolError("verification failed: audio stream count changed")
+    if expected_duration is not None and out.audio_streams != 1:
         raise ToolError("verification failed: audio stream count changed")
     if source.video_streams and out.video_streams != source.video_streams:
         raise ToolError("verification failed: video stream lost")
-    if source.duration and out.duration is not None and abs(out.duration - source.duration) > 0.5:
+    target_dur = expected_duration if expected_duration is not None else source.duration
+    if target_dur and out.duration is not None and abs(out.duration - target_dur) > 0.6:
         raise ToolError("verification failed: duration changed")

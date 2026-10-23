@@ -13,7 +13,11 @@ DEFAULT_SETTINGS = {
     #   bulk  only a run started by the user checks and normalizes enabled folders; no periodic scan
     #   force like bulk, but a started run checks and normalizes all files in enabled folders again (even if already checked)
     #   auto  new and changed files are found every "scanEvery" minutes and normalized by themselves
-    "general": {"dryRun": False, "preserveMtime": True, "mode": "bulk"},
+    "general": {
+        "dryRun": False, "preserveMtime": True, "mode": "bulk",
+        "trimSilence": False, "silenceLevelPct": 2.0, "silencePeakDb": -40.0,
+        "silenceMinDuration": 5.0, "silenceFadeOut": 0.5, "silenceFadeIn": 0.5,
+    },
     "audio": {
         "target": -16.0, "truePeak": -1.0, "hysteresis": 0.5, "threshold": 6.0, "override": False,
         "lossy": "gain", "writeMode": "inplace", "outputDir": "/data/normalized-audio",
@@ -24,7 +28,11 @@ DEFAULT_SETTINGS = {
     },
 }
 
-RANGES = {"target": (-30.0, -10.0), "truePeak": (-6.0, -1.0), "hysteresis": (0.0, 6.0), "threshold": (1.0, 12.0)}
+RANGES = {
+    "target": (-30.0, -10.0), "truePeak": (-6.0, -1.0), "hysteresis": (0.0, 6.0), "threshold": (1.0, 12.0),
+    "silenceLevelPct": (0.1, 50.0), "silencePeakDb": (-80.0, -10.0),
+    "silenceMinDuration": (0.5, 600.0), "silenceFadeOut": (0.0, 30.0), "silenceFadeIn": (0.0, 30.0),
+}
 MODES = ("off", "bulk", "force", "auto")
 LOSSY_MODES = ("gain", "reencode", "skip")
 WRITE_MODES = ("inplace", "backup", "output")
@@ -77,7 +85,7 @@ def _validate(key: str, value):
         if not lo <= number <= hi:
             raise ValueError(f"{key} must be between {lo:g} and {hi:g}")
         return round(number, 1)
-    if key in ("override", "dryRun", "preserveMtime"):
+    if key in ("override", "dryRun", "preserveMtime", "trimSilence"):
         return bool(value)
     if key == "mode":
         if value not in MODES:

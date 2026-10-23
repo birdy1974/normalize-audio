@@ -460,13 +460,19 @@ class Engine:
             raise ff.ToolError(f"unsupported audio codec '{probe.codec}'")
         self.db.execute("UPDATE files SET gain_db = ?, method = ? WHERE id = ?", (d.gain, d.method, fid))
 
+        cuts = self._silent_cuts(media, src, lufs, probe, st["general"], cancel) if d.action != "skip" else []
         if st["general"]["dryRun"]:
             self.db.execute("UPDATE files SET status = 'dryrun' WHERE id = ?", (fid,))
+            extra = f", {len(cuts)} silent section(s)" if cuts else ""
             self.db.log("info", f"{row['name']}: dry run, would be {d.action}"
-                                f" ({d.gain:+.1f} dB)", media)
+                                f" ({d.gain:+.1f} dB{extra})", media)
             return
         if d.action == "ok":
-            self.db.execute("UPDATE files SET status = 'ok' WHERE id = ?", (fid,))
+            if cuts:
+                eff_method = "volume" if family == "lossless" else "reencode"
+                self._apply(row, cfg_m, st, eff_method, 0.0, probe, family, cancel, cuts=cuts)
+            else:
+                self.db.execute("UPDATE files SET status = 'ok' WHERE id = ?", (fid,))
         elif d.action == "skip":
             self.db.execute("UPDATE files SET status = 'skipped', reason = ? WHERE id = ?", (d.reason, fid))
         elif d.action == "park":
@@ -474,7 +480,22 @@ class Engine:
             if d.reason == "large_change":
                 self.db.log("warn", f"{row['name']}: change {d.gain:+.1f} dB is large, parked for review", media)
         else:
-            self._apply(row, cfg_m, st, d.method, d.gain, probe, family, cancel)
+            self._apply(row, cfg_m, st, d.method, d.gain, probe, family, cancel, cuts=cuts)
+
+    def _silent_cuts(self, media: str, src: str, lufs: float, probe: ff.Probe,
+                     gen: dict, cancel) -> list[tuple[float, float]]:
+        if media != "audio" or not gen.get("trimSilence") or not probe.duration:
+            return []
+        cuts = ff.detect_silent_sections(
+            self.cfg.ffmpeg, src, lufs=lufs,
+            level_pct=gen.get("silenceLevelPct", 2.0),
+            peak_db=gen.get("silencePeakDb", -40.0),
+            min_duration=gen.get("silenceMinDuration", 5.0),
+            cancel=cancel,
+        )
+        if not cuts or not ff.kept_segments(probe.duration, cuts):
+            return []
+        return cuts
 
     def _apply_approved(self, row: dict, cancel) -> None:
         media = row["media"]
@@ -483,20 +504,28 @@ class Engine:
         if row["gain_db"] is None:
             raise ff.ToolError("no gain stored for this file; check it again")
         gain = round(row["gain_db"] + (row["adjust_db"] or 0.0), 2)
-        probe = ff.probe(self.cfg.ffmpeg, self.abs_path(media, row["relpath"]), cancel)
+        src = self.abs_path(media, row["relpath"])
+        probe = ff.probe(self.cfg.ffmpeg, src, cancel)
         family = row["family"] or audio_family(probe.codec)
         room = cfg_m["truePeak"] - row["true_peak"] if row["true_peak"] is not None else None
         if gain > 0 and room is not None and gain > room:
             gain = round(max(0.0, room), 2)
             self.db.log("warn", f"{row['name']}: gain limited to keep the true peak under {cfg_m['truePeak']:.1f} dBTP",
                         media)
-        self._apply(row, cfg_m, st, row["method"] or "reencode", gain, probe, family, cancel)
+        cuts = self._silent_cuts(media, src, row["lufs"] if row["lufs"] is not None else -16.0,
+                                 probe, st["general"], cancel)
+        self._apply(row, cfg_m, st, row["method"] or "reencode", gain, probe, family, cancel, cuts=cuts)
 
-    def _apply(self, row, cfg_m, st, method, gain, probe, family, cancel) -> None:
+    def _apply(self, row, cfg_m, st, method, gain, probe, family, cancel,
+               cuts: list[tuple[float, float]] | None = None) -> None:
         media, fid, rel, name, ext = row["media"], row["id"], row["relpath"], row["name"], row["ext"]
-        if abs(gain) < 0.05:
+        kept = ff.kept_segments(probe.duration or 0.0, cuts) if cuts and probe.duration else []
+        has_cuts = bool(kept and cuts)
+        if abs(gain) < 0.05 and not has_cuts:
             self.db.execute("UPDATE files SET status = 'ok', gain_db = ? WHERE id = ?", (gain, fid))
             return
+        if has_cuts and method in GAIN_TOOLS:
+            method = "volume" if family == "lossless" else "reencode"
         src = self.abs_path(media, rel)
         mode = cfg_m["writeMode"]
         if mode == "output":
@@ -505,7 +534,8 @@ class Engine:
             final = src
         tmp = ff.temp_path(final)
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
-        applied = round(gain, 2)
+        applied = round(gain, 2) if abs(gain) >= 0.05 else 0.0
+        gen = st["general"]
         try:
             if method in GAIN_TOOLS:
                 steps = math.floor(gain / 1.5) if gain > 0 else round(gain / 1.5)
@@ -518,8 +548,12 @@ class Engine:
             else:
                 kbps = probe.kbps or DEFAULT_KBPS.get(family, 192)
                 ff.transcode(self.cfg.ffmpeg, src, tmp, ext=ext, probe_=probe, family=family,
-                             method=method, gain=applied, kbps=kbps, cancel=cancel)
-            ff.verify(self.cfg.ffmpeg, tmp, probe, cancel)
+                             method=method, gain=applied, kbps=kbps, cancel=cancel,
+                             cuts=cuts if has_cuts else None,
+                             fade_in=gen.get("silenceFadeIn", 0.5),
+                             fade_out=gen.get("silenceFadeOut", 0.5))
+            expected_dur = sum(e - s for s, e, _, _ in kept) if has_cuts else None
+            ff.verify(self.cfg.ffmpeg, tmp, probe, cancel, expected_duration=expected_dur)
             self._commit(src, tmp, final, media, rel, mode, st["general"]["preserveMtime"])
         finally:
             if os.path.exists(tmp):
@@ -528,7 +562,12 @@ class Engine:
             "UPDATE files SET status = 'changed', applied_db = ?, gain_db = ?, method = ?, reason = NULL, "
             "changed_at = ? WHERE id = ?",
             (applied, gain, method, time.time(), fid))
-        self.db.log("ok", f"{name}: changed by {applied:+.1f} dB ({method})", media)
+        if has_cuts:
+            removed = sum(ce - cs for cs, ce in cuts)
+            self.db.log("ok", f"{name}: changed by {applied:+.1f} dB ({method}), "
+                              f"removed {len(cuts)} silent section(s) (-{removed:.1f} s)", media)
+        else:
+            self.db.log("ok", f"{name}: changed by {applied:+.1f} dB ({method})", media)
 
     def _commit(self, src: str, tmp: str, final: str, media: str, rel: str, mode: str, preserve: bool) -> None:
         st = os.stat(src)
