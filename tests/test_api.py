@@ -369,6 +369,8 @@ def test_dashboard_reports_that_a_scan_is_running(client, cfg):
 def test_settings_are_validated(client):
     assert client.put("/api/settings", json={"audio": {"target": 50}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"target": -31}}).status_code == 400
+    assert client.put("/api/settings", json={"audio": {"hysteresis": -0.5}}).status_code == 400
+    assert client.put("/api/settings", json={"audio": {"hysteresis": 6.5}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"lossy": "transcode"}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"writeMode": "trash"}}).status_code == 400
     assert client.put("/api/settings", json={"audio": {"outputDir": "relative/path"}}).status_code == 400
@@ -377,10 +379,11 @@ def test_settings_are_validated(client):
 
 
 def test_valid_settings_are_saved_and_rounded(client):
-    r = client.put("/api/settings", json={"audio": {"target": -18.04, "lossy": "skip", "writeMode": "backup"}})
+    r = client.put("/api/settings", json={"audio": {"target": -18.04, "hysteresis": 1.24, "lossy": "skip", "writeMode": "backup"}})
     assert r.status_code == 200
     saved = client.get("/api/settings").json()["audio"]
     assert saved["target"] == -18.0
+    assert saved["hysteresis"] == 1.2
     assert saved["lossy"] == "skip"
     assert saved["writeMode"] == "backup"
 

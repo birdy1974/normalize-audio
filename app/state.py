@@ -15,16 +15,16 @@ DEFAULT_SETTINGS = {
     #   auto  new and changed files are found every "scanEvery" minutes and normalized by themselves
     "general": {"dryRun": False, "preserveMtime": True, "mode": "bulk"},
     "audio": {
-        "target": -16.0, "truePeak": -1.0, "threshold": 6.0, "override": False,
+        "target": -16.0, "truePeak": -1.0, "hysteresis": 0.5, "threshold": 6.0, "override": False,
         "lossy": "gain", "writeMode": "inplace", "outputDir": "/data/normalized-audio",
     },
     "video": {
-        "target": -16.0, "truePeak": -1.0, "threshold": 6.0, "override": False,
+        "target": -16.0, "truePeak": -1.0, "hysteresis": 0.5, "threshold": 6.0, "override": False,
         "writeMode": "inplace", "outputDir": "/data/normalized-video",
     },
 }
 
-RANGES = {"target": (-30.0, -10.0), "truePeak": (-6.0, -1.0), "threshold": (1.0, 12.0)}
+RANGES = {"target": (-30.0, -10.0), "truePeak": (-6.0, -1.0), "hysteresis": (0.0, 6.0), "threshold": (1.0, 12.0)}
 MODES = ("off", "bulk", "force", "auto")
 LOSSY_MODES = ("gain", "reencode", "skip")
 WRITE_MODES = ("inplace", "backup", "output")

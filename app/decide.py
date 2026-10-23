@@ -30,11 +30,12 @@ def limit_gain(gain_raw: float, true_peak: float | None, ceiling: float) -> tupl
 
 def decide(*, media: str, ext: str, family: str | None, measured: float, true_peak: float | None,
            target: float, ceiling: float, threshold: float, override: bool,
-           strategy: str, tools: set[str]) -> Decision:
+           strategy: str, tools: set[str], hysteresis: float = NO_CHANGE_DB) -> Decision:
     if family is None:
         return Decision("error", reason="unsupported")
-    gain, capped = limit_gain(round(target - measured, 2), true_peak, ceiling)
-    if abs(gain) < NO_CHANGE_DB:
+    raw_gain = round(target - measured, 2)
+    gain, capped = limit_gain(raw_gain, true_peak, ceiling)
+    if abs(raw_gain) <= hysteresis or abs(gain) <= hysteresis or abs(gain) < 0.05:
         return Decision("ok", None, gain, None, capped)
 
     if family == "lossless":

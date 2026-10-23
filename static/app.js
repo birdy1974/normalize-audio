@@ -47,8 +47,8 @@
   };
   const DEFAULTS = {
     general: { dryRun: false, preserveMtime: true, mode: 'bulk' },
-    audio: { target: -16, truePeak: -1, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
-    video: { target: -16, truePeak: -1, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
+    audio: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
+    video: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
   };
   const PRESETS = {
     nights: (d, h) => h >= 22 || h < 6,
@@ -1492,7 +1492,7 @@
         : '<button class="btn btn-sm" data-action="check-level" data-idx="' + i + '">Check level</button>';
       const cls = checking ? 'is-busy-row' : playing ? 'is-playing-row' : '';
       return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>'
-        + '<td>' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
+        + '<td class="file-cell">' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
         + '<td class="num">' + fmtLufs(f.lufs) + '</td>'
         + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
@@ -1500,7 +1500,7 @@
         + '<td class="actions-cell">' + listen + editing + check + '</td></tr>';
     }).join('');
     return head
-      + '<div class="table-wrap"><table><thead><tr><th>File</th><th>Format</th><th class="num">Level'
+      + '<div class="table-wrap files-table-wrap"><table class="files-table"><thead><tr><th>File</th><th>Format</th><th class="num">Level'
       + tip('Integrated loudness of the whole file (EBU R128), measured without changing the file. Check level measures one file again.')
       + '</th><th class="num">Change</th><th>Method</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
       + (b.rows.length >= 500 ? '<p class="small muted" style="margin-top:10px">Showing the first 500 files.</p>' : '');
@@ -1707,18 +1707,23 @@
     const cfg = state.draft[t];
     return '<section class="card"><div class="card-head"><div><h2>Level</h2><div class="sub">Applies to ' + MEDIA[t].label.toLowerCase() + ' files</div></div></div>'
       + '<div class="field"><label class="lbl" for="target-' + t + '">Target loudness (integrated, EBU R128)'
-      + tip('−16 LUFS suits podcasts and speech, −14 suits music streaming, −23 is the EBU broadcast standard.') + '</label>'
+      + tip('Higher numbers (closer to 0, such as −14 or −10 LUFS) make the music louder; lower numbers (more negative, such as −23 or −30 LUFS) make it quieter. −14 LUFS suits music streaming, −16 suits podcasts and speech, and −23 is the TV broadcast standard.') + '</label>'
       + '<div class="slider-row"><input id="target-' + t + '" type="range" min="-30" max="-10" step="0.5" value="' + cfg.target + '" data-scope="' + t + '" data-setting="target">'
       + '<div class="val"><span data-out="' + t + '.target">' + Number(cfg.target).toFixed(1) + '</span> LUFS</div></div>'
       + '<p class="baseline-link-row"><a class="inline-link" href="#/directories" data-action="baseline-start" data-media="' + t + '">Set the baseline from a file: check its level in Directories →</a></p>'
       + '</div>'
       + '<div class="field"><label class="lbl" for="tp-' + t + '">True-peak ceiling'
-      + tip('The gain is capped so that no sample exceeds this level, which prevents clipping.') + '</label>'
+      + tip('Prevents distortion (clipping) when boosting quiet files. Higher numbers (closer to 0, such as −1.0 dBTP) allow louder peaks so quiet music can be turned up further; lower numbers (more negative, such as −6.0 dBTP) leave more headroom and keep boosted files quieter.') + '</label>'
       + '<div class="slider-row"><input id="tp-' + t + '" type="range" min="-6" max="-1" step="0.1" value="' + cfg.truePeak + '" data-scope="' + t + '" data-setting="truePeak">'
       + '<div class="val"><span data-out="' + t + '.truePeak">' + Number(cfg.truePeak).toFixed(1) + '</span> dBTP</div></div>'
       + '</div>'
+      + '<div class="field"><label class="lbl" for="hys-' + t + '">Hysteresis (no-change bandwidth)'
+      + tip('If a file\'s loudness is already within ± this bandwidth around the target, its audio level is not changed. Higher numbers (up to 6.0 dB) leave files that are already fairly close to the target untouched; lower numbers (down to 0.0 dB) adjust even small volume differences so files match the target more tightly.') + '</label>'
+      + '<div class="slider-row"><input id="hys-' + t + '" type="range" min="0" max="6" step="0.1" value="' + (cfg.hysteresis ?? 0.5) + '" data-scope="' + t + '" data-setting="hysteresis">'
+      + '<div class="val">±<span data-out="' + t + '.hysteresis">' + Number(cfg.hysteresis ?? 0.5).toFixed(1) + '</span> dB</div></div>'
+      + '</div>'
       + '<div class="field"><label class="lbl" for="th-' + t + '">Large-change threshold'
-      + tip('Changes bigger than this are parked for review instead of being applied.') + '</label>'
+      + tip('Changes bigger than this are parked for review instead of being applied automatically. A higher number (up to 12 dB) lets the app make larger volume jumps (much louder or quieter) on its own; a lower number (down to 1 dB) only applies small tweaks automatically and parks bigger changes.') + '</label>'
       + '<div class="slider-row"><input id="th-' + t + '" type="range" min="1" max="12" step="0.5" value="' + cfg.threshold + '" data-scope="' + t + '" data-setting="threshold">'
       + '<div class="val"><span data-out="' + t + '.threshold">' + Number(cfg.threshold).toFixed(1) + '</span> dB</div></div>'
       + '</div>'

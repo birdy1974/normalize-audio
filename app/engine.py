@@ -454,7 +454,8 @@ class Engine:
         strategy = cfg_m.get("lossy", "reencode") if media == "audio" else "reencode"
         d = decide(media=media, ext=row["ext"], family=family, measured=lufs, true_peak=true_peak,
                    target=cfg_m["target"], ceiling=cfg_m["truePeak"], threshold=cfg_m["threshold"],
-                   override=cfg_m["override"], strategy=strategy, tools=self.tools)
+                   override=cfg_m["override"], strategy=strategy, tools=self.tools,
+                   hysteresis=cfg_m.get("hysteresis", 0.5))
         if d.action == "error":
             raise ff.ToolError(f"unsupported audio codec '{probe.codec}'")
         self.db.execute("UPDATE files SET gain_db = ?, method = ? WHERE id = ?", (d.gain, d.method, fid))

@@ -12,6 +12,14 @@ def test_small_change_is_ok():
     assert d(measured=-16.3).action == "ok"
 
 
+def test_hysteresis_bandwidth_skips_changes_within_band():
+    # target is -16.0; at measured -18.0 (+2.0 dB needed), hysteresis of 2.0 keeps it as 'ok'
+    assert d(measured=-18.0, hysteresis=2.0).action == "ok"
+    assert d(measured=-14.0, hysteresis=2.0).action == "ok"
+    # outside the +/-2.0 dB hysteresis bandwidth, the change is applied
+    assert d(measured=-18.5, hysteresis=2.0).action == "apply"
+
+
 def test_gain_tool_used_for_mp3_when_installed():
     x = d()
     assert (x.action, x.method, x.gain) == ("apply", "mp3gain", 5.0)

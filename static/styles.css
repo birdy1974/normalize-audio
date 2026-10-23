@@ -142,6 +142,7 @@ body {
 .app.is-rail .brand, .app.auto-rail .brand { padding: 4px 0; }
 
 .content { min-width: 0; padding: 28px 36px 64px; max-width: 1220px; }
+.content:has(.split-dirs) { max-width: none; }
 
 /* ---------- type ---------- */
 a { color: var(--text); text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 3px; }
@@ -321,7 +322,10 @@ input[type=range]::-moz-range-thumb { width: 14px; height: 14px; background: var
 .tag { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 7px; margin-left: 8px; color: var(--muted); vertical-align: 1px; }
 
 /* ---------- directory tree ---------- */
-.split-dirs { display: grid; grid-template-columns: minmax(360px, 46%) minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 16px; }
+.split-dirs { display: grid; grid-template-columns: minmax(220px, 28%) minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 16px; }
+.files-table-wrap { overflow-x: visible; }
+.files-table th, .files-table td { padding: 9px 8px; white-space: nowrap; }
+.files-table td.file-cell { width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .tree { min-width: 0; overflow-x: auto; }
 .tree ul { list-style: none; margin: 0; padding-left: 18px; }
 .tree > ul { padding-left: 0; }
@@ -449,7 +453,7 @@ tr.row-sel td { background: var(--accent-tint); }
 .tip-body {
   display: none; position: absolute; z-index: 60;
   bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
-  width: max-content; max-width: 280px;
+  width: max-content; max-width: 320px;
   background: var(--ink); color: #fff;
   font-size: 12px; font-weight: 400; line-height: 1.45;
   padding: 8px 10px; border-radius: var(--r-s);
