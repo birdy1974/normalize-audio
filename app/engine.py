@@ -162,6 +162,20 @@ class Engine:
             items = sorted(self._inflight.values(), key=lambda item: item["approved"])
             return items[0]["relpath"] if items else None
 
+    def approved_status(self) -> tuple[int, str | None]:
+        """Return (count, current_relpath) of approved parked files currently running or waiting."""
+        with self._lock:
+            inflight = {
+                fid: item["relpath"]
+                for fid, item in self._inflight.items()
+                if item.get("approved")
+            }
+        rows = self.db.query("SELECT id, relpath FROM files WHERE status = 'approved' ORDER BY id")
+        waiting = [r["relpath"] for r in rows if r["id"] not in inflight]
+        count = len(inflight) + len(waiting)
+        current = next(iter(inflight.values()), None) or (waiting[0] if waiting else None)
+        return count, current
+
     def status(self, media_stats: dict | None = None) -> str:
         mode = self.mode()
         if mode == "off":
