@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -219,6 +220,129 @@ def detect_silent_sections(ffmpeg: str, path: str, *, lufs: float,
         err = (err_bytes or b"").decode("utf-8", errors="replace")
         raise ToolError("silence analysis failed: " + _tail(err))
     return cuts
+
+
+def analyze_audio(ffmpeg: str, path: str, *,
+                  level_pct: float = 2.0, peak_db: float = -40.0,
+                  min_duration: float = 5.0,
+                  cancel: Cancel = None) -> tuple[float, float, Probe, list[tuple[float, float]]]:
+    """Measure LUFS, true peak, stream info and silent sections in one single ffmpeg pass."""
+    cmd = [
+        ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-i", path,
+        "-map", "0:a:0",
+        "-af", f"ebur128=peak=true,aresample={SILENCE_RATE},aformat=sample_fmts=s16:channel_layouts=mono",
+        "-f", "s16le", "-",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    err_chunks: list[bytes] = []
+
+    def _read_err() -> None:
+        while True:
+            b = proc.stderr.read(65536)
+            if not b:
+                break
+            err_chunks.append(b)
+
+    err_thread = threading.Thread(target=_read_err, daemon=True)
+    err_thread.start()
+
+    pks = array.array("f")
+    rmss = array.array("f")
+    rest = b""
+    tail_dur = 0.0
+    try:
+        while True:
+            if cancel and cancel():
+                proc.kill()
+                proc.communicate()
+                raise Cancelled()
+            chunk = proc.stdout.read(65536)
+            if not chunk:
+                break
+            data = rest + chunk
+            usable = (len(data) // (SILENCE_WIN * 2)) * (SILENCE_WIN * 2)
+            if not usable:
+                rest = data
+                continue
+            rest = data[usable:]
+            samples = array.array("h")
+            samples.frombytes(data[:usable])
+            if sys.byteorder != "little":
+                samples.byteswap()
+            for offset in range(0, len(samples), SILENCE_WIN):
+                sl = samples[offset:offset + SILENCE_WIN]
+                hi, lo = max(sl), min(sl)
+                pk = hi if hi >= -lo else -lo
+                rms = math.sqrt(sum(x * x for x in sl) / SILENCE_WIN)
+                pks.append(pk)
+                rmss.append(rms)
+        if len(rest) >= 2:
+            samples = array.array("h")
+            samples.frombytes(rest[:(len(rest) // 2) * 2])
+            if sys.byteorder != "little":
+                samples.byteswap()
+            hi, lo = max(samples), min(samples)
+            pk = hi if hi >= -lo else -lo
+            rms = math.sqrt(sum(x * x for x in samples) / len(samples))
+            pks.append(pk)
+            rmss.append(rms)
+            tail_dur = len(samples) / SILENCE_RATE
+        proc.wait(timeout=10)
+        err_thread.join(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    err = b"".join(err_chunks).decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise ToolError("analysis failed: " + _tail(err))
+    i_vals = _I.findall(err)
+    tp_vals = _TP.findall(err)
+    if not i_vals or not tp_vals:
+        raise ToolError("analysis gave no result")
+    lufs = -70.0 if i_vals[-1] == "-inf" else float(i_vals[-1])
+    tp = -70.0 if tp_vals[-1] == "-inf" else float(tp_vals[-1])
+    probe = _parse_probe(err)
+    if lufs <= -60 or not probe.duration:
+        return lufs, tp, probe, []
+
+    avg_amp = 32768.0 * (10.0 ** (float(lufs) / 20.0))
+    rms_limit = avg_amp * (max(0.0, float(level_pct)) / 100.0)
+    peak_limit = 32768.0 * (10.0 ** (float(peak_db) / 20.0))
+    dt = SILENCE_WIN / SILENCE_RATE
+    cuts: list[tuple[float, float]] = []
+    run_start: float | None = None
+    n_full = len(pks) - (1 if tail_dur > 0 else 0)
+    for idx in range(n_full):
+        pk = pks[idx]
+        silent = False if pk > peak_limit else (True if pk <= rms_limit else rmss[idx] <= rms_limit)
+        t0 = idx * dt
+        if silent:
+            if run_start is None:
+                run_start = t0
+        elif run_start is not None:
+            if t0 - run_start > min_duration:
+                cuts.append((round(run_start, 3), round(t0, 3)))
+            run_start = None
+    if tail_dur > 0:
+        idx = n_full
+        pk = pks[idx]
+        silent = False if pk > peak_limit else (True if pk <= rms_limit else rmss[idx] <= rms_limit)
+        t0 = idx * dt
+        t_end = t0 + tail_dur
+        if silent:
+            if run_start is None:
+                run_start = t0
+            if t_end - run_start > min_duration:
+                cuts.append((round(run_start, 3), round(t_end, 3)))
+            run_start = None
+    if run_start is not None:
+        t_end = n_full * dt
+        if t_end - run_start > min_duration:
+            cuts.append((round(run_start, 3), round(t_end, 3)))
+    return lufs, tp, probe, cuts
 
 
 def kept_segments(duration: float, cuts: list[tuple[float, float]]) -> list[tuple[float, float, bool, bool]]:

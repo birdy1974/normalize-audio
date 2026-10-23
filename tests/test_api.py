@@ -623,7 +623,7 @@ def test_the_mode_setting_switches_the_app_on_and_off(client, cfg):
     assert d["next_scan"] is None
     assert client.post("/api/run/start").status_code == 200
     d = client.get("/api/dashboard").json()
-    assert d["run_mode"] == "active"
+    assert d["run_mode"] == "active" and d["status"] in ("running", "waiting_window")
     assert d["media"]["audio"]["files_pending"] == 1         # Music/a.flac re-queued; Old/* left untouched
     assert d["media"]["audio"]["files_checked"] == 0
     assert client.app_state.db.one("SELECT status FROM files WHERE relpath = 'Old/b.flac'")["status"] == "ok"

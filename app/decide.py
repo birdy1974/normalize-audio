@@ -35,14 +35,15 @@ def decide(*, media: str, ext: str, family: str | None, measured: float, true_pe
         return Decision("error", reason="unsupported")
     raw_gain = round(target - measured, 2)
     gain, capped = limit_gain(raw_gain, true_peak, ceiling)
-    if abs(raw_gain) <= hysteresis or abs(gain) <= hysteresis or abs(gain) < 0.05:
-        return Decision("ok", None, gain, None, capped)
+    within_band = abs(raw_gain) <= hysteresis or abs(gain) <= hysteresis or abs(gain) < 0.05
 
     if family == "lossless":
         method = "volume"                       # same codec, gain applied to the samples
     elif media == "video":
         method = "reencode"                     # gain-only is impossible inside a video container
     elif strategy == "skip":
+        if within_band:
+            return Decision("ok", None, gain, None, capped)
         return Decision("skip", None, gain, "lossy_skipped", capped)
     elif strategy == "reencode":
         method = "reencode"
@@ -52,8 +53,13 @@ def decide(*, media: str, ext: str, family: str | None, measured: float, true_pe
             tool = None
         if tool and tool in tools:
             method = tool
+        elif within_band:
+            return Decision("ok", "reencode", gain, None, capped)
         else:
             return Decision("park", "reencode", gain, "lossy_no_gain_tool", capped)
+
+    if within_band:
+        return Decision("ok", method, gain, None, capped)
 
     if abs(gain) > threshold and not override:
         return Decision("park", method, gain, "large_change", capped)
