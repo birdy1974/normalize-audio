@@ -443,6 +443,9 @@ def test_parked_list_and_adjust_approve_skip(client, cfg):
     assert client.post(f"/api/parked/{fid}/adjust", json={}).status_code == 400
 
     assert client.post(f"/api/parked/{fid}/approve").status_code == 200
+    dash = client.get("/api/dashboard").json()
+    assert dash["approved_pending"] == 1
+    assert dash["current_file"] == "Music/a.flac"
     assert client.post(f"/api/parked/{fid}/approve").status_code == 409     # no longer parked
     assert client.post(f"/api/parked/{fid}/adjust", json={"value": 1.0}).status_code == 409
 

@@ -90,7 +90,7 @@
      running normalization, the periodic scan). */
   function startBusy(text) {
     const id = 'b' + (++busySeq);
-    state.busy[id] = { text, secs: null };
+    state.busy[id] = { text, secs: null, startedAt: Date.now() };
     showActivity();
     return id;
   }
@@ -110,8 +110,15 @@
     return { stop: () => clearInterval(timer) };
   }
 
-  function endBusy(id) {
+  function endBusy(id, minMs = 0) {
     if (state.busy[id] === undefined) return;
+    if (minMs > 0 && state.busy[id].startedAt) {
+      const remain = minMs - (Date.now() - state.busy[id].startedAt);
+      if (remain > 0) {
+        setTimeout(() => endBusy(id, 0), remain);
+        return;
+      }
+    }
     delete state.busy[id];
     showActivity();
   }
@@ -121,6 +128,11 @@
     if (!d) return [];
     const out = [];
     const auto = d.mode === 'auto';
+    if (d.approved_pending > 0) {
+      const fileSub = d.current_file ? folderTail(d.current_file) : 'applying parked file';
+      const sub = d.approved_pending > 1 ? fileSub + ' · ' + d.approved_pending + ' left' : fileSub;
+      out.push({ busy: true, text: 'Applying parked changes', sub: sub });
+    }
     if (d.status === 'running') {
       out.push({ busy: true, text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
     } else if (d.status === 'paused') {
@@ -1035,6 +1047,8 @@
     haTest: '',
     trees: { audio: null, video: null },   // { roots, map, rootFiles } built from /api/folders/tree
     selected: { audio: null, video: null },// selected folder (relpath) per media type
+    treeScroll: { audio: { top: 0, left: 0 }, video: { top: 0, left: 0 } },
+    filesScroll: { audio: { rel: null, top: 0, left: 0 }, video: { rel: null, top: 0, left: 0 } },
     browse: { media: null, rel: null, rows: null, loading: false },
     fileSel: [],                    // selected file ids in the Directories files pane
     scanning: { audio: false, video: false },  // a rescan of the base location is running
@@ -1546,6 +1560,42 @@
       + (b.rows.length >= 500 ? '<p class="small muted" style="margin-top:10px">Showing the first 500 files.</p>' : '');
   }
 
+  function captureDirScroll() {
+    const root = app();
+    if (!root) return;
+    const treeEl = root.querySelector('.split-dirs > .tree');
+    if (treeEl) {
+      const m = treeEl.dataset.media || state.media;
+      state.treeScroll[m] = { top: treeEl.scrollTop, left: treeEl.scrollLeft };
+    }
+    const filesEl = root.querySelector('.split-dirs > .files-pane');
+    if (filesEl) {
+      const m = filesEl.dataset.media || state.media;
+      state.filesScroll[m] = {
+        rel: filesEl.dataset.rel || null,
+        top: filesEl.scrollTop,
+        left: filesEl.scrollLeft,
+      };
+    }
+  }
+
+  function restoreDirScroll(t, selRel) {
+    const root = app();
+    if (!root) return;
+    const treeEl = root.querySelector('.split-dirs > .tree');
+    const savedTree = state.treeScroll[t];
+    if (treeEl && savedTree) {
+      treeEl.scrollTop = savedTree.top;
+      treeEl.scrollLeft = savedTree.left;
+    }
+    const filesEl = root.querySelector('.split-dirs > .files-pane');
+    const savedFiles = state.filesScroll[t];
+    if (filesEl && savedFiles && savedFiles.rel === (selRel || '')) {
+      filesEl.scrollTop = savedFiles.top;
+      filesEl.scrollLeft = savedFiles.left;
+    }
+  }
+
   function renderDirectories() {
     const t = state.media;
     const tr = tree(t);
@@ -1553,6 +1603,7 @@
     const selRel = state.selected[t];
     const sel = selRel && tr.map.get(selRel);
     const scanning = !!state.scanning[t];
+    captureDirScroll();
     if (sel && (state.browse.media !== t || state.browse.rel !== sel.rel) && !state.browse.loading) {
       loadBrowse(sel.rel);
     }
@@ -1575,13 +1626,15 @@
       + baselinePanel(t)
       + dirs
       + '<div class="split-dirs">'
-      + '<section class="card tree" aria-label="Folder tree"><ul>' + renderTree(tr.roots) + '</ul></section>'
-      + '<section class="card">' + (sel ? renderBrowse(sel) : '<p class="muted">Select a folder in the tree.</p>') + '</section>'
+      + '<section class="card tree" data-media="' + t + '" aria-label="Folder tree"><ul>' + renderTree(tr.roots) + '</ul></section>'
+      + '<section class="card files-pane" data-media="' + t + '" data-rel="' + esc(selRel || '') + '">'
+      + (sel ? renderBrowse(sel) : '<p class="muted">Select a folder in the tree.</p>') + '</section>'
       + '</div>';
     app().querySelectorAll('input[data-check]').forEach((cb) => {
       const n = tr.map.get(cb.dataset.check);
       cb.indeterminate = !!n && subtreeState(n) === 'mixed';
     });
+    restoreDirScroll(t, selRel);
   }
 
   /* ---------------------------------------------------------------- parked */
@@ -2016,8 +2069,40 @@
     if (el && state.dash) el.textContent = ALL.reduce((a, t) => a + dashMedia(t).files_parked, 0);
   }
 
+  let approvedWatchTimer = null;
+  function watchApprovedWork() {
+    if (approvedWatchTimer) return;
+    approvedWatchTimer = setInterval(async () => {
+      try {
+        await refreshDash();
+        if (currentRoute() === 'parked' && !state.dragging) {
+          const t = state.media;
+          const d = await loadParkedData(t);
+          if (JSON.stringify(d) !== JSON.stringify(state.parked[t]) && currentRoute() === 'parked' && !state.dragging) {
+            state.parked[t] = d;
+            render();
+          }
+        }
+      } catch (_err) {
+        /* ignore transient errors */
+      }
+      if (!state.dash || !state.dash.approved_pending) {
+        clearInterval(approvedWatchTimer);
+        approvedWatchTimer = null;
+      }
+    }, 800);
+  }
+
+  function hasCachedRouteData(route) {
+    const t = state.media;
+    if (route === 'directories') return !!(state.trees[t] && state.settings && state.dash);
+    if (route === 'parked') return !!(state.parked[t] && state.settings);
+    return false;
+  }
+
   function render() {
     const route = currentRoute();
+    captureDirScroll();
     document.querySelectorAll('#nav a').forEach((a) => {
       if (a.dataset.route === route) a.setAttribute('aria-current', 'page');
       else a.removeAttribute('aria-current');
@@ -2034,11 +2119,13 @@
     }
     const missing = keys.filter((k) => !state.loaded[k]);
     if (missing.length) {
-      app().innerHTML = pageHead(TITLES[route], '', '') + '<p class="muted">Loading…</p>';
       missing.forEach((k) => {
         if (!state.pending[k]) loadKey(k).then(render);
       });
-      return;
+      if (!hasCachedRouteData(route)) {
+        app().innerHTML = pageHead(TITLES[route], '', '') + '<p class="muted">Loading…</p>';
+        return;
+      }
     }
     ROUTES[route]();
     document.querySelectorAll('input[type=range]').forEach(paintRange);
@@ -2142,33 +2229,74 @@
       render();
     } else if (a === 'approve' || a === 'skip') {
       const path = a === 'approve' ? 'approve' : 'skip';
-      await api('/parked/' + el.dataset.file + '/' + path, { method: 'POST' });
-      state.parkSel = state.parkSel.filter((id) => String(id) !== el.dataset.file);
-      invalidate('parked:' + t);
-      await refreshDash();
-      toast(a === 'approve' ? 'Queued: the change will be applied in the next run' : 'Skipped');
+      const f = ((state.parked[t] && state.parked[t].files) || []).find((x) => String(x.id) === String(el.dataset.file));
+      const label = f ? f.name : 'parked file';
+      const busy = startBusy((a === 'approve' ? 'Applying parked change · ' : 'Skipping · ') + label);
+      const elapsed = tickBusy(busy);
+      try {
+        await api('/parked/' + el.dataset.file + '/' + path, { method: 'POST' });
+        state.parkSel = state.parkSel.filter((id) => String(id) !== el.dataset.file);
+        invalidate('parked:' + t);
+        await Promise.all([loadKey('parked:' + t), refreshDash()]);
+        if (a === 'approve') watchApprovedWork();
+        toast(a === 'approve' ? 'Applying change to ' + label : 'Skipped ' + label);
+      } finally {
+        elapsed.stop();
+        endBusy(busy, 800);
+      }
       render();
     } else if (a === 'approve-all') {
-      const r = await api('/parked/approve-all', { method: 'POST', body: { media: t, reason: el.dataset.reason } });
-      state.parkSel = [];
-      invalidate('parked:' + t);
-      await refreshDash();
-      toast(r.done + ' file' + (r.done === 1 ? '' : 's') + ' queued');
+      const busy = startBusy('Applying all parked ' + MEDIA[t].label.toLowerCase() + ' files');
+      const elapsed = tickBusy(busy);
+      try {
+        const r = await api('/parked/approve-all', { method: 'POST', body: { media: t, reason: el.dataset.reason } });
+        state.parkSel = [];
+        invalidate('parked:' + t);
+        await Promise.all([loadKey('parked:' + t), refreshDash()]);
+        if (r.done) watchApprovedWork();
+        toast('Applying ' + r.done + ' parked file' + (r.done === 1 ? '' : 's'));
+      } finally {
+        elapsed.stop();
+        endBusy(busy, 800);
+      }
       render();
     } else if (a === 'adjust-file') {
-      await api('/parked/' + el.dataset.file + '/adjust', { method: 'POST', body: { delta: Number(el.dataset.step) } });
-      invalidate('parked:' + t);
+      const f = ((state.parked[t] && state.parked[t].files) || []).find((x) => String(x.id) === String(el.dataset.file));
+      const busy = startBusy('Adjusting change · ' + (f ? f.name : 'parked file'));
+      try {
+        await api('/parked/' + el.dataset.file + '/adjust', { method: 'POST', body: { delta: Number(el.dataset.step) } });
+        invalidate('parked:' + t);
+        await loadKey('parked:' + t);
+      } finally {
+        endBusy(busy, 500);
+      }
       render();
     } else if (a === 'bulk-adjust') {
-      await api('/parked/bulk', { method: 'POST', body: { ids: state.parkSel, action: 'adjust', delta: Number(el.dataset.step) } });
-      invalidate('parked:' + t);
+      const count = state.parkSel.length;
+      const busy = startBusy('Adjusting ' + count + ' selected parked file' + (count === 1 ? '' : 's'));
+      try {
+        await api('/parked/bulk', { method: 'POST', body: { ids: state.parkSel, action: 'adjust', delta: Number(el.dataset.step) } });
+        invalidate('parked:' + t);
+        await loadKey('parked:' + t);
+      } finally {
+        endBusy(busy, 500);
+      }
       render();
     } else if (a === 'apply-selected') {
-      const r = await api('/parked/bulk', { method: 'POST', body: { ids: state.parkSel, action: 'approve' } });
-      state.parkSel = [];
-      invalidate('parked:' + t);
-      await refreshDash();
-      toast(r.done + ' selected file' + (r.done === 1 ? '' : 's') + ' queued');
+      const count = state.parkSel.length;
+      const busy = startBusy('Applying ' + count + ' selected parked file' + (count === 1 ? '' : 's'));
+      const elapsed = tickBusy(busy);
+      try {
+        const r = await api('/parked/bulk', { method: 'POST', body: { ids: state.parkSel, action: 'approve' } });
+        state.parkSel = [];
+        invalidate('parked:' + t);
+        await Promise.all([loadKey('parked:' + t), refreshDash()]);
+        if (r.done) watchApprovedWork();
+        toast('Applying ' + r.done + ' selected file' + (r.done === 1 ? '' : 's'));
+      } finally {
+        elapsed.stop();
+        endBusy(busy, 800);
+      }
       render();
     } else if (a === 'clear-selection') {
       state.parkSel = [];
@@ -2359,9 +2487,17 @@
         if (out) out.textContent = fmtDb(tenth(Number(el.value)));
         return;
       }
-      await api('/parked/' + el.dataset.parkSlider + '/adjust', { method: 'POST', body: { value: Number(el.value) } });
-      state.dragging = false;
-      invalidate('parked:' + state.media);
+      const t = state.media;
+      const f = ((state.parked[t] && state.parked[t].files) || []).find((x) => String(x.id) === String(el.dataset.parkSlider));
+      const busy = startBusy('Adjusting change · ' + (f ? f.name : 'parked file'));
+      try {
+        await api('/parked/' + el.dataset.parkSlider + '/adjust', { method: 'POST', body: { value: Number(el.value) } });
+        state.dragging = false;
+        invalidate('parked:' + t);
+        await loadKey('parked:' + t);
+      } finally {
+        endBusy(busy, 500);
+      }
       render();
       return;
     }
@@ -2460,6 +2596,22 @@
       render();
     }
   }
+
+  document.addEventListener('scroll', (e) => {
+    const el = e.target;
+    if (!el || !el.classList || !el.matches) return;
+    if (el.matches('.split-dirs > .tree')) {
+      const m = el.dataset.media || state.media;
+      state.treeScroll[m] = { top: el.scrollTop, left: el.scrollLeft };
+    } else if (el.matches('.split-dirs > .files-pane')) {
+      const m = el.dataset.media || state.media;
+      state.filesScroll[m] = {
+        rel: el.dataset.rel || null,
+        top: el.scrollTop,
+        left: el.scrollLeft,
+      };
+    }
+  }, true);
 
   document.addEventListener('input', (e) => { onField(e).catch(SAVE_ERR); });
   document.addEventListener('change', (e) => { onField(e).catch(SAVE_ERR); });
