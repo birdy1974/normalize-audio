@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS files (
     applied_db REAL,
     method TEXT,
     changed_at REAL,
+    silent_sections INTEGER NOT NULL DEFAULT 0,
+    silent_duration REAL NOT NULL DEFAULT 0,
+    silence_trimmed INTEGER NOT NULL DEFAULT 0,
     seen_at REAL NOT NULL,
     UNIQUE (media, relpath)
 );
@@ -67,6 +70,14 @@ class Database:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(files)").fetchall()}
+            for col, ddl in (
+                ("silent_sections", "INTEGER NOT NULL DEFAULT 0"),
+                ("silent_duration", "REAL NOT NULL DEFAULT 0"),
+                ("silence_trimmed", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if col not in cols:
+                    self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} {ddl}")
 
     def query(self, sql: str, args=()) -> list[dict]:
         with self._lock:

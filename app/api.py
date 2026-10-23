@@ -51,6 +51,12 @@ class MeasureBody(BaseModel):
     relpath: str
 
 
+class FilesBatchBody(BaseModel):
+    media: Literal["audio", "video"]
+    ids: list[int] = Field(default_factory=list)
+    dir: str | None = None
+
+
 class EditBody(BaseModel):
     media: Literal["audio"]
     relpath: str
@@ -278,7 +284,8 @@ def list_files(media: str = "audio", dir: str = ".", engine=Engine):
     _media_check(media)
     rows = engine.db.query(
         "SELECT id, name, relpath, ext, lufs, true_peak, status, reason, gain_db, adjust_db, applied_db, "
-        "method, measured_at, changed_at FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
+        "method, measured_at, changed_at, silent_sections, silent_duration, silence_trimmed "
+        "FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
         (media, dir))
     for row in rows:
         row["playable"] = row["ext"] in PLAYABLE[media]
@@ -305,6 +312,18 @@ def measure(body: MeasureBody, engine=Engine):
     if ".." in body.relpath.split("/") or body.relpath.startswith("/"):
         raise HTTPException(400, "invalid path")
     return engine.measure(body.media, body.relpath)
+
+
+@router.post("/files/check-batch")
+def check_batch(body: FilesBatchBody, engine=Engine):
+    _media_check(body.media)
+    return engine.check_files(body.media, ids=body.ids or None, dir_rel=body.dir)
+
+
+@router.post("/files/execute-batch")
+def execute_batch(body: FilesBatchBody, engine=Engine):
+    _media_check(body.media)
+    return engine.execute_files(body.media, ids=body.ids or None, dir_rel=body.dir)
 
 
 @router.get("/files/info")

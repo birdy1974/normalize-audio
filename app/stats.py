@@ -14,9 +14,11 @@ def has_pending(db: Database, media: str) -> bool:
 
 
 def media_stats(db: Database, media: str) -> dict:
-    total = pending = checked = changed = parked = skipped = errors = 0
+    total = pending = checked = changed = parked = skipped = errors = empty_sections = empty_changed = 0
     rows = db.query(
-        "SELECT f.status, (f.measured_at IS NOT NULL) AS measured, COUNT(*) AS n "
+        "SELECT f.status, (f.measured_at IS NOT NULL) AS measured, COUNT(*) AS n, "
+        "COALESCE(SUM(CASE WHEN f.silent_sections > 0 OR f.silence_trimmed = 1 THEN 1 ELSE 0 END), 0) AS has_empty, "
+        "COALESCE(SUM(CASE WHEN f.silence_trimmed = 1 OR (f.status = 'changed' AND f.silent_sections > 0) THEN 1 ELSE 0 END), 0) AS empty_chg "
         "FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
         "WHERE f.media = ? AND d.enabled = 1 GROUP BY f.status, measured",
         (media,),
@@ -24,6 +26,8 @@ def media_stats(db: Database, media: str) -> dict:
     for r in rows:
         n = r["n"]
         total += n
+        empty_sections += r["has_empty"]
+        empty_changed += r["empty_chg"]
         if r["measured"]:
             checked += n
         status = r["status"]
@@ -52,4 +56,6 @@ def media_stats(db: Database, media: str) -> dict:
         "files_parked": parked,
         "files_skipped": skipped,
         "files_errors": errors,
+        "files_empty_sections": empty_sections,
+        "files_empty_changed": empty_changed,
     }

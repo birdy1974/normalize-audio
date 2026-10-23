@@ -667,9 +667,64 @@ def test_trim_silence_removes_long_silent_sections_with_fades(lib):
     run_until_idle(engine, db)
 
     assert row(db, "long_gap.flac")["status"] == "changed"
+    assert row(db, "long_gap.flac")["silent_sections"] == 1
+    assert row(db, "long_gap.flac")["silence_trimmed"] == 1
     assert abs((ff.probe(FFMPEG, long_gap).duration or 0.0) - 4.0) < 0.3
 
     assert row(db, "short_gap.flac")["status"] == "changed"
+    assert row(db, "short_gap.flac")["silent_sections"] == 0
+    assert row(db, "short_gap.flac")["silence_trimmed"] == 0
     assert abs((ff.probe(FFMPEG, short_gap).duration or 0.0) - 5.0) < 0.3
+
+    from app import stats
+    m_stats = stats.media_stats(db, "audio")
+    assert m_stats["files_empty_sections"] == 1
+    assert m_stats["files_empty_changed"] == 1
+
+
+def test_measure_after_normalization_updates_gain_db_to_zero(lib):
+    cfg, engine, db = lib
+    tone(os.path.join(cfg.audio_root, "norm.flac"), -6, codec_args=("-c:a", "flac"))
+    set_settings(db, target=-16.0, threshold=12.0)
+    open_windows(db)
+    engine.scan_now("audio")
+    engine.start()
+    run_until_idle(engine, db)
+
+    assert row(db, "norm.flac")["status"] == "changed"
+    assert row(db, "norm.flac")["gain_db"] > 5.0
+
+    engine.scan_now("audio")
+    res = engine.measure("audio", "norm.flac")
+    assert res["gain_db"] == 0.0
+    assert row(db, "norm.flac")["gain_db"] == 0.0
+
+
+def test_check_files_and_execute_files_batch(lib):
+    cfg, engine, db = lib
+    tone(os.path.join(cfg.audio_root, "one.flac"), -6, codec_args=("-c:a", "flac"))
+    make(
+        os.path.join(cfg.audio_root, "two.flac"),
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]",
+        "-map", "[a]", "-c:a", "flac",
+    )
+    set_settings(db, target=-16.0, threshold=12.0)
+    state.put_settings(db, {"general": {"trimSilence": True, "silenceMinDuration": 2.5}})
+    engine.scan_now("audio")
+
+    chk = engine.check_files("audio", dir_rel=".")
+    assert chk == {"checked": 2, "empty_sections": 1}
+    assert row(db, "one.flac")["silent_sections"] == 0
+    assert row(db, "two.flac")["silent_sections"] == 1
+
+    exe = engine.execute_files("audio", ids=[row(db, "two.flac")["id"]])
+    assert exe == {"executed": 1, "changed": 1}
+    assert row(db, "two.flac")["status"] == "changed"
+    assert row(db, "two.flac")["silence_trimmed"] == 1
+    assert row(db, "one.flac")["status"] == "pending"
+
 
 
