@@ -1140,30 +1140,59 @@
 
   function invalidate(key) { delete state.loaded[key]; }
 
+  let dashSeq = 0;
   async function refreshDash() {
+    const seq = ++dashSeq;
     const d = await api('/dashboard');
+    if (seq < dashSeq) return;
     const key = JSON.stringify(d);
     if (key !== state.dashKey) {
       state.dash = d;
       state.dashKey = key;
       state.loaded.dashboard = true;
-      if (currentRoute() === 'dashboard') render();
-      else updateNavBadge();
+      state.browse.stale = true;
+      const route = currentRoute();
+      if (route === 'dashboard') {
+        render();
+      } else if (route === 'directories') {
+        const t = state.media;
+        invalidate('dir:' + t);
+        if (state.selected[t]) loadBrowse(state.selected[t], true);
+        render();
+      } else {
+        updateNavBadge();
+      }
+    }
+    if (d.status === 'running' || d.scanning || d.approved_pending > 0) {
+      watchApprovedWork();
     }
     showActivity();                 // the run state lives in the dashboard data
   }
 
-  async function loadBrowse(rel) {
+  let browseSeq = 0;
+  async function loadBrowse(rel, quiet) {
     const t = state.media;
-    state.browse = { media: t, rel: rel, rows: null, loading: true };
+    const seq = ++browseSeq;
+    const sameFolder = state.browse.media === t && state.browse.rel === rel && Array.isArray(state.browse.rows);
+    state.browse = {
+      media: t,
+      rel: rel,
+      rows: quiet && sameFolder ? state.browse.rows : null,
+      loading: !(quiet && sameFolder),
+      stale: false,
+    };
     try {
       const d = await api('/files?media=' + t + '&dir=' + encodeURIComponent(rel));
-      if (state.browse.rel === rel && state.browse.media === t) state.browse = { media: t, rel: rel, rows: d.files, loading: false };
+      if (seq === browseSeq && (state.selected[t] === rel || state.browse.rel === rel) && state.media === t) {
+        state.browse = { media: t, rel: rel, rows: d.files, loading: false, stale: false };
+      }
     } catch (err) {
-      if (state.browse.rel === rel) state.browse = { media: t, rel: rel, rows: [], loading: false };
-      toast(err.message);
+      if (seq === browseSeq && state.browse.rel === rel) {
+        state.browse = { media: t, rel: rel, rows: state.browse.rows || [], loading: false, stale: false };
+      }
+      if (!quiet) toast(err.message);
     }
-    render();
+    if (currentRoute() === 'directories') render();
   }
 
   /* Look for new, changed and removed files and folders on disk. One scan per media type at a
@@ -1212,6 +1241,11 @@
   function openDirectories() {
     const t = state.media;
     invalidate('dir:' + t);                 // read the tree from the database; use Rescan to scan the disk
+    if (state.selected[t]) {
+      loadBrowse(state.selected[t], true);
+    } else {
+      state.browse = { media: null, rel: null, rows: null, loading: false, stale: true };
+    }
   }
 
   /* ----------------------------------------------------- derived helpers */
@@ -1604,8 +1638,8 @@
     const sel = selRel && tr.map.get(selRel);
     const scanning = !!state.scanning[t];
     captureDirScroll();
-    if (sel && (state.browse.media !== t || state.browse.rel !== sel.rel) && !state.browse.loading) {
-      loadBrowse(sel.rel);
+    if (sel && (state.browse.stale || state.browse.media !== t || state.browse.rel !== sel.rel) && !state.browse.loading) {
+      loadBrowse(sel.rel, state.browse.media === t && state.browse.rel === sel.rel);
     }
     const dirs = !tr.roots.length
       ? '<p class="muted">No folders found under the base location. Check the mount in docker-compose.yml, then use Rescan.</p>'
@@ -2086,7 +2120,8 @@
       } catch (_err) {
         /* ignore transient errors */
       }
-      if (!state.dash || !state.dash.approved_pending) {
+      const d = state.dash;
+      if (!d || (!d.approved_pending && d.status !== 'running' && !d.scanning)) {
         clearInterval(approvedWatchTimer);
         approvedWatchTimer = null;
       }
@@ -2144,8 +2179,42 @@
       closePreview();
       render();
     } else if (a === 'run') {
-      await api('/run/' + el.dataset.path, { method: 'POST' });
-      await refreshDash();
+      const action = el.dataset.path;
+      const mode = state.dash ? state.dash.mode : 'bulk';
+      const label = action === 'start'
+        ? (mode === 'force' ? 'Starting force run' : 'Starting bulk run')
+        : action === 'stop'
+          ? 'Stopping run'
+          : (state.dash && state.dash.paused ? 'Resuming run' : 'Pausing run');
+      const busy = startBusy(label);
+      const elapsed = tickBusy(busy);
+      if (state.dash) {
+        if (action === 'start') {
+          const inWin = ALL.some((m) => state.dash.types && state.dash.types[m] && state.dash.media && state.dash.media[m] && state.dash.media[m].in_window);
+          state.dash.run_mode = 'active';
+          state.dash.paused = false;
+          state.dash.status = inWin ? 'running' : 'waiting_window';
+        } else if (action === 'stop') {
+          state.dash.run_mode = 'stopped';
+          state.dash.paused = false;
+          state.dash.status = 'stopped';
+        } else if (action === 'pause') {
+          state.dash.paused = !state.dash.paused;
+          state.dash.status = state.dash.paused ? 'paused' : 'running';
+        }
+        state.dashKey = JSON.stringify(state.dash);
+        render();
+      }
+      try {
+        await api('/run/' + action, { method: 'POST' });
+        await refreshDash();
+        if (action === 'start' || (state.dash && state.dash.status === 'running')) {
+          watchApprovedWork();
+        }
+      } finally {
+        elapsed.stop();
+        endBusy(busy, 600);
+      }
       render();
     } else if (a === 'set-mode') {
       const mode = el.dataset.mode;
@@ -2649,6 +2718,36 @@
   /* the info icon must not toggle the checkbox or radio of its label */
   document.addEventListener('click', (e) => {
     if (e.target.closest && e.target.closest('.tip')) e.preventDefault();
+  });
+
+  function positionTip(tipEl) {
+    if (!tipEl) return;
+    const body = tipEl.querySelector('.tip-body');
+    if (!body) return;
+    const rect = tipEl.getBoundingClientRect();
+    const inTh = !!tipEl.closest('th, .page-head');
+    body.style.position = 'fixed';
+    body.style.transform = 'none';
+    body.style.zIndex = '200';
+    const w = Math.min(320, Math.max(180, body.offsetWidth || 260));
+    const left = Math.max(12, Math.min(window.innerWidth - w - 12, Math.round(rect.left + rect.width / 2 - w / 2)));
+    body.style.left = left + 'px';
+    if (inTh || rect.top < 100) {
+      body.style.top = Math.round(rect.bottom + 8) + 'px';
+      body.style.bottom = 'auto';
+    } else {
+      body.style.bottom = Math.round(window.innerHeight - rect.top + 8) + 'px';
+      body.style.top = 'auto';
+    }
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const tipEl = e.target.closest && e.target.closest('.tip');
+    if (tipEl) positionTip(tipEl);
+  });
+  document.addEventListener('focusin', (e) => {
+    const tipEl = e.target.closest && e.target.closest('.tip');
+    if (tipEl) positionTip(tipEl);
   });
 
   /* ------------------------------------------------------------------ menu */

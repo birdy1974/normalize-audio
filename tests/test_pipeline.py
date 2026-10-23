@@ -727,4 +727,27 @@ def test_check_files_and_execute_files_batch(lib):
     assert row(db, "one.flac")["status"] == "pending"
 
 
+def test_normalization_run_saves_check_results_for_files_pane(lib):
+    cfg, engine, db = lib
+    ok_path = tone(os.path.join(cfg.audio_root, "already_ok.flac"), 0, codec_args=("-c:a", "flac"))
+    tone(os.path.join(cfg.audio_root, "needs_change.flac"), -6, codec_args=("-c:a", "flac"))
+    ok_lufs = loudness(FFMPEG, ok_path)
+    set_settings(db, target=ok_lufs, threshold=12.0)
+    open_windows(db)
+    engine.scan_now("audio")
+    engine.start()
+    run_until_idle(engine, db)
+
+    r_ok = row(db, "already_ok.flac")
+    assert r_ok["status"] == "ok"
+    assert r_ok["lufs"] is not None and r_ok["measured_at"] is not None
+    assert r_ok["gain_db"] is not None and r_ok["method"] == "volume"
+
+    r_chg = row(db, "needs_change.flac")
+    assert r_chg["status"] == "changed"
+    assert r_chg["lufs"] is not None and r_chg["measured_at"] is not None
+    assert r_chg["gain_db"] is not None and r_chg["method"] == "volume"
+
+
+
 

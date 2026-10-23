@@ -149,8 +149,12 @@ def dashboard(engine=Engine):
             total += s["files_total"]
             checked += s["files_checked"]
     approved_pending, approved_file = engine.approved_status()
+    st_now = engine.status(media)
+    current = engine.current_file() or approved_file
+    if not current and st_now == "running":
+        current = engine.next_pending_file(run["types"])
     return {
-        "status": engine.status(media),
+        "status": st_now,
         "mode": settings["general"]["mode"],      # off / bulk / force / auto: what the app does on its own
         "run_mode": run["mode"],                  # the run engine: active / stopped
         "paused": run["paused"],
@@ -160,7 +164,7 @@ def dashboard(engine=Engine):
         "last_scan": run.get("lastScan"),
         "next_scan": engine.next_scan(),          # None unless Automatic mode is selected
         "progress_percent": int(round(100 * checked / total)) if total else 0,
-        "current_file": engine.current_file() or approved_file,
+        "current_file": current,
         "approved_pending": approved_pending,
         "scanning": engine.scanning(),
         "dry_run": settings["general"]["dryRun"],

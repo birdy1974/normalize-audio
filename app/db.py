@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS dirs (
     PRIMARY KEY (media, relpath)
 );
 CREATE INDEX IF NOT EXISTS dirs_parent ON dirs(media, parent);
+CREATE INDEX IF NOT EXISTS dirs_enabled ON dirs(media, enabled, relpath);
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     media TEXT NOT NULL,
@@ -47,6 +48,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_status ON files(media, status);
 CREATE INDEX IF NOT EXISTS files_dir ON files(media, dir);
+CREATE INDEX IF NOT EXISTS files_dir_status ON files(media, dir, status);
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -69,6 +71,9 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn.execute("PRAGMA cache_size=-16000")
             self._conn.executescript(SCHEMA)
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(files)").fetchall()}
             for col, ddl in (

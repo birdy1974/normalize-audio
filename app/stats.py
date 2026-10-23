@@ -6,8 +6,8 @@ from .db import Database
 
 def has_pending(db: Database, media: str) -> bool:
     row = db.one(
-        "SELECT 1 FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
-        "WHERE f.media = ? AND f.status IN ('pending', 'approved', 'processing') AND d.enabled = 1 LIMIT 1",
+        "SELECT 1 FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+        "WHERE d.media = ? AND d.enabled = 1 AND f.status IN ('pending', 'approved', 'processing') LIMIT 1",
         (media,),
     )
     return row is not None
@@ -19,8 +19,8 @@ def media_stats(db: Database, media: str) -> dict:
         "SELECT f.status, (f.measured_at IS NOT NULL) AS measured, COUNT(*) AS n, "
         "COALESCE(SUM(CASE WHEN f.silent_sections > 0 OR f.silence_trimmed = 1 THEN 1 ELSE 0 END), 0) AS has_empty, "
         "COALESCE(SUM(CASE WHEN f.silence_trimmed = 1 OR (f.status = 'changed' AND f.silent_sections > 0) THEN 1 ELSE 0 END), 0) AS empty_chg "
-        "FROM files f JOIN dirs d ON d.media = f.media AND d.relpath = f.dir "
-        "WHERE f.media = ? AND d.enabled = 1 GROUP BY f.status, measured",
+        "FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+        "WHERE d.media = ? AND d.enabled = 1 GROUP BY f.status, measured",
         (media,),
     )
     for r in rows:
