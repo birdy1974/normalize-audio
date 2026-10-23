@@ -50,6 +50,7 @@
       dryRun: false, preserveMtime: true, mode: 'bulk',
       trimSilence: false, silenceLevelPct: 2.0, silencePeakDb: -40.0,
       silenceMinDuration: 5.0, silenceFadeOut: 0.5, silenceFadeIn: 0.5,
+      coverAuto: false, coverSources: 'both', discogsToken: '', useLocalCover: true,
     },
     audio: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
     video: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
@@ -1054,6 +1055,17 @@
     scanning: { audio: false, video: false },  // a rescan of the base location is running
     busy: {},                       // what this browser is doing now: id -> { text, secs }
     parked: { audio: null, video: null },  // GET /api/parked
+    coverParked: null,              // GET /api/covers/parked (separate cover art pane)
+    coverParkMode: 'album',         // 'album' | 'file' in the cover art parked pane
+    discogsTest: '',
+    metadata: null,                 // GET /api/metadata
+    metaSel: [],                    // selected file ids on the Meta data tab
+    metaFilterStatus: 'diff',       // 'diff' | 'path_diff' | 'missing' | 'all'
+    metaFilterField: 'all',         // 'all' or field key
+    metaFilterFolder: 'all',        // 'all' or folder relpath
+    metaSearch: '',                 // search query on the Meta data tab
+    metaSort: 'folder',             // 'folder' | 'name' | 'diffs_desc' | 'path_first'
+    metaEditing: {},                // { "fileId:field": true } for inline custom input
     parkSel: [],                    // selected parked file ids
     parkSort: 'order',
     measure: null,                  // last file level check (baseline)
@@ -1068,7 +1080,8 @@
     switch (route) {
       case 'dashboard': return ['dashboard', 'settings'];
       case 'directories': return ['dir:' + t, 'settings', 'dashboard'];   // folder counts come from the dashboard
-      case 'parked': return ['parked:' + t, 'settings'];
+      case 'parked': return t === 'audio' ? ['parked:' + t, 'coverParked', 'settings'] : ['parked:' + t, 'settings'];
+      case 'metadata': return ['metadata', 'dashboard', 'settings'];
       case 'schedule': return ['schedule'];
       case 'settings': return ['settings', 'schedule'];
       case 'homeassistant': return ['ha'];
@@ -1123,6 +1136,10 @@
       }
     } else if (parts[0] === 'parked') {
       state.parked[parts[1]] = await loadParkedData(parts[1]);
+    } else if (key === 'coverParked') {
+      state.coverParked = await api('/covers/parked');
+    } else if (key === 'metadata') {
+      state.metadata = await api('/metadata');
     }
   }
 
@@ -1352,6 +1369,11 @@
       + stat('4 · Actually changed', fmt(m.files_changed), 'level set to ' + Number(m.target).toFixed(1) + ' LUFS')
       + stat('5 · Parked', fmt(m.files_parked), '<a href="#/parked">waiting for your decision</a>')
       + stat('6 · Empty sections changed', fmt(m.files_empty_changed || 0), fmt(m.files_empty_sections || 0) + ' detected with empty sections')
+      + (t === 'audio'
+        ? stat('7 · Cover art', fmt(m.files_cover_present || 0) + ' with cover',
+               fmt(m.files_cover_embedded || 0) + ' embedded · ' + fmt(m.files_cover_missing || 0) + ' missing'
+               + (m.files_cover_parked ? ' · <a href="#/parked">' + fmt(m.files_cover_parked) + ' waiting</a>' : ''))
+        : '')
       + '</div>'
       + '<p class="small muted" style="margin-top:12px">' + esc(scheduleText(t)) + '</p>'
       + '</section>';
@@ -1454,6 +1476,10 @@
         : '<span class="muted">manual only (Rescan or opening Directories)</span>') + '</dd></div>'
       + '<div><dt>Parked for review</dt><dd><a href="#/parked">Audio ' + dashMedia('audio').files_parked + ' · Video ' + dashMedia('video').files_parked + '</a>'
       + (parkedTotal ? '' : ' <span class="muted">(none)</span>') + '</dd></div>'
+      + '<div><dt>Cover art (audio)</dt><dd><a href="#/parked">' + fmt(dashMedia('audio').files_cover_parked || 0) + ' waiting</a>'
+      + ' <span class="muted">(' + fmt(dashMedia('audio').files_cover_present || 0) + ' with cover · '
+      + fmt(dashMedia('audio').files_cover_missing || 0) + ' missing)</span>'
+      + ' · <button class="btn btn-sm" data-action="cover-check-bulk">Check covers</button></dd></div>'
       + '<div><dt>Empty sections changed</dt><dd>Audio ' + fmt(dashMedia('audio').files_empty_changed || 0)
       + ' <span class="muted">(' + fmt(dashMedia('audio').files_empty_sections || 0) + ' detected)</span></dd></div>'
       + '<div><dt>Errors</dt><dd>' + errors + '</dd></div>'
@@ -1529,6 +1555,30 @@
     return '—';
   }
 
+  function coverLabel(f, i) {
+    if (f.has_cover) {
+      const emb = f.cover_status === 'embedded';
+      return '<button type="button" class="cover-chip-btn' + (emb ? ' is-embedded' : '') + '" data-action="open-cover-modal" data-idx="' + i + '" title="Click to view or change cover art">'
+        + '<img class="cover-mini-thumb" src="/api/files/' + f.id + '/cover?v=' + encodeURIComponent(f.changed_at || f.measured_at || 1) + '" alt="" loading="lazy">'
+        + '<span>' + (emb ? 'embedded' : 'present') + '</span></button>';
+    }
+    if (f.cover_status === 'choices') {
+      const cnt = f.cover_choices_count || 'multiple';
+      return '<button type="button" class="cover-chip-btn is-choices" data-action="open-cover-modal" data-idx="' + i + '" title="Multiple pictures found — click to choose">'
+        + esc(cnt) + ' choices</button>';
+    }
+    if (f.cover_status === 'not_found') {
+      return '<button type="button" class="cover-chip-btn dim" data-action="open-cover-modal" data-idx="' + i + '" title="No cover found automatically — click to search">not found</button>';
+    }
+    if (f.cover_status === 'skipped') {
+      return '<button type="button" class="cover-chip-btn dim" data-action="open-cover-modal" data-idx="' + i + '" title="Cover skipped — click to search">skipped</button>';
+    }
+    if (f.has_cover === 0) {
+      return '<button type="button" class="cover-chip-btn dim" data-action="open-cover-modal" data-idx="' + i + '" title="No embedded cover picture — click to search Discogs / open sources">missing</button>';
+    }
+    return '<button type="button" class="cover-chip-btn dim" data-action="open-cover-modal" data-idx="' + i + '">check</button>';
+  }
+
   function renderBrowse(node) {
     const t = node.type;
     const b = state.browse;
@@ -1537,8 +1587,14 @@
     state.fileSel = sel;
     const hasRows = !!(b.rows && b.rows.length);
     const selSuffix = sel.length ? ' (' + sel.length + ')' : '';
+    const coverBtns = hasRows && t === 'audio'
+      ? '<button class="btn btn-sm" data-action="check-covers-dir" title="Check and propose/embed missing cover art for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check covers' + selSuffix + '</button>'
+        + '<button class="btn btn-sm" data-action="open-album-cover" title="Search and set cover art for this album / folder">Album cover' + selSuffix + '</button>'
+        + '<button class="btn btn-sm" data-action="check-meta-dir" title="Check metadata tags for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check meta' + selSuffix + '</button>'
+      : '';
     const batchBtns = hasRows
-      ? '<button class="btn btn-sm" data-action="check-all-files" title="Check level and empty sections for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check all' + selSuffix + '</button>'
+      ? coverBtns
+        + '<button class="btn btn-sm" data-action="check-all-files" title="Check level and empty sections for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check all' + selSuffix + '</button>'
         + '<button class="btn btn-sm btn-primary" data-action="execute-files" title="Execute normalization for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Execute' + selSuffix + '</button>'
       : '';
     const head = '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
@@ -1564,6 +1620,12 @@
             ? ' disabled title="This file is being processed right now"'
             : ' title="Edit ' + esc(f.name) + ': fades and cut"') + '>Edit</button>'
         : '';
+      const coverBtn = t === 'audio'
+        ? '<button class="btn btn-sm" data-action="open-cover-modal" data-idx="' + i + '" title="Search or choose cover art for ' + esc(f.name) + '">Cover</button>'
+        : '';
+      const metaBtn = t === 'audio'
+        ? '<button class="btn btn-sm" data-action="open-meta-modal" data-idx="' + i + '" title="Check and update metadata tags for ' + esc(f.name) + '">Meta</button>'
+        : '';
       const listen = !f.playable
         ? '<button class="btn btn-sm" disabled title="This format cannot be played in the browser">Play</button>'
         : '<button class="btn btn-sm' + (playing ? ' btn-primary' : '') + '" data-action="preview" data-idx="' + i
@@ -1576,17 +1638,22 @@
       return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>'
         + '<td class="pick"><input type="checkbox" data-file-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
         + '<td class="file-cell">' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
+        + (t === 'audio' ? '<td class="cover-cell">' + coverLabel(f, i) + '</td>' : '')
         + '<td class="num">' + fmtLufs(f.lufs) + '</td>'
         + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
         + '<td>' + emptyLabel(f) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
         + '<td>' + statusLabel(f.status) + '</td>'
-        + '<td class="actions-cell">' + listen + editing + check + '</td></tr>';
+        + '<td class="actions-cell">' + listen + editing + coverBtn + metaBtn + check + '</td></tr>';
     }).join('');
     return head
       + '<div class="table-wrap files-table-wrap"><table class="files-table"><thead><tr>'
       + '<th class="pick"><input type="checkbox" data-file-all aria-label="Select all files in this folder"' + (allOn ? ' checked' : '') + '></th>'
-      + '<th>File</th><th>Format</th><th class="num">Level'
+      + '<th>File</th><th>Format</th>'
+      + (t === 'audio'
+        ? '<th>Cover' + tip('Embedded cover picture in the audio metadata. Click a cover badge or Cover button to view, pick between found pictures, or search Discogs and open sources (per file or per album).') + '</th>'
+        : '')
+      + '<th class="num">Level'
       + tip('Integrated loudness of the whole file (EBU R128), measured without changing the file. Check level measures one file again.')
       + '</th><th class="num">Change</th><th>Empty'
       + tip('Long silent ("no sound") sections detected in the file based on the thresholds in Settings.')
@@ -1720,6 +1787,126 @@
       + '<tbody>' + files.map((f) => parkedRow(f, t, lossy, sel)).join('') + '</tbody></table></div>';
   }
 
+  function renderCoverParkedPane() {
+    const cp = state.coverParked || { albums: [], choices_files: [], not_found_files: [], counts: { albums: 0, choices: 0, not_found: 0, total: 0 } };
+    const mode = state.coverParkMode || 'album';
+    const choicesCount = cp.choices_files.length;
+    const nfCount = cp.not_found_files.length;
+    const modeSeg = '<div class="seg" role="group" aria-label="Cover update grouping">'
+      + '<button type="button" class="' + (mode === 'album' ? 'on' : '') + '" data-action="cover-park-mode" data-mode="album">Per album (' + cp.albums.length + ')</button>'
+      + '<button type="button" class="' + (mode === 'file' ? 'on' : '') + '" data-action="cover-park-mode" data-mode="file">Per file (' + choicesCount + ')</button>'
+      + '</div>';
+
+    let bodyHtml = '';
+    if (!choicesCount && !nfCount) {
+      bodyHtml = '<p class="muted">No audio files are waiting for cover art selection. Use <strong>Check missing covers</strong> to scan enabled folders for missing pictures.</p>';
+    } else {
+      if (choicesCount > 0) {
+        if (mode === 'album') {
+          bodyHtml += cp.albums.map((g) => {
+            const albumTitle = [g.artist, g.album].filter(Boolean).join(' — ') || folderLabel(g.dir);
+            const overrideBadge = g.query_source === 'path_override'
+              ? '<span class="cover-override-tag" title="ID3 tag was totally different from the folder/file name, so the folder/file name was used">Folder/file name used (ID3 differed)</span>'
+              : '';
+            const idsStr = g.file_ids.join(',');
+            const candsHtml = g.candidates.map((c) => {
+              const thumb = c.thumb_url || c.image_url || '';
+              return '<div class="cover-cand">'
+                + '<div class="cover-cand-img-wrap">'
+                + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
+                + '</div>'
+                + '<div class="cover-cand-title">' + esc(c.title || 'Cover') + '</div>'
+                + '<div class="cover-cand-meta"><span class="tag" style="margin:0">' + esc(c.source || 'Source') + '</span>'
+                + '<span>' + esc(c.year || '') + '</span></div>'
+                + '<div class="cover-cand-actions">'
+                + '<button type="button" class="btn btn-sm btn-primary" data-action="cover-apply-cand" data-file="' + g.primary_file_id + '" data-scope="album" data-ids="' + esc(idsStr) + '" data-url="' + esc(c.image_url) + '">Use for album (' + g.file_ids.length + ')</button>'
+                + '<button type="button" class="btn btn-sm" data-action="cover-apply-cand" data-file="' + g.primary_file_id + '" data-scope="file" data-url="' + esc(c.image_url) + '" title="Apply only to ' + esc(g.files[0].name) + '">1 file</button>'
+                + '</div></div>';
+            }).join('');
+            const fileNames = g.files.slice(0, 6).map((f) => esc(f.name)).join(' · ')
+              + (g.files.length > 6 ? ' · +' + (g.files.length - 6) + ' more' : '');
+            return '<div class="cover-album-group">'
+              + '<div class="cover-album-head"><div>'
+              + '<strong>' + esc(albumTitle) + '</strong>' + overrideBadge
+              + '<div class="small muted mono">' + esc(g.dir) + ' · ' + g.file_ids.length + ' file' + (g.file_ids.length === 1 ? '' : 's') + '</div>'
+              + '<div class="small muted" style="margin-top:2px">' + fileNames + '</div>'
+              + '</div>'
+              + '<div class="btns">'
+              + '<button type="button" class="btn btn-sm" data-action="open-cover-by-id" data-file="' + g.primary_file_id + '" data-scope="album" data-ids="' + esc(idsStr) + '">Search / Edit query</button>'
+              + '<button type="button" class="btn btn-sm" data-action="cover-skip" data-ids="' + esc(idsStr) + '">Skip album</button>'
+              + '</div></div>'
+              + '<div class="cover-grid">' + candsHtml + '</div>'
+              + '</div>';
+          }).join('');
+        } else {
+          bodyHtml += cp.choices_files.map((f) => {
+            const queryLabel = [f.artist, f.album, f.title].filter(Boolean).join(' · ') || f.name;
+            const overrideBadge = f.query_source === 'path_override'
+              ? '<span class="cover-override-tag" title="ID3 tag was totally different from the folder/file name, so the folder/file name was used">Folder/file name used (ID3 differed)</span>'
+              : '';
+            const candsHtml = f.candidates.map((c) => {
+              const thumb = c.thumb_url || c.image_url || '';
+              return '<div class="cover-cand">'
+                + '<div class="cover-cand-img-wrap">'
+                + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
+                + '</div>'
+                + '<div class="cover-cand-title">' + esc(c.title || 'Cover') + '</div>'
+                + '<div class="cover-cand-meta"><span class="tag" style="margin:0">' + esc(c.source || 'Source') + '</span>'
+                + '<span>' + esc(c.year || '') + '</span></div>'
+                + '<div class="cover-cand-actions">'
+                + '<button type="button" class="btn btn-sm btn-primary" data-action="cover-apply-cand" data-file="' + f.id + '" data-scope="file" data-url="' + esc(c.image_url) + '">Use for file</button>'
+                + '<button type="button" class="btn btn-sm" data-action="cover-apply-cand" data-file="' + f.id + '" data-scope="album" data-url="' + esc(c.image_url) + '">Album</button>'
+                + '</div></div>';
+            }).join('');
+            return '<div class="cover-album-group">'
+              + '<div class="cover-album-head"><div>'
+              + '<strong>' + esc(f.name) + '</strong>' + overrideBadge
+              + '<div class="small muted">' + esc(queryLabel) + ' · <span class="mono">' + esc(f.dir) + '</span></div>'
+              + '</div>'
+              + '<div class="btns">'
+              + '<button type="button" class="btn btn-sm" data-action="open-cover-by-id" data-file="' + f.id + '" data-scope="file">Search / Edit query</button>'
+              + '<button type="button" class="btn btn-sm" data-action="cover-skip" data-ids="' + f.id + '">Skip</button>'
+              + '</div></div>'
+              + '<div class="cover-grid">' + candsHtml + '</div>'
+              + '</div>';
+          }).join('');
+        }
+      }
+
+      if (nfCount > 0) {
+        const nfRows = cp.not_found_files.map((f) => {
+          const q = [f.artist, f.album, f.title].filter(Boolean).join(' · ') || '—';
+          const overrideBadge = f.query_source === 'path_override'
+            ? '<span class="cover-override-tag">Folder/file name used</span>'
+            : '';
+          return '<tr>'
+            + '<td class="file-cell">' + esc(f.name) + '</td>'
+            + '<td class="dim mono folder-cell">' + esc(folderLabel(f.dir)) + '</td>'
+            + '<td>' + esc(q) + overrideBadge + '</td>'
+            + '<td class="actions">'
+            + '<button type="button" class="btn btn-sm btn-primary" data-action="open-cover-by-id" data-file="' + f.id + '" data-scope="album">Search cover</button>'
+            + '<button type="button" class="btn btn-sm" data-action="cover-skip" data-ids="' + f.id + '">Skip</button>'
+            + '</td></tr>';
+        }).join('');
+        bodyHtml += '<div style="margin-top:' + (choicesCount ? '18px' : '0') + '">'
+          + '<h2 style="margin-bottom:8px">No picture found automatically (' + nfCount + ')</h2>'
+          + '<p class="small muted" style="margin-bottom:10px">Use Search cover to adjust the Artist / Album / Title query and pick a picture for the file or album.</p>'
+          + '<div class="table-wrap"><table><thead><tr><th>File</th><th>Folder</th><th>Query tried</th><th></th></tr></thead>'
+          + '<tbody>' + nfRows + '</tbody></table></div></div>';
+      }
+    }
+
+    return '<section class="card cover-parked-pane" id="cover-parked-pane">'
+      + '<div class="card-head"><div><h2>Cover art — picture selection &amp; missing covers</h2>'
+      + '<div class="sub">Separate pane for audio files without embedded pictures. Choose between multiple found pictures per album or per file, or bulk-update with the best match.</div></div>'
+      + '<div class="btns">' + modeSeg
+      + '<button type="button" class="btn btn-sm" data-action="cover-check-bulk">Check missing covers</button>'
+      + '<button type="button" class="btn btn-sm btn-primary" data-action="cover-apply-first-all"' + (choicesCount ? '' : ' disabled') + '>Use first picture for all (' + choicesCount + ')</button>'
+      + '</div></div>'
+      + bodyHtml
+      + '</section>';
+  }
+
   function renderParked() {
     const t = state.media;
     const data = state.parked[t];
@@ -1751,10 +1938,11 @@
       + '<button class="btn btn-primary" data-action="approve-all" data-reason="lossy_no_gain_tool"' + (lossy.length ? '' : ' disabled') + '>Re-encode all (' + lossy.length + ')</button></div>'
       + (lossy.length ? parkedTable(lossy, t, true, sel) : '<p class="muted">No lossy files are waiting.</p>')
       + '</section>';
+    const coverSection = t === 'audio' ? renderCoverParkedPane() : '';
     app().innerHTML = pageHead('Parked files',
-      'Files that need a decision are listed here. Each one is parked, not applied, until you approve it.',
+      'Files that need a decision are listed here. Audio normalization parked files and missing/multi-choice cover art have separate panes.',
       '<a class="btn" href="#/settings">Threshold</a>', true)
-      + (t === 'audio' ? largeSection + lossySection : largeSection);
+      + (t === 'audio' ? largeSection + lossySection + coverSection : largeSection);
   }
 
   /* -------------------------------------------------------------- schedule */
@@ -1966,6 +2154,41 @@
       + '</div></section>';
   }
 
+  function coverCard() {
+    const g = state.draft.general;
+    const srcMode = g.coverSources || 'both';
+    const srcOpts = [
+      ['both', 'Both: Discogs API + Open sources (MusicBrainz / Cover Art Archive / iTunes)', 'Queries Discogs and open sources to propose cover pictures. Single matches are embedded automatically; multiple matches are parked in the Cover art pane for you to choose.', true],
+      ['discogs', 'Discogs native API only', 'Searches only the Discogs database. Add a Personal Access Token below for full rate limits (60 requests/min).', false],
+      ['open', 'Open sources only (no API key needed)', 'Searches MusicBrainz / Cover Art Archive and iTunes Search API without requiring an account or token.', false],
+    ].map(([v, title, d, def]) => '<label class="opt"><input type="radio" name="cover-sources" value="' + v + '"'
+      + ' data-scope="general" data-setting="coverSources"' + (srcMode === v ? ' checked' : '') + '>'
+      + '<span><strong style="font-weight:500">' + title + '</strong>'
+      + (def ? '<span class="tag">default</span>' : '') + tip(d) + '</span></label>').join('');
+
+    return '<section class="card" style="margin-top:16px"><div class="card-head"><div><h2>Cover art (audio metadata)</h2>'
+      + '<div class="sub">Detect missing cover pictures in audio files, compare ID3 tags against folder/file names (using the folder/file name when totally different), and propose pictures from Discogs and open sources.</div></div></div>'
+      + '<label class="check" style="padding-top:0">'
+      + '<input class="switch" type="checkbox" data-scope="general" data-setting="coverAuto"' + (g.coverAuto ? ' checked' : '') + '>'
+      + '<span><strong>Check and embed missing cover art during normalization runs</strong>'
+      + tip('When enabled, audio files without an embedded picture are checked during runs. If 1 picture is found it is embedded automatically; if multiple pictures are found the file is listed in the separate Cover art pane on Parked files.')
+      + '</span></label>'
+      + '<label class="check" style="margin-bottom:16px;border-bottom:1px solid var(--line)">'
+      + '<input class="switch" type="checkbox" data-scope="general" data-setting="useLocalCover"' + ((g.useLocalCover ?? true) ? ' checked' : '') + '>'
+      + '<span><strong>Use local folder image (cover.jpg / folder.jpg) when present</strong>'
+      + tip('If the audio file\'s folder already contains cover.jpg, folder.jpg, front.jpg, or album.jpg, embed that picture before querying online sources.')
+      + '</span></label>'
+      + '<div class="split-2" style="margin-top:0">'
+      + '<div class="field" style="margin:0"><span class="lbl">Cover art sources</span>' + srcOpts + '</div>'
+      + '<div><div class="field"><label class="lbl" for="discogs-token">Discogs Personal Access Token (optional)'
+      + tip('Generate a free Personal Access Token in your Discogs account under Settings → Developers. Increases the Discogs rate limit to 60 requests/minute and unlocks full release image search.') + '</label>'
+      + '<input class="input" id="discogs-token" type="password" autocomplete="off" data-scope="general" data-setting="discogsToken" placeholder="Paste Discogs Personal Access Token" value="' + esc(g.discogsToken || '') + '">'
+      + '</div>'
+      + '<div class="btns"><button type="button" class="btn btn-sm" data-action="discogs-test">Test Discogs</button>'
+      + '<span class="muted small">' + esc(state.discogsTest || '') + '</span></div>'
+      + '</div></div></section>';
+  }
+
   function renderSettings() {
     const t = state.media;
     const g = state.draft.general;
@@ -1981,6 +2204,7 @@
       + 'Do not forward the port to the internet. The Home Assistant API still requires its access token.</p>'
       + '</div></section>'
       + silenceCard()
+      + coverCard()
       + scheduleOptions()
       + '<div class="split-2">' + levelCard(t) + outputCard(t) + '</div>';
   }
@@ -2082,16 +2306,551 @@
     }
   }
 
+  /* ------------------------------------------------------------- metadata */
+  const META_FIELDS = [
+    ['artist', 'Artist'],
+    ['title', 'Title (Track)'],
+    ['album', 'Album'],
+    ['album_artist', 'Album Artist'],
+    ['year', 'Year'],
+    ['track', 'Track No.'],
+    ['genre', 'Genre'],
+    ['cover', 'Cover picture'],
+  ];
+  const META_FIELD_MAP = Object.fromEntries(META_FIELDS);
+  const META_SOURCES = [
+    ['discogs', 'Discogs'],
+    ['musicbrainz', 'MusicBrainz'],
+    ['open', 'Open (iTunes)'],
+  ];
+
+  function renderMetaFieldCells(fileItem, fieldKey, fieldObj, isModal) {
+    const choice = (fieldObj && fieldObj.choice) || 'current';
+    const curVal = (fieldObj && fieldObj.current) || '';
+    const pathVal = (fieldObj && fieldObj.path) || '';
+    const onlineVal = (fieldObj && fieldObj.online) || '';
+    const customVal = (fieldObj && fieldObj.custom_value) || '';
+    const pathWarn = !!(fieldObj && fieldObj.path_vs_tag_diff);
+    const pickAct = isModal ? 'meta-modal-pick' : 'meta-pick';
+    const editToggleAct = isModal ? 'meta-modal-edit-toggle' : 'meta-edit-toggle';
+    const saveCustomAct = isModal ? 'meta-modal-save-custom' : 'meta-save-custom';
+    const editKey = (isModal ? 'modal:' : '') + fileItem.id + ':' + fieldKey;
+    const isEditing = !!state.metaEditing[editKey];
+
+    // 1. Current Tag cell
+    let curHtml = '';
+    if (fieldKey === 'cover') {
+      const hasCov = curVal === 'present' || !!fileItem.has_cover;
+      const thumb = hasCov
+        ? '<img class="meta-cover-mini" src="/api/files/' + fileItem.id + '/cover?v=' + encodeURIComponent(fileItem.checked_at || 1) + '" alt="">'
+        : '';
+      curHtml = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current">'
+        + '<span class="meta-radio-dot"></span>' + thumb + '<span>' + (hasCov ? 'Present' : 'Missing') + '</span></button>';
+    } else {
+      curHtml = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + (pathWarn ? ' is-warn' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current" title="Keep current tag value">'
+        + '<span class="meta-radio-dot"></span>'
+        + '<span>' + (curVal ? esc(curVal) : '<em class="muted">(empty)</em>') + '</span>'
+        + (pathWarn ? '<span class="cover-override-tag" title="Differs from folder/file name">⚠️ vs path</span>' : '')
+        + '</button>';
+    }
+
+    // 2. Folder / File Name cell
+    let pathHtml = '<span class="muted small">—</span>';
+    if (fieldKey !== 'cover' && pathVal) {
+      pathHtml = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path" title="Use value from folder/file name">'
+        + '<span class="meta-radio-dot"></span><span>' + esc(pathVal) + '</span></button>';
+    }
+
+    // 3. Internet Match cell
+    let onlineHtml = '<span class="muted small">—</span>';
+    if (fieldKey === 'cover') {
+      if (onlineVal) {
+        onlineHtml = '<button type="button" class="meta-pill' + (choice === 'online' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="online" title="Embed cover art from internet source">'
+          + '<span class="meta-radio-dot"></span>'
+          + '<img class="meta-cover-mini" src="' + esc(onlineVal) + '" alt="Online cover" loading="lazy">'
+          + '<span>Online cover</span></button>';
+      }
+    } else if (onlineVal) {
+      onlineHtml = '<button type="button" class="meta-pill' + (choice === 'online' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="online" title="Use value from internet match">'
+        + '<span class="meta-radio-dot"></span><span>' + esc(onlineVal) + '</span></button>';
+    }
+
+    // 4. Custom (✎) cell
+    let customHtml = '';
+    const defaultCustom = customVal !== '' ? customVal : (onlineVal || pathVal || (fieldKey === 'cover' ? '' : curVal) || '');
+    if (isEditing) {
+      customHtml = '<span class="meta-edit-wrap">'
+        + '<input type="text" class="meta-custom-input" data-meta-custom-input="' + editKey + '" value="' + esc(defaultCustom) + '" placeholder="' + esc(fieldKey === 'cover' ? 'Cover image URL…' : 'Custom ' + (META_FIELD_MAP[fieldKey] || fieldKey)) + '">'
+        + '<button type="button" class="btn btn-sm btn-primary" data-action="' + saveCustomAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '">Set</button>'
+        + '<button type="button" class="meta-edit-btn is-active" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Cancel custom edit">✕</button>'
+        + '</span>';
+    } else {
+      const chosenCustom = choice === 'custom'
+        ? '<button type="button" class="meta-pill is-chosen" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Click to edit custom value">'
+          + '<span class="meta-radio-dot"></span><span>' + (customVal ? esc(customVal) : '<em class="muted">(empty)</em>') + '</span></button>'
+        : '';
+      customHtml = '<span class="meta-edit-wrap">'
+        + chosenCustom
+        + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Enter a custom ' + esc(META_FIELD_MAP[fieldKey] || fieldKey) + ' value">✎</button>'
+        + '</span>';
+    }
+
+    return '<td class="meta-choice-cell">' + curHtml + '</td>'
+      + '<td class="meta-choice-cell">' + pathHtml + '</td>'
+      + '<td class="meta-choice-cell">' + onlineHtml + '</td>'
+      + '<td class="meta-choice-cell">' + customHtml + '</td>';
+  }
+
+  function filterAndSortMetaFiles(files, opts) {
+    const enabledFields = (opts && opts.fields) || META_FIELDS.map((x) => x[0]);
+    const stFilter = state.metaFilterStatus || 'diff';
+    const fldFilter = state.metaFilterField || 'all';
+    const dirFilter = state.metaFilterFolder || 'all';
+    const q = (state.metaSearch || '').trim().toLowerCase();
+
+    const filtered = (files || []).filter((f) => {
+      if (dirFilter !== 'all' && f.dir !== dirFilter) return false;
+      if (stFilter === 'diff' && !f.diff_count && f.status !== 'diff') return false;
+      if (stFilter === 'path_diff' && !f.path_diff_count) return false;
+      if (stFilter === 'missing') {
+        const hasMissing = enabledFields.some((k) => f.fields && f.fields[k] && f.fields[k].missing);
+        if (!hasMissing) return false;
+      }
+      if (fldFilter !== 'all') {
+        const fo = f.fields && f.fields[fldFilter];
+        if (!fo || (!fo.diff && stFilter !== 'all')) return false;
+      }
+      if (q) {
+        const hay = [
+          f.name, f.relpath, f.dir,
+          f.fields && f.fields.artist && (f.fields.artist.current || f.fields.artist.path || f.fields.artist.online),
+          f.fields && f.fields.album && (f.fields.album.current || f.fields.album.path || f.fields.album.online),
+          f.fields && f.fields.title && (f.fields.title.current || f.fields.title.path || f.fields.title.online),
+        ].filter(Boolean).join(' ').toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    const sortMode = state.metaSort || 'folder';
+    filtered.sort((a, b) => {
+      if (sortMode === 'name') return String(a.name).localeCompare(String(b.name), 'en');
+      if (sortMode === 'diffs_desc') return (b.diff_count - a.diff_count) || String(a.relpath).localeCompare(String(b.relpath), 'en');
+      if (sortMode === 'path_first') return (b.path_diff_count - a.path_diff_count) || (b.diff_count - a.diff_count) || String(a.relpath).localeCompare(String(b.relpath), 'en');
+      return String(a.relpath).localeCompare(String(b.relpath), 'en');
+    });
+    return filtered;
+  }
+
+  function renderMetadata() {
+    const m = state.metadata || {
+      options: { fields: META_FIELDS.map((x) => x[0]), check_path_vs_tags: true, sources: ['discogs', 'musicbrainz', 'open'] },
+      enabled_folders: 0, total_folders: 0, total_files_in_scope: 0,
+      checked_count: 0, diff_count: 0, path_diff_count: 0, folders: [], files: [],
+    };
+    const opts = m.options || { fields: META_FIELDS.map((x) => x[0]), check_path_vs_tags: true, sources: ['discogs', 'musicbrainz', 'open'] };
+    const enabledFields = opts.fields || META_FIELDS.map((x) => x[0]);
+    const enabledSources = opts.sources || ['discogs', 'musicbrainz', 'open'];
+
+    const visibleFiles = filterAndSortMetaFiles(m.files || [], opts);
+    const visIds = visibleFiles.map((f) => f.id);
+    const sel = state.metaSel.filter((id) => visIds.includes(id));
+    state.metaSel = sel;
+
+    const headBtns = '<div class="btns">'
+      + '<button class="btn" data-action="meta-check-run" title="Check metadata for audio files in enabled folders">'
+      + 'Check meta data</button>'
+      + '<button class="btn" data-action="meta-check-force" title="Re-check all audio files in enabled folders against online sources">'
+      + 'Re-check all</button>'
+      + '<button class="btn btn-primary" data-action="meta-apply-selected"' + (sel.length ? '' : ' disabled')
+      + ' title="Write selected metadata values into the selected audio files without changing their timestamps">'
+      + 'Update selected' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>'
+      + '</div>';
+
+    const fieldChecks = META_FIELDS.map(([k, lbl]) => {
+      const on = enabledFields.includes(k);
+      return '<label class="inline"><input type="checkbox" data-meta-opt-field="' + k + '"' + (on ? ' checked' : '') + '> ' + esc(lbl) + '</label>';
+    }).join('');
+
+    const sourceChecks = META_SOURCES.map(([k, lbl]) => {
+      const on = enabledSources.includes(k);
+      return '<label class="inline"><input type="checkbox" data-meta-opt-source="' + k + '"' + (on ? ' checked' : '') + '> ' + esc(lbl) + '</label>';
+    }).join('');
+
+    const optionsCard = '<section class="card" style="margin-bottom:16px">'
+      + '<div class="card-head"><div><h2>1 · Scope &amp; check options'
+      + tip('Checks audio files inside the folders enabled on the Directories tab. Updating metadata preserves the original file modification timestamp (mtime).')
+      + '</h2>'
+      + '<div class="sub">'
+      + fmt(m.enabled_folders) + ' of ' + fmt(m.total_folders) + ' audio folders enabled (<a href="#/directories">Directories tab</a>) · '
+      + fmt(m.total_files_in_scope) + ' audio files in scope · '
+      + fmt(m.checked_count) + ' checked · '
+      + '<strong>' + fmt(m.diff_count) + '</strong> with differences'
+      + (m.path_diff_count ? ' · <span class="warn-text">' + fmt(m.path_diff_count) + ' folder/file name mismatch' + (m.path_diff_count === 1 ? '' : 'es') + '</span>' : '')
+      + '</div></div></div>'
+      + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Fields to check</span>'
+      + fieldChecks + '</div>'
+      + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Folder / file check</span>'
+      + '<label class="inline"><input class="switch" type="checkbox" data-meta-opt-path' + (opts.check_path_vs_tags ? ' checked' : '') + '> '
+      + 'Compare <strong>Artist</strong>, <strong>Title</strong> and <strong>Album</strong> in file tags against the folder / file name (flag differences and use folder/file name for online search when totally different)</label>'
+      + '</div>'
+      + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Internet sources</span>'
+      + sourceChecks
+      + '<span class="small muted">Configure your Discogs token in <a href="#/settings">Settings → General</a>.</span>'
+      + '</div>'
+      + '</section>';
+
+    const statusOpts = [
+      ['diff', 'With differences (' + fmt(m.diff_count) + ')'],
+      ['path_diff', 'Tag vs. Folder/File mismatch ⚠️ (' + fmt(m.path_diff_count) + ')'],
+      ['missing', 'Missing tags'],
+      ['all', 'All checked files (' + fmt(m.checked_count) + ')'],
+    ].map(([k, lbl]) => '<option value="' + k + '"' + (state.metaFilterStatus === k ? ' selected' : '') + '>' + lbl + '</option>').join('');
+
+    const fieldFilterOpts = [['all', 'All checked fields']].concat(META_FIELDS)
+      .map(([k, lbl]) => '<option value="' + k + '"' + (state.metaFilterField === k ? ' selected' : '') + '>' + esc(lbl) + '</option>').join('');
+
+    const folderFilterOpts = [['all', 'All enabled folders']]
+      .concat((m.folders || []).map((d) => [d, folderLabel(d)]))
+      .map(([k, lbl]) => '<option value="' + esc(k) + '"' + (state.metaFilterFolder === k ? ' selected' : '') + '>' + esc(lbl) + '</option>').join('');
+
+    const sortOpts = [
+      ['folder', 'Folder / Album order'],
+      ['name', 'File name (A–Z)'],
+      ['diffs_desc', 'Most differences first'],
+      ['path_first', 'Folder/file mismatch first'],
+    ].map(([k, lbl]) => '<option value="' + k + '"' + (state.metaSort === k ? ' selected' : '') + '>' + lbl + '</option>').join('');
+
+    const filterBar = '<div class="meta-filter-bar">'
+      + '<div class="field"><label class="lbl" for="meta-flt-status">Show</label>'
+      + '<select class="input" id="meta-flt-status" data-meta-filter="status">' + statusOpts + '</select></div>'
+      + '<div class="field"><label class="lbl" for="meta-flt-field">Field</label>'
+      + '<select class="input" id="meta-flt-field" data-meta-filter="field">' + fieldFilterOpts + '</select></div>'
+      + '<div class="field"><label class="lbl" for="meta-flt-folder">Folder</label>'
+      + '<select class="input" id="meta-flt-folder" data-meta-filter="folder">' + folderFilterOpts + '</select></div>'
+      + '<div class="field"><label class="lbl" for="meta-flt-search">Filter text</label>'
+      + '<input class="input" id="meta-flt-search" data-meta-filter="search" value="' + esc(state.metaSearch) + '" placeholder="Artist, album, title or file…"></div>'
+      + '<div class="field"><label class="lbl" for="meta-flt-sort">Sort by</label>'
+      + '<select class="input" id="meta-flt-sort" data-meta-filter="sort">' + sortOpts + '</select></div>'
+      + '</div>';
+
+    const bulkTargets = sel.length ? sel : visIds;
+    const bulkScopeLabel = sel.length ? sel.length + ' selected' : visibleFiles.length + ' visible';
+    const bulkBar = visibleFiles.length
+      ? '<div class="park-bar" style="margin-bottom:12px">'
+        + '<span><strong>' + (sel.length ? sel.length + ' selected' : visibleFiles.length + ' file' + (visibleFiles.length === 1 ? '' : 's') + ' shown') + '</strong>'
+        + ' · Quick select source for ' + bulkScopeLabel + ':</span>'
+        + '<div class="btns">'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="online">Use Internet match</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path">Use Folder / File name</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current">Keep Current tag</button>'
+        + (sel.length
+          ? '<button class="btn btn-sm btn-primary" data-action="meta-apply-selected">Update selected (' + sel.length + ') — keep timestamp</button>'
+            + '<button class="btn btn-sm" data-action="meta-clear-sel">Clear selection</button>'
+          : '<button class="btn btn-sm btn-primary" data-action="meta-apply-visible">Update all shown (' + visibleFiles.length + ') — keep timestamp</button>')
+        + '</div></div>'
+      : '';
+
+    let tableHtml = '';
+    if (!m.checked_count) {
+      tableHtml = '<p class="muted">No files have been checked for metadata differences yet. Press <strong>Check meta data</strong> above to compare your enabled audio folders against folder/file names and internet sources.</p>';
+    } else if (!visibleFiles.length) {
+      tableHtml = '<p class="muted">No files match the current filter. Change the <strong>Show</strong> filter above to <em>All checked files</em> or press <strong>Check meta data</strong>.</p>';
+    } else {
+      const allOn = visibleFiles.length > 0 && visibleFiles.every((f) => sel.includes(f.id));
+      const bodyRows = [];
+      visibleFiles.forEach((f) => {
+        const on = sel.includes(f.id);
+        const fFields = f.fields || {};
+        // Determine which fields to show as rows for this file
+        let rowFields = enabledFields.filter((k) => {
+          if (state.metaFilterField !== 'all' && k !== state.metaFilterField) return false;
+          const fo = fFields[k];
+          if (!fo) return false;
+          if (state.metaFilterStatus === 'all') return true;
+          if (state.metaFilterStatus === 'path_diff') return !!fo.path_vs_tag_diff || !!fo.diff;
+          return !!fo.diff;
+        });
+        if (!rowFields.length) {
+          rowFields = enabledFields.filter((k) => state.metaFilterField === 'all' || k === state.metaFilterField);
+        }
+        const span = Math.max(1, rowFields.length);
+        rowFields.forEach((k, idx) => {
+          const fo = fFields[k] || { current: '', path: '', online: '', choice: 'current', custom_value: '' };
+          const firstRow = idx === 0;
+          const trCls = [firstRow ? 'meta-file-group-start' : '', on ? 'row-sel' : ''].filter(Boolean).join(' ');
+          const srcTag = f.online_source
+            ? '<span class="tag" style="margin-left:0">' + esc(f.online_source) + (f.online_score ? ' · ' + Math.round(f.online_score * 100) + '%' : '') + '</span>'
+            : '<span class="muted small">No online match</span>';
+          const overrideBadge = f.query_source === 'path_override'
+            ? '<span class="cover-override-tag" title="Tags were totally different from folder/file name; folder/file name was used">Folder/file used</span>'
+            : '';
+          const fileCols = firstRow
+            ? '<td class="pick" rowspan="' + span + '"><input type="checkbox" data-meta-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
+              + '<td rowspan="' + span + '" style="min-width:210px">'
+              + '<div style="font-weight:600;overflow-wrap:anywhere">' + esc(f.name) + '</div>'
+              + '<div class="small muted mono" style="margin-top:2px">' + esc(folderLabel(f.dir)) + '</div>'
+              + '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' + srcTag + overrideBadge + '</div>'
+              + '<div class="btns" style="margin-top:8px">'
+              + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + f.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
+              + '<button type="button" class="btn btn-sm" data-action="open-meta-by-id" data-file="' + f.id + '" title="Open full metadata popup for this file">Popup</button>'
+              + '</div>'
+              + '</td>'
+            : '';
+          bodyRows.push(
+            '<tr' + (trCls ? ' class="' + trCls + '"' : '') + '>'
+            + fileCols
+            + '<td class="meta-field-name">' + esc(META_FIELD_MAP[k] || k) + '</td>'
+            + renderMetaFieldCells(f, k, fo, false)
+            + '</tr>'
+          );
+        });
+      });
+
+      tableHtml = '<div class="table-wrap"><table class="meta-table"><thead><tr>'
+        + '<th class="pick"><input type="checkbox" data-meta-all aria-label="Select all visible files"' + (allOn ? ' checked' : '') + '></th>'
+        + '<th>File &amp; folder</th>'
+        + '<th>Field</th>'
+        + '<th>Current tag (file)' + tip('Value currently stored in the audio file metadata. Click to keep the current value.') + '</th>'
+        + '<th>Folder / file name' + tip('Value parsed from the folder and file name on disk. Highlighted when it differs from the file tag.') + '</th>'
+        + '<th>Internet match' + tip('Best match found on Discogs, MusicBrainz or Open (iTunes). Click to select.') + '</th>'
+        + '<th>Custom (✎)' + tip('Click the ✎ pencil button to enter a custom value for any field.') + '</th>'
+        + '</tr></thead><tbody>' + bodyRows.join('') + '</tbody></table></div>';
+    }
+
+    const diffCard = '<section class="card">'
+      + '<div class="card-head"><div><h2>2 · Metadata differences &amp; selection'
+      + tip('Click any pill to select which value to use for that field, or click ✎ to type a custom value. Press Update to write the chosen values into the file without changing its modification timestamp.')
+      + '</h2>'
+      + '<div class="sub">Click a value pill to select it, or click <strong>✎</strong> to enter a custom value. Updating preserves the file timestamp.</div></div></div>'
+      + filterBar
+      + bulkBar
+      + tableHtml
+      + '</section>';
+
+    app().innerHTML = pageHead(
+      'Meta data',
+      'Check and compare audio file tags in enabled folders against folder/file names, Discogs, MusicBrainz and open sources. File timestamps are preserved.',
+      headBtns,
+      false
+    ) + optionsCard + diffCard;
+  }
+
+  /* ------------------------------------------------ per-file metadata modal */
+  const META_MODAL = {
+    open: false,
+    fileId: null,
+    name: '',
+    relpath: '',
+    dir: '',
+    albumFileCount: 1,
+    artist: '',
+    album: '',
+    title: '',
+    item: null,
+    loading: false,
+    busy: false,
+    error: '',
+  };
+
+  function renderMetaModal() {
+    const modal = document.getElementById('metadata-modal');
+    if (!modal || !META_MODAL.open) return;
+    const titleEl = document.getElementById('metadata-modal-title');
+    const subEl = document.getElementById('metadata-modal-sub');
+    const bodyEl = document.getElementById('metadata-modal-body');
+    const btnFile = document.getElementById('metadata-apply-file');
+    const btnAlbum = document.getElementById('metadata-apply-album');
+
+    titleEl.textContent = 'Meta data check — ' + (META_MODAL.name || 'File');
+    subEl.textContent = MEDIA.audio.root + '/' + (META_MODAL.relpath || '');
+
+    const searchHtml = '<div class="cover-search-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr)) auto">'
+      + '<div class="field"><label class="lbl" for="meta-q-artist">Search Artist</label>'
+      + '<input class="input" id="meta-q-artist" data-meta-modal-input="artist" value="' + esc(META_MODAL.artist) + '" placeholder="Artist"></div>'
+      + '<div class="field"><label class="lbl" for="meta-q-album">Search Album</label>'
+      + '<input class="input" id="meta-q-album" data-meta-modal-input="album" value="' + esc(META_MODAL.album) + '" placeholder="Album"></div>'
+      + '<div class="field"><label class="lbl" for="meta-q-title">Search Track Title</label>'
+      + '<input class="input" id="meta-q-title" data-meta-modal-input="title" value="' + esc(META_MODAL.title) + '" placeholder="Track title"></div>'
+      + '<button type="button" class="btn' + (META_MODAL.loading ? ' is-busy' : '') + '" data-action="meta-modal-search"' + (META_MODAL.loading ? ' disabled' : '') + '>'
+      + (META_MODAL.loading ? 'Checking…' : 'Re-check online') + '</button>'
+      + '</div>';
+
+    let contentHtml = '';
+    if (META_MODAL.loading) {
+      contentHtml = '<p class="muted"><span class="working" aria-hidden="true"></span> Checking file tags, folder/file name, and online metadata databases…</p>';
+    } else if (META_MODAL.error) {
+      contentHtml = '<p class="warn-text">' + esc(META_MODAL.error) + '</p>';
+    } else if (META_MODAL.item) {
+      const it = META_MODAL.item;
+      const fields = it.fields || {};
+      const overrideBanner = it.query_source === 'path_override'
+        ? '<div class="notice" style="margin:0"><strong>Folder/file name used for search:</strong> the file tags were totally different from the folder/file name, so the folder/file name was used to look up metadata.</div>'
+        : '';
+      const srcLine = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">'
+        + '<div><span class="small muted">Online match: </span>'
+        + (it.online_source
+          ? '<span class="tag">' + esc(it.online_source) + (it.online_score ? ' · ' + Math.round(it.online_score * 100) + '%' : '') + '</span>'
+          : '<span class="small muted">none found</span>')
+        + '</div>'
+        + '<div class="btns">'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="online">Select all Internet</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="path">Select all Folder/File</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="current">Keep all Current</button>'
+        + '</div></div>';
+
+      const rows = META_FIELDS.map(([k, lbl]) => {
+        const fo = fields[k] || { current: '', path: '', online: '', choice: 'current', custom_value: '' };
+        return '<tr>'
+          + '<td class="meta-field-name">' + esc(lbl) + '</td>'
+          + renderMetaFieldCells(it, k, fo, true)
+          + '</tr>';
+      }).join('');
+
+      contentHtml = overrideBanner + srcLine
+        + '<div class="table-wrap"><table class="meta-table"><thead><tr>'
+        + '<th>Field</th>'
+        + '<th>Current tag (file)</th>'
+        + '<th>Folder / file name</th>'
+        + '<th>Internet match</th>'
+        + '<th>Custom (✎)</th>'
+        + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }
+
+    bodyEl.innerHTML = searchHtml + contentHtml;
+    const disabled = META_MODAL.loading || META_MODAL.busy || !META_MODAL.item;
+    if (btnFile) btnFile.disabled = disabled;
+    if (btnAlbum) {
+      btnAlbum.disabled = disabled;
+      btnAlbum.textContent = 'Update album (' + (META_MODAL.albumFileCount || 1) + ' file' + ((META_MODAL.albumFileCount || 1) === 1 ? '' : 's') + ')';
+    }
+  }
+
+  async function openMetaModal(fileId, opts) {
+    const o = opts || {};
+    META_MODAL.open = true;
+    META_MODAL.fileId = fileId;
+    META_MODAL.name = o.name || '';
+    META_MODAL.relpath = o.relpath || '';
+    META_MODAL.dir = o.dir || '';
+    META_MODAL.albumFileCount = 1;
+    META_MODAL.artist = '';
+    META_MODAL.album = '';
+    META_MODAL.title = '';
+    META_MODAL.item = null;
+    META_MODAL.loading = true;
+    META_MODAL.busy = false;
+    META_MODAL.error = '';
+
+    const modal = document.getElementById('metadata-modal');
+    if (modal) modal.hidden = false;
+    document.body.classList.add('has-modal');
+    renderMetaModal();
+    await runMetaModalCheck(false);
+  }
+
+  async function runMetaModalCheck(force) {
+    if (!META_MODAL.fileId) return;
+    META_MODAL.loading = true;
+    META_MODAL.error = '';
+    renderMetaModal();
+    try {
+      const body = { force: !!force };
+      if (force) {
+        body.artist = META_MODAL.artist;
+        body.album = META_MODAL.album;
+        body.title = META_MODAL.title;
+      }
+      const d = await api('/files/' + META_MODAL.fileId + '/metadata/check', { method: 'POST', body });
+      META_MODAL.item = d;
+      META_MODAL.name = d.name || META_MODAL.name;
+      META_MODAL.relpath = d.relpath || META_MODAL.relpath;
+      META_MODAL.dir = d.dir || META_MODAL.dir;
+      META_MODAL.albumFileCount = d.album_file_count || 1;
+      const f = d.fields || {};
+      META_MODAL.artist = (f.artist && (f.artist.online || f.artist.current || f.artist.path)) || '';
+      META_MODAL.album = (f.album && (f.album.online || f.album.current || f.album.path)) || '';
+      META_MODAL.title = (f.title && (f.title.online || f.title.current || f.title.path)) || '';
+      invalidate('metadata');
+    } catch (err) {
+      META_MODAL.error = err.message;
+    } finally {
+      META_MODAL.loading = false;
+      renderMetaModal();
+    }
+  }
+
+  function closeMetaModal() {
+    if (!META_MODAL.open) return;
+    META_MODAL.open = false;
+    const modal = document.getElementById('metadata-modal');
+    if (modal) modal.hidden = true;
+    if (!EDIT.open && !COVER.open) document.body.classList.remove('has-modal');
+  }
+
+  async function applyMetaFromModal(scope) {
+    if (!META_MODAL.open || !META_MODAL.fileId || !META_MODAL.item || META_MODAL.busy) return;
+    META_MODAL.busy = true;
+    renderMetaModal();
+    const label = scope === 'album' ? 'album' : META_MODAL.name;
+    const busy = startBusy('Updating metadata (preserving timestamp) · ' + label);
+    const elapsed = tickBusy(busy);
+    try {
+      const f = META_MODAL.item.fields || {};
+      const overrides = {};
+      const sharedAlbumFields = ['artist', 'album', 'album_artist', 'year', 'genre', 'cover'];
+      META_FIELDS.forEach(([k]) => {
+        if (scope === 'album' && !sharedAlbumFields.includes(k)) return;
+        const fo = f[k];
+        if (!fo) return;
+        const ch = fo.choice || 'current';
+        if (ch === 'custom') overrides[k] = fo.custom_value || '';
+        else if (ch === 'online' && fo.online) overrides[k] = fo.online;
+        else if (ch === 'path' && fo.path) overrides[k] = fo.path;
+      });
+      const r = await api('/metadata/apply', {
+        method: 'POST',
+        body: { ids: [META_MODAL.fileId], scope: scope, overrides: overrides },
+      });
+      closeMetaModal();
+      invalidate('metadata');
+      await Promise.all([
+        refreshDash(),
+        currentRoute() === 'metadata' ? loadKey('metadata') : Promise.resolve(),
+        currentRoute() === 'directories' && state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
+      ]);
+      toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (timestamp preserved)');
+      render();
+    } catch (err) {
+      META_MODAL.error = err.message;
+      toast(err.message);
+    } finally {
+      elapsed.stop();
+      endBusy(busy);
+      META_MODAL.busy = false;
+      if (META_MODAL.open) renderMetaModal();
+    }
+  }
+
   /* -------------------------------------------------------------- routing */
   const ROUTES = {
     dashboard: renderDashboard,
     directories: renderDirectories,
     parked: renderParked,
+    metadata: renderMetadata,
     schedule: renderSchedule,
     settings: renderSettings,
     homeassistant: renderHA,
   };
-  const TITLES = { dashboard: 'Dashboard', directories: 'Directories', parked: 'Parked files', schedule: 'Schedule', settings: 'Settings', homeassistant: 'Home Assistant' };
+  const TITLES = {
+    dashboard: 'Dashboard',
+    directories: 'Directories',
+    parked: 'Parked files',
+    metadata: 'Meta data',
+    schedule: 'Schedule',
+    settings: 'Settings',
+    homeassistant: 'Home Assistant',
+  };
 
   function currentRoute() {
     const r = location.hash.replace(/^#\/?/, '') || 'dashboard';
@@ -2100,7 +2859,18 @@
 
   function updateNavBadge() {
     const el = document.getElementById('parkedBadge');
-    if (el && state.dash) el.textContent = ALL.reduce((a, t) => a + dashMedia(t).files_parked, 0);
+    if (el && state.dash) {
+      const audioParked = ALL.reduce((a, t) => a + dashMedia(t).files_parked, 0);
+      const coverParked = (dashMedia('audio') && dashMedia('audio').files_cover_parked) || 0;
+      el.textContent = audioParked + coverParked;
+    }
+    const metaEl = document.getElementById('metaBadge');
+    if (metaEl && state.dash) {
+      const metaDiff = (state.metadata && typeof state.metadata.diff_count === 'number')
+        ? state.metadata.diff_count
+        : ((dashMedia('audio') && dashMedia('audio').files_meta_diff) || 0);
+      metaEl.textContent = metaDiff;
+    }
   }
 
   let approvedWatchTimer = null;
@@ -2131,8 +2901,231 @@
   function hasCachedRouteData(route) {
     const t = state.media;
     if (route === 'directories') return !!(state.trees[t] && state.settings && state.dash);
-    if (route === 'parked') return !!(state.parked[t] && state.settings);
+    if (route === 'parked') return !!(state.parked[t] && state.settings && (t !== 'audio' || state.coverParked));
+    if (route === 'metadata') return !!(state.metadata && state.dash && state.settings);
     return false;
+  }
+
+  /* ----------------------------------------------------------- cover modal */
+  const COVER = {
+    open: false,
+    fileId: null,
+    name: '',
+    relpath: '',
+    dir: '',
+    hasCover: false,
+    artist: '',
+    album: '',
+    title: '',
+    source: 'both',
+    querySource: 'tags',
+    tagArtist: '',
+    tagAlbum: '',
+    tagTitle: '',
+    pathArtist: '',
+    pathAlbum: '',
+    pathTitle: '',
+    albumFileCount: 1,
+    targetIds: null,
+    defaultScope: 'file',
+    candidates: [],
+    selectedUrl: '',
+    loading: false,
+    busy: false,
+    error: '',
+  };
+
+  function renderCoverModal() {
+    const modal = document.getElementById('cover-modal');
+    if (!modal || !COVER.open) return;
+    const titleEl = document.getElementById('cover-modal-title');
+    const subEl = document.getElementById('cover-modal-sub');
+    const bodyEl = document.getElementById('cover-modal-body');
+    const noteEl = document.getElementById('cover-modal-note');
+    const btnFile = document.getElementById('cover-apply-file');
+    const btnAlbum = document.getElementById('cover-apply-album');
+
+    titleEl.textContent = COVER.defaultScope === 'album'
+      ? 'Album / folder cover art — ' + (COVER.album || folderLabel(COVER.dir))
+      : 'Cover art — ' + COVER.name;
+    subEl.textContent = MEDIA.audio.root + '/' + COVER.relpath;
+
+    const currentHtml = COVER.hasCover
+      ? '<div class="cover-current-row">'
+        + '<img class="cover-current-img" src="/api/files/' + COVER.fileId + '/cover?t=' + Date.now() + '" alt="Current cover">'
+        + '<div><strong>Embedded cover art is present</strong><div class="small muted">Select a new picture below to replace it for this file or the whole album.</div></div>'
+        + '</div>'
+      : '';
+
+    const overrideBanner = COVER.querySource === 'path_override'
+      ? '<div class="notice" style="margin:0"><strong>Folder/file name used for search:</strong> the ID3 tags ('
+        + esc([COVER.tagArtist, COVER.tagAlbum, COVER.tagTitle].filter(Boolean).join(' / ') || 'none')
+        + ') were totally different from the folder/file name ('
+        + esc([COVER.pathArtist, COVER.pathAlbum, COVER.pathTitle].filter(Boolean).join(' / '))
+        + '), so the folder/file name was taken.</div>'
+      : '';
+
+    const srcOpts = [
+      ['both', 'Both (Discogs + Open)'],
+      ['discogs', 'Discogs only'],
+      ['open', 'Open sources only'],
+    ].map(([k, lbl]) => '<option value="' + k + '"' + (COVER.source === k ? ' selected' : '') + '>' + lbl + '</option>').join('');
+
+    const searchHtml = '<div class="cover-search-grid">'
+      + '<div class="field"><label class="lbl" for="cover-q-artist">Artist</label>'
+      + '<input class="input" id="cover-q-artist" data-cover-input="artist" value="' + esc(COVER.artist) + '" placeholder="Artist"></div>'
+      + '<div class="field"><label class="lbl" for="cover-q-album">Album</label>'
+      + '<input class="input" id="cover-q-album" data-cover-input="album" value="' + esc(COVER.album) + '" placeholder="Album"></div>'
+      + '<div class="field"><label class="lbl" for="cover-q-title">Track title</label>'
+      + '<input class="input" id="cover-q-title" data-cover-input="title" value="' + esc(COVER.title) + '" placeholder="Track title"></div>'
+      + '<div class="field"><label class="lbl" for="cover-q-source">Source</label>'
+      + '<select class="input" id="cover-q-source" data-cover-input="source">' + srcOpts + '</select></div>'
+      + '<button type="button" class="btn' + (COVER.loading ? ' is-busy' : '') + '" data-action="cover-search"' + (COVER.loading ? ' disabled' : '') + '>'
+      + (COVER.loading ? 'Searching…' : 'Search') + '</button>'
+      + '</div>';
+
+    let gridHtml = '';
+    if (COVER.loading) {
+      gridHtml = '<p class="muted"><span class="working" aria-hidden="true"></span> Searching Discogs and open cover databases…</p>';
+    } else if (COVER.error) {
+      gridHtml = '<p class="warn-text">' + esc(COVER.error) + '</p>';
+    } else if (!COVER.candidates.length) {
+      gridHtml = '<p class="muted">No cover pictures found for this query. Adjust the Artist, Album or Track title above and press <strong>Search</strong>.</p>';
+    } else {
+      gridHtml = '<div class="cover-grid">' + COVER.candidates.map((c, idx) => {
+        const sel = COVER.selectedUrl === c.image_url;
+        const thumb = c.thumb_url || c.image_url || '';
+        return '<div class="cover-cand' + (sel ? ' is-selected' : '') + '" data-action="cover-select-cand" data-idx="' + idx + '" tabindex="0" role="button" aria-pressed="' + sel + '">'
+          + '<div class="cover-cand-img-wrap">'
+          + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
+          + '</div>'
+          + '<div class="cover-cand-title">' + esc(c.title || 'Cover') + '</div>'
+          + '<div class="cover-cand-meta"><span class="tag" style="margin:0">' + esc(c.source || 'Source') + '</span>'
+          + '<span>' + esc(c.year || '') + '</span></div>'
+          + '</div>';
+      }).join('') + '</div>';
+    }
+
+    bodyEl.innerHTML = currentHtml + overrideBanner + searchHtml + gridHtml;
+    const targetCount = (COVER.targetIds && COVER.targetIds.length) || COVER.albumFileCount || 1;
+    btnFile.disabled = !COVER.selectedUrl || COVER.busy || COVER.loading;
+    btnAlbum.disabled = !COVER.selectedUrl || COVER.busy || COVER.loading;
+    btnAlbum.textContent = COVER.targetIds && COVER.targetIds.length
+      ? 'Use for selected (' + COVER.targetIds.length + ')'
+      : 'Use for album (' + targetCount + ')';
+    noteEl.textContent = COVER.candidates.length
+      ? COVER.candidates.length + ' picture' + (COVER.candidates.length === 1 ? '' : 's') + ' found · click a picture, then apply to 1 file or the album'
+      : '';
+  }
+
+  async function openCoverModal(fileId, opts) {
+    const o = opts || {};
+    COVER.open = true;
+    COVER.fileId = Number(fileId);
+    COVER.name = o.name || '';
+    COVER.relpath = o.relpath || '';
+    COVER.dir = o.dir || '';
+    COVER.hasCover = !!o.hasCover;
+    COVER.artist = '';
+    COVER.album = '';
+    COVER.title = '';
+    COVER.source = (state.settings && state.settings.general && state.settings.general.coverSources) || 'both';
+    COVER.querySource = 'tags';
+    COVER.albumFileCount = 1;
+    COVER.targetIds = o.targetIds || null;
+    COVER.defaultScope = o.scope || 'file';
+    COVER.candidates = [];
+    COVER.selectedUrl = '';
+    COVER.loading = true;
+    COVER.busy = false;
+    COVER.error = '';
+
+    const modal = document.getElementById('cover-modal');
+    if (modal) {
+      modal.hidden = false;
+      document.body.classList.add('has-modal');
+    }
+    renderCoverModal();
+    await runCoverModalSearch(false);
+  }
+
+  async function runCoverModalSearch(force) {
+    if (!COVER.open || !COVER.fileId) return;
+    COVER.loading = true;
+    COVER.error = '';
+    renderCoverModal();
+    try {
+      const body = { source: COVER.source, force: !!force };
+      if (force) {
+        body.artist = COVER.artist;
+        body.album = COVER.album;
+        body.title = COVER.title;
+      }
+      const d = await api('/files/' + COVER.fileId + '/cover/search', { method: 'POST', body });
+      COVER.name = d.name || COVER.name;
+      COVER.relpath = d.relpath || COVER.relpath;
+      COVER.dir = d.dir || COVER.dir;
+      COVER.hasCover = !!d.has_cover;
+      COVER.artist = d.artist || '';
+      COVER.album = d.album || '';
+      COVER.title = d.title || '';
+      COVER.querySource = d.query_source || 'tags';
+      COVER.tagArtist = d.tag_artist || '';
+      COVER.tagAlbum = d.tag_album || '';
+      COVER.tagTitle = d.tag_title || '';
+      COVER.pathArtist = d.path_artist || '';
+      COVER.pathAlbum = d.path_album || '';
+      COVER.pathTitle = d.path_title || '';
+      COVER.albumFileCount = d.album_file_count || 1;
+      COVER.candidates = d.candidates || [];
+      COVER.selectedUrl = COVER.candidates[0] ? COVER.candidates[0].image_url : '';
+    } catch (err) {
+      COVER.error = err.message;
+    } finally {
+      COVER.loading = false;
+      renderCoverModal();
+    }
+  }
+
+  function closeCoverModal() {
+    if (!COVER.open) return;
+    COVER.open = false;
+    const modal = document.getElementById('cover-modal');
+    if (modal) modal.hidden = true;
+    if (!EDIT.open) document.body.classList.remove('has-modal');
+  }
+
+  async function applyCoverFromModal(scope) {
+    if (!COVER.open || !COVER.fileId || !COVER.selectedUrl || COVER.busy) return;
+    COVER.busy = true;
+    renderCoverModal();
+    const label = scope === 'album' ? 'album' : COVER.name;
+    const busy = startBusy('Embedding cover art · ' + label);
+    const elapsed = tickBusy(busy);
+    try {
+      const body = { image_url: COVER.selectedUrl, scope: scope };
+      if (scope === 'album' && COVER.targetIds && COVER.targetIds.length) {
+        body.target_ids = COVER.targetIds;
+      }
+      const r = await api('/files/' + COVER.fileId + '/cover/apply', { method: 'POST', body });
+      closeCoverModal();
+      invalidate('coverParked');
+      await Promise.all([
+        refreshDash(),
+        currentRoute() === 'parked' ? loadKey('coverParked') : Promise.resolve(),
+        currentRoute() === 'directories' && state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
+      ]);
+      toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
+      render();
+    } catch (err) {
+      COVER.error = err.message;
+      toast(err.message);
+    } finally {
+      elapsed.stop();
+      endBusy(busy);
+      COVER.busy = false;
+      if (COVER.open) renderCoverModal();
+    }
   }
 
   function render() {
@@ -2519,6 +3512,320 @@
         endBusy(busy);
       }
       render();
+    } else if (a === 'open-cover-modal') {
+      const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
+      if (f) {
+        await openCoverModal(f.id, { name: f.name, relpath: f.relpath, dir: state.browse.rel || '', hasCover: f.has_cover, scope: 'file' });
+      }
+    } else if (a === 'open-album-cover') {
+      const b = state.browse;
+      if (!b || !b.rows || !b.rows.length) return;
+      const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((x) => x.id);
+      const first = b.rows.find((x) => x.id === ids[0]) || b.rows[0];
+      await openCoverModal(first.id, {
+        name: first.name,
+        relpath: first.relpath,
+        dir: b.rel || '',
+        hasCover: first.has_cover,
+        targetIds: state.fileSel.length ? ids : null,
+        scope: 'album',
+      });
+    } else if (a === 'open-cover-by-id') {
+      const fid = Number(el.dataset.file);
+      const ids = el.dataset.ids ? el.dataset.ids.split(',').map(Number).filter(Boolean) : null;
+      await openCoverModal(fid, { scope: el.dataset.scope || 'file', targetIds: ids });
+    } else if (a === 'cover-close') {
+      closeCoverModal();
+    } else if (a === 'cover-search') {
+      await runCoverModalSearch(true);
+    } else if (a === 'cover-select-cand') {
+      const cand = COVER.candidates[Number(el.dataset.idx)];
+      if (cand) {
+        COVER.selectedUrl = cand.image_url;
+        renderCoverModal();
+      }
+    } else if (a === 'cover-apply') {
+      await applyCoverFromModal(el.dataset.scope || 'file');
+    } else if (a === 'cover-apply-cand') {
+      const fid = Number(el.dataset.file);
+      const scope = el.dataset.scope || 'file';
+      const url = el.dataset.url;
+      const ids = el.dataset.ids ? el.dataset.ids.split(',').map(Number).filter(Boolean) : [];
+      const busy = startBusy('Embedding cover picture (' + scope + ')');
+      const elapsed = tickBusy(busy);
+      try {
+        const r = await api('/files/' + fid + '/cover/apply', {
+          method: 'POST',
+          body: { image_url: url, scope: scope, target_ids: ids },
+        });
+        invalidate('coverParked');
+        await Promise.all([loadKey('coverParked'), refreshDash()]);
+        toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'cover-skip') {
+      const ids = (el.dataset.ids || '').split(',').map(Number).filter(Boolean);
+      if (!ids.length) return;
+      const busy = startBusy('Skipping cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      try {
+        await api('/covers/skip', { method: 'POST', body: { ids: ids } });
+        invalidate('coverParked');
+        await Promise.all([loadKey('coverParked'), refreshDash()]);
+        toast('Skipped cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      } finally {
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'check-covers-dir') {
+      const b = state.browse;
+      if (!b || !b.rows || !b.rows.length) return;
+      const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
+      const busy = startBusy('Checking cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        const r = await api('/covers/check', { method: 'POST', body: { ids: ids, dir: b.rel } });
+        invalidate('coverParked');
+        await refreshDash();
+        const parts = [];
+        if (r.embedded) parts.push(r.embedded + ' embedded');
+        if (r.choices) parts.push(r.choices + ' parked with multiple choices');
+        if (r.present) parts.push(r.present + ' already had cover');
+        if (r.not_found) parts.push(r.not_found + ' not found');
+        toast('Cover check: ' + (parts.length ? parts.join(' · ') : r.checked + ' checked'));
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      if (b.rel) await loadBrowse(b.rel);
+      else render();
+    } else if (a === 'cover-check-bulk') {
+      const busy = startBusy('Checking missing cover art in enabled audio folders');
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        const r = await api('/covers/check', { method: 'POST', body: { enabled_only: true } });
+        invalidate('coverParked');
+        await Promise.all([
+          refreshDash(),
+          currentRoute() === 'parked' ? loadKey('coverParked') : Promise.resolve(),
+        ]);
+        const parts = [];
+        if (r.embedded) parts.push(r.embedded + ' embedded');
+        if (r.choices) parts.push(r.choices + ' parked with multiple choices');
+        if (r.not_found) parts.push(r.not_found + ' not found');
+        toast('Bulk cover check (' + r.checked + ' files): ' + (parts.length ? parts.join(' · ') : 'all checked'));
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'cover-apply-first-all') {
+      const busy = startBusy('Embedding first cover picture for all waiting files');
+      const elapsed = tickBusy(busy);
+      try {
+        const r = await api('/covers/apply-first-all', { method: 'POST', body: {} });
+        invalidate('coverParked');
+        await Promise.all([loadKey('coverParked'), refreshDash()]);
+        toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'cover-park-mode') {
+      state.coverParkMode = el.dataset.mode === 'file' ? 'file' : 'album';
+      render();
+    } else if (a === 'discogs-test') {
+      const token = (state.draft && state.draft.general && state.draft.general.discogsToken) || '';
+      const busy = startBusy('Testing Discogs API connection');
+      const elapsed = tickBusy(busy);
+      try {
+        const r = await api('/covers/test-discogs', { method: 'POST', body: { token: token } });
+        state.discogsTest = r.message || '';
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'meta-check-run' || a === 'meta-check-force') {
+      const force = a === 'meta-check-force';
+      const busy = startBusy(force ? 'Re-checking metadata in enabled audio folders' : 'Checking metadata in enabled audio folders');
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        const r = await api('/metadata/check', { method: 'POST', body: { enabled_only: true, force: force } });
+        invalidate('metadata');
+        await Promise.all([loadKey('metadata'), refreshDash()]);
+        toast('Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences · ' + r.ok + ' matching');
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'check-meta-dir') {
+      const b = state.browse;
+      if (!b || !b.rows || !b.rows.length) return;
+      const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
+      const busy = startBusy('Checking metadata for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const elapsed = tickBusy(busy);
+      render();
+      try {
+        const r = await api('/metadata/check', { method: 'POST', body: { ids: ids, dir: b.rel, force: true } });
+        invalidate('metadata');
+        await refreshDash();
+        toast('Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences');
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'meta-pick') {
+      const fid = Number(el.dataset.file);
+      const field = el.dataset.field;
+      const choice = el.dataset.choice;
+      const editKey = fid + ':' + field;
+      delete state.metaEditing[editKey];
+      // Optimistically update local state so UI responds immediately
+      const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === fid);
+      if (item && item.fields && item.fields[field]) {
+        item.fields[field].choice = choice;
+      }
+      render();
+      await api('/metadata/select', { method: 'POST', body: { ids: [fid], field: field, choice: choice } });
+    } else if (a === 'meta-edit-toggle') {
+      const fid = Number(el.dataset.file);
+      const field = el.dataset.field;
+      const editKey = fid + ':' + field;
+      if (state.metaEditing[editKey]) delete state.metaEditing[editKey];
+      else state.metaEditing[editKey] = true;
+      render();
+      const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
+      if (inp) { inp.focus(); inp.select(); }
+    } else if (a === 'meta-save-custom') {
+      const fid = Number(el.dataset.file);
+      const field = el.dataset.field;
+      const editKey = fid + ':' + field;
+      const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
+      const val = inp ? inp.value.trim() : '';
+      delete state.metaEditing[editKey];
+      const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === fid);
+      if (item && item.fields && item.fields[field]) {
+        item.fields[field].choice = 'custom';
+        item.fields[field].custom_value = val;
+      }
+      render();
+      await api('/metadata/select', {
+        method: 'POST',
+        body: { ids: [fid], field: field, choice: 'custom', custom_value: val },
+      });
+    } else if (a === 'meta-bulk-choice') {
+      const choice = el.dataset.choice || 'online';
+      const m = state.metadata || {};
+      const visible = filterAndSortMetaFiles(m.files || [], m.options || {});
+      const ids = state.metaSel.length ? state.metaSel.slice() : visible.map((f) => f.id);
+      if (!ids.length) return;
+      const fieldFilter = state.metaFilterField !== 'all' ? state.metaFilterField : 'all';
+      await api('/metadata/select', { method: 'POST', body: { ids: ids, field: fieldFilter, choice: choice } });
+      await loadKey('metadata');
+      render();
+    } else if (a === 'meta-clear-sel') {
+      state.metaSel = [];
+      render();
+    } else if (a === 'meta-apply-one' || a === 'meta-apply-selected' || a === 'meta-apply-visible') {
+      let ids = [];
+      if (a === 'meta-apply-one') {
+        ids = [Number(el.dataset.file)];
+      } else if (a === 'meta-apply-selected') {
+        ids = state.metaSel.slice();
+      } else {
+        const m = state.metadata || {};
+        ids = filterAndSortMetaFiles(m.files || [], m.options || {}).map((f) => f.id);
+      }
+      if (!ids.length) return;
+      const busy = startBusy('Updating metadata (preserving timestamp) for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const elapsed = tickBusy(busy);
+      try {
+        const r = await api('/metadata/apply', { method: 'POST', body: { ids: ids, scope: 'file' } });
+        invalidate('metadata');
+        await Promise.all([loadKey('metadata'), refreshDash()]);
+        toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (file timestamp preserved)');
+      } finally {
+        elapsed.stop();
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'open-meta-modal') {
+      const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
+      if (f) {
+        await openMetaModal(f.id, { name: f.name, relpath: f.relpath, dir: state.browse.rel || '' });
+      }
+    } else if (a === 'open-meta-by-id') {
+      const fid = Number(el.dataset.file);
+      const f = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === fid);
+      await openMetaModal(fid, f ? { name: f.name, relpath: f.relpath, dir: f.dir } : {});
+    } else if (a === 'meta-modal-close') {
+      closeMetaModal();
+    } else if (a === 'meta-modal-search') {
+      await runMetaModalCheck(true);
+    } else if (a === 'meta-modal-pick') {
+      const fid = Number(el.dataset.file);
+      const field = el.dataset.field;
+      const choice = el.dataset.choice;
+      const editKey = 'modal:' + fid + ':' + field;
+      delete state.metaEditing[editKey];
+      if (META_MODAL.item && META_MODAL.item.fields && META_MODAL.item.fields[field]) {
+        META_MODAL.item.fields[field].choice = choice;
+      }
+      renderMetaModal();
+      await api('/metadata/select', { method: 'POST', body: { ids: [fid], field: field, choice: choice } });
+    } else if (a === 'meta-modal-edit-toggle') {
+      const fid = Number(el.dataset.file);
+      const field = el.dataset.field;
+      const editKey = 'modal:' + fid + ':' + field;
+      if (state.metaEditing[editKey]) delete state.metaEditing[editKey];
+      else state.metaEditing[editKey] = true;
+      renderMetaModal();
+      const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
+      if (inp) { inp.focus(); inp.select(); }
+    } else if (a === 'meta-modal-save-custom') {
+      const fid = Number(el.dataset.file);
+      const field = el.dataset.field;
+      const editKey = 'modal:' + fid + ':' + field;
+      const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
+      const val = inp ? inp.value.trim() : '';
+      delete state.metaEditing[editKey];
+      if (META_MODAL.item && META_MODAL.item.fields && META_MODAL.item.fields[field]) {
+        META_MODAL.item.fields[field].choice = 'custom';
+        META_MODAL.item.fields[field].custom_value = val;
+      }
+      renderMetaModal();
+      await api('/metadata/select', {
+        method: 'POST',
+        body: { ids: [fid], field: field, choice: 'custom', custom_value: val },
+      });
+    } else if (a === 'meta-modal-bulk') {
+      const choice = el.dataset.choice || 'online';
+      if (META_MODAL.item && META_MODAL.item.fields) {
+        META_FIELDS.forEach(([k]) => {
+          const fo = META_MODAL.item.fields[k];
+          if (!fo) return;
+          if (choice === 'online' && fo.online) fo.choice = 'online';
+          else if (choice === 'path' && fo.path) fo.choice = 'path';
+          else if (choice === 'current') fo.choice = 'current';
+        });
+        renderMetaModal();
+        await api('/metadata/select', { method: 'POST', body: { ids: [META_MODAL.fileId], field: 'all', choice: choice } });
+      }
+    } else if (a === 'meta-modal-apply') {
+      await applyMetaFromModal(el.dataset.scope || 'file');
     }
   }
 
@@ -2663,6 +3970,85 @@
         : { onClose: el.value };
       state.sched = await api('/schedule', { method: 'PUT', body: body });
       render();
+      return;
+    }
+
+    if (el.dataset.coverInput !== undefined) {
+      const k = el.dataset.coverInput;
+      if (k === 'artist') COVER.artist = el.value;
+      else if (k === 'album') COVER.album = el.value;
+      else if (k === 'title') COVER.title = el.value;
+      else if (k === 'source') COVER.source = el.value;
+      return;
+    }
+
+    if (el.dataset.metaModalInput !== undefined) {
+      const k = el.dataset.metaModalInput;
+      if (k === 'artist') META_MODAL.artist = el.value;
+      else if (k === 'album') META_MODAL.album = el.value;
+      else if (k === 'title') META_MODAL.title = el.value;
+      return;
+    }
+
+    if (el.dataset.metaCheck !== undefined || el.dataset.metaAll !== undefined) {
+      if (!committed) return;
+      const m = state.metadata || {};
+      const visible = filterAndSortMetaFiles(m.files || [], m.options || {});
+      if (el.dataset.metaAll !== undefined) {
+        state.metaSel = el.checked ? visible.map((f) => f.id) : [];
+      } else {
+        const id = Number(el.dataset.metaCheck);
+        state.metaSel = el.checked ? state.metaSel.concat(id) : state.metaSel.filter((x) => x !== id);
+      }
+      render();
+      return;
+    }
+
+    if (el.dataset.metaFilter !== undefined) {
+      const k = el.dataset.metaFilter;
+      if (k === 'search') {
+        state.metaSearch = el.value;
+        render();
+        const inp = document.getElementById('meta-flt-search');
+        if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+        return;
+      }
+      if (!committed) return;
+      if (k === 'status') state.metaFilterStatus = el.value;
+      else if (k === 'field') state.metaFilterField = el.value;
+      else if (k === 'folder') state.metaFilterFolder = el.value;
+      else if (k === 'sort') state.metaSort = el.value;
+      render();
+      return;
+    }
+
+    if (el.dataset.metaOptField !== undefined || el.dataset.metaOptSource !== undefined || el.dataset.metaOptPath !== undefined) {
+      if (!committed) return;
+      const m = state.metadata || {};
+      const opts = Object.assign({
+        fields: META_FIELDS.map((x) => x[0]),
+        check_path_vs_tags: true,
+        sources: ['discogs', 'musicbrainz', 'open'],
+      }, m.options || {});
+      if (el.dataset.metaOptField !== undefined) {
+        const fld = el.dataset.metaOptField;
+        const next = el.checked
+          ? Array.from(new Set(opts.fields.concat(fld)))
+          : opts.fields.filter((x) => x !== fld);
+        if (next.length) opts.fields = next;
+      } else if (el.dataset.metaOptSource !== undefined) {
+        const src = el.dataset.metaOptSource;
+        const next = el.checked
+          ? Array.from(new Set(opts.sources.concat(src)))
+          : opts.sources.filter((x) => x !== src);
+        if (next.length) opts.sources = next;
+      } else if (el.dataset.metaOptPath !== undefined) {
+        opts.check_path_vs_tags = !!el.checked;
+      }
+      const saved = await api('/metadata/options', { method: 'PUT', body: opts });
+      if (state.metadata) state.metadata.options = saved;
+      render();
+      return;
     }
   }
 
@@ -2777,12 +4163,63 @@
     applyMenu();
   });
 
+  const coverModalEl = document.getElementById('cover-modal');
+  if (coverModalEl) {
+    coverModalEl.addEventListener('click', (ev) => {
+      if (ev.target === coverModalEl) closeCoverModal();
+    });
+  }
+  const metaModalEl = document.getElementById('metadata-modal');
+  if (metaModalEl) {
+    metaModalEl.addEventListener('click', (ev) => {
+      if (ev.target === metaModalEl) closeMetaModal();
+    });
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.metaCustomInput) {
+      ev.preventDefault();
+      const editKey = ev.target.dataset.metaCustomInput;
+      const isModal = editKey.startsWith('modal:');
+      const clean = isModal ? editKey.slice(6) : editKey;
+      const parts = clean.split(':');
+      const fid = Number(parts[0]);
+      const field = parts[1];
+      const btn = document.querySelector('[data-action="' + (isModal ? 'meta-modal-save-custom' : 'meta-save-custom') + '"][data-file="' + fid + '"][data-field="' + field + '"]');
+      if (btn) btn.click();
+      return;
+    }
+    if (META_MODAL.open) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeMetaModal();
+      } else if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.metaModalInput) {
+        ev.preventDefault();
+        runMetaModalCheck(true);
+      }
+      return;
+    }
+    if (!COVER.open) return;
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeCoverModal();
+    } else if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.coverInput) {
+      ev.preventDefault();
+      runCoverModalSearch(true);
+    }
+  });
+
   /* ---------------------------------------------------------------- start */
   window.addEventListener('hashchange', () => {
     const route = currentRoute();
     if (route !== 'directories') state.baselineFrom = null;      // the baseline banner lasts while on Directories
     if (route !== 'settings' && state.settings) state.draft = clone(state.settings);   // unsaved edits are dropped
-    if (route === 'parked') invalidate('parked:' + state.media);  // fresh list each time the page is opened
+    if (route === 'parked') {
+      invalidate('parked:' + state.media);  // fresh list each time the page is opened
+      invalidate('coverParked');
+    }
+    if (route === 'metadata') {
+      invalidate('metadata');
+    }
     if (route === 'directories') openDirectories();                // and look for new files and folders
     render();
   });

@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from . import __version__, folders, ha, state, stats, waveform
+from . import __version__, cover, folders, ha, state, stats, waveform
 from .config import tool_path
 from .media import EXTENSIONS, MEDIA
 from .schedule import in_window, next_change
@@ -86,6 +87,65 @@ class HaBody(BaseModel):
     url: str | None = None
     token: str | None = None
     sensors: list[dict] | None = None
+
+
+class CoverSearchBody(BaseModel):
+    artist: str | None = None
+    album: str | None = None
+    title: str | None = None
+    source: Literal["both", "discogs", "open"] | None = None
+    force: bool = False
+
+
+class CoverApplyBody(BaseModel):
+    image_url: str
+    scope: Literal["file", "album", "dir"] = "file"
+    target_ids: list[int] = Field(default_factory=list)
+    only_missing: bool = False
+
+
+class CoverCheckBody(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    dir: str | None = None
+    enabled_only: bool = False
+
+
+class CoverIdsBody(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+
+
+class DiscogsTestBody(BaseModel):
+    token: str | None = None
+
+
+class MetadataCheckBody(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    dir: str | None = None
+    enabled_only: bool = True
+    force: bool = False
+    options: dict | None = None
+
+
+class FileMetadataCheckBody(BaseModel):
+    force: bool = False
+    query: dict | None = None
+    artist: str | None = None
+    album: str | None = None
+    title: str | None = None
+
+
+class MetadataSelectBody(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    field: str | None = None
+    choice: Literal["current", "path", "online", "custom"] = "online"
+    value: str | None = None
+    custom_value: str | None = None
+
+
+class MetadataApplyBody(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    overrides: dict | None = None
+    scope: Literal["file", "album"] = "file"
 
 
 SORTS = {
@@ -289,13 +349,244 @@ def _stream_path(engine, media: str, rel: str) -> str:
 def list_files(media: str = "audio", dir: str = ".", engine=Engine):
     _media_check(media)
     rows = engine.db.query(
-        "SELECT id, name, relpath, ext, lufs, true_peak, status, reason, gain_db, adjust_db, applied_db, "
-        "method, measured_at, changed_at, silent_sections, silent_duration, silence_trimmed "
+        "SELECT id, media, name, relpath, dir, ext, lufs, true_peak, status, reason, gain_db, adjust_db, applied_db, "
+        "method, measured_at, changed_at, silent_sections, silent_duration, silence_trimmed, "
+        "has_cover, cover_status, cover_candidates, tag_artist, tag_album, tag_title, cover_query_source "
         "FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
         (media, dir))
     for row in rows:
         row["playable"] = row["ext"] in PLAYABLE[media]
+        if media == "audio" and row.get("has_cover") is None:
+            inspected = engine.inspect_file_cover(row)
+            row["has_cover"] = inspected["has_cover"]
+            row["cover_status"] = inspected["cover_status"]
+            row["tag_artist"] = inspected["artist"]
+            row["tag_album"] = inspected["album"]
+            row["tag_title"] = inspected["title"]
+            row["cover_query_source"] = inspected["source"]
+        cands = []
+        if row.get("cover_candidates"):
+            try:
+                cands = json.loads(row["cover_candidates"])
+            except Exception:
+                cands = []
+        row["cover_choices_count"] = len(cands)
+        row.pop("cover_candidates", None)
     return {"files": rows, "target": state.get_settings(engine.db)[media]["target"]}
+
+
+@router.get("/files/{fid}/cover")
+def file_cover(fid: int, engine=Engine):
+    row = engine.db.one("SELECT media, relpath FROM files WHERE id = ?", (fid,))
+    if not row or row["media"] != "audio":
+        raise HTTPException(404, "audio file not found")
+    path = engine.abs_path("audio", row["relpath"])
+    extracted = cover.extract_cover(path)
+    if not extracted:
+        raise HTTPException(404, "no embedded cover art")
+    data, mime = extracted
+    return Response(content=data, media_type=mime, headers={"Cache-Control": "no-cache"})
+
+
+@router.post("/files/{fid}/cover/search")
+def file_cover_search(fid: int, body: CoverSearchBody | None = None, engine=Engine):
+    b = body or CoverSearchBody()
+    try:
+        return engine.search_file_covers(
+            fid,
+            artist=b.artist,
+            album=b.album,
+            title=b.title,
+            source_mode=b.source,
+            force_refresh=b.force,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/files/{fid}/cover/apply")
+def file_cover_apply(fid: int, body: CoverApplyBody, engine=Engine):
+    try:
+        return engine.apply_cover(
+            fid,
+            body.image_url,
+            scope=body.scope,
+            target_ids=body.target_ids or None,
+            only_missing=body.only_missing,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/covers/check")
+def covers_check(body: CoverCheckBody, engine=Engine):
+    return engine.check_covers_batch(
+        ids=body.ids or None,
+        dir_rel=body.dir,
+        enabled_only=body.enabled_only,
+    )
+
+
+@router.get("/covers/parked")
+def covers_parked(engine=Engine):
+    """Return audio files with multiple cover choices or missing/not-found covers for the
+    separate Cover Art pane on the Parked files tab (never mixed with audio normalization parked files)."""
+    enabled = folders.enabled_set(engine.db, "audio")
+    rows = engine.db.query(
+        "SELECT id, name, relpath, dir, ext, has_cover, cover_status, cover_candidates, "
+        "tag_artist, tag_album, tag_title, cover_query_source "
+        "FROM files WHERE media = 'audio' AND cover_status IN ('choices', 'not_found') "
+        "ORDER BY dir, name"
+    )
+    choices_files: list[dict] = []
+    not_found_files: list[dict] = []
+    albums_map: dict[tuple[str, str, str], dict] = {}
+
+    for r in rows:
+        if r["dir"] not in enabled:
+            continue
+        cands = []
+        if r.get("cover_candidates"):
+            try:
+                cands = json.loads(r["cover_candidates"])
+            except Exception:
+                cands = []
+        item = {
+            "id": r["id"],
+            "name": r["name"],
+            "relpath": r["relpath"],
+            "dir": r["dir"],
+            "ext": r["ext"],
+            "cover_status": r["cover_status"],
+            "artist": r.get("tag_artist") or "",
+            "album": r.get("tag_album") or "",
+            "title": r.get("tag_title") or "",
+            "query_source": r.get("cover_query_source") or "tags",
+            "candidates": cands,
+        }
+        if r["cover_status"] == "choices" and cands:
+            choices_files.append(item)
+            key = (
+                r["dir"],
+                (item["artist"] or "").lower().strip(),
+                (item["album"] or "").lower().strip(),
+            )
+            grp = albums_map.get(key)
+            if grp is None:
+                grp = {
+                    "dir": r["dir"],
+                    "artist": item["artist"],
+                    "album": item["album"],
+                    "query_source": item["query_source"],
+                    "primary_file_id": r["id"],
+                    "file_ids": [],
+                    "files": [],
+                    "candidates": cands,
+                }
+                albums_map[key] = grp
+            grp["file_ids"].append(r["id"])
+            grp["files"].append({"id": r["id"], "name": r["name"], "title": item["title"], "relpath": r["relpath"]})
+        else:
+            not_found_files.append(item)
+
+    return {
+        "albums": list(albums_map.values()),
+        "choices_files": choices_files,
+        "not_found_files": not_found_files,
+        "counts": {
+            "albums": len(albums_map),
+            "choices": len(choices_files),
+            "not_found": len(not_found_files),
+            "total": len(choices_files) + len(not_found_files),
+        },
+    }
+
+
+@router.post("/covers/skip")
+def covers_skip(body: CoverIdsBody, engine=Engine):
+    return engine.skip_cover(body.ids)
+
+
+@router.post("/covers/apply-first-all")
+def covers_apply_first_all(body: CoverIdsBody | None = None, engine=Engine):
+    ids = body.ids if body else None
+    try:
+        return engine.apply_first_cover_all(ids=ids or None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/covers/test-discogs")
+def covers_test_discogs(body: DiscogsTestBody | None = None, engine=Engine):
+    token = body.token if body and body.token is not None else state.get_settings(engine.db)["general"].get("discogsToken", "")
+    return cover.test_discogs(token or "")
+
+
+# ------------------------------------------------------------ metadata tab & per-file popup
+
+@router.get("/metadata")
+def get_metadata(engine=Engine):
+    return engine.get_metadata_results()
+
+
+@router.put("/metadata/options")
+def put_metadata_options(body: dict, engine=Engine):
+    return state.put_metadata_options(engine.db, body)
+
+
+@router.post("/metadata/check")
+def check_metadata(body: MetadataCheckBody | None = None, engine=Engine):
+    b = body or MetadataCheckBody()
+    return engine.check_metadata_batch(
+        ids=b.ids or None,
+        dir_rel=b.dir,
+        options=b.options,
+        force=b.force,
+    )
+
+
+@router.post("/files/{fid}/metadata/check")
+def check_file_metadata(fid: int, body: FileMetadataCheckBody | None = None, engine=Engine):
+    b = body or FileMetadataCheckBody()
+    row = engine.db.one("SELECT * FROM files WHERE id = ?", (fid,))
+    if not row or row["media"] != "audio":
+        raise HTTPException(404, "audio file not found")
+    custom_q = dict(b.query) if isinstance(b.query, dict) else {}
+    for k in ("artist", "album", "title"):
+        val = getattr(b, k, None)
+        if val is not None:
+            custom_q[k] = val
+    try:
+        return engine.check_file_metadata(
+            row,
+            force_refresh=b.force,
+            custom_query=custom_q or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/metadata/select")
+def select_metadata(body: MetadataSelectBody, engine=Engine):
+    val = body.custom_value if body.custom_value is not None else body.value
+    return engine.select_metadata_choice(
+        body.ids,
+        field=body.field,
+        choice=body.choice,
+        custom_value=val,
+    )
+
+
+@router.post("/metadata/apply")
+def apply_metadata(body: MetadataApplyBody, engine=Engine):
+    try:
+        return engine.apply_metadata(
+            body.ids,
+            field_overrides=body.overrides,
+            scope=body.scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/files/stream")
