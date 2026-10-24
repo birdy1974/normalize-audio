@@ -47,7 +47,7 @@
   };
   const DEFAULTS = {
     general: {
-      dryRun: false, preserveMtime: true, mode: 'bulk',
+      dryRun: false, preserveMtime: true, mode: 'bulk', theme: 'light',
       trimSilence: false, silenceLevelPct: 2.0, silencePeakDb: -40.0,
       silenceMinDuration: 5.0, silenceFadeOut: 0.5, silenceFadeIn: 0.5,
       coverAuto: false, coverSources: 'both', discogsToken: '', useLocalCover: true,
@@ -55,6 +55,80 @@
     audio: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
     video: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
   };
+
+  /* ----------------------------------------------------------------- theme */
+  const THEME_KEY = 'audio-normalizer-theme';
+  const VALID_THEMES = ['light', 'dark', 'system'];
+  let themeHydratedFromLocal = false;
+  let themePref = (() => {
+    try {
+      const raw = localStorage.getItem(THEME_KEY);
+      if (raw && VALID_THEMES.includes(raw)) {
+        themeHydratedFromLocal = true;
+        return raw;
+      }
+    } catch (_e) { /* private mode */ }
+    return 'light';
+  })();
+
+  function effectiveTheme(pref) {
+    const p = pref || themePref || 'light';
+    if (p === 'dark') return 'dark';
+    if (p === 'system') {
+      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    return 'light';
+  }
+
+  function syncThemeControls() {
+    const resolved = effectiveTheme(themePref);
+    const toggleBtn = document.getElementById('theme-toggle');
+    if (toggleBtn) {
+      const nextLbl = resolved === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+      toggleBtn.setAttribute('aria-label', nextLbl);
+      toggleBtn.title = nextLbl;
+      toggleBtn.setAttribute('aria-pressed', String(resolved === 'dark'));
+    }
+    document.querySelectorAll('#sidebar-theme [data-theme]').forEach((btn) => {
+      const on = btn.dataset.theme === themePref;
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-pressed', String(on));
+    });
+  }
+
+  function applyTheme(pref, opts) {
+    const o = opts || {};
+    const next = VALID_THEMES.includes(pref) ? pref : 'light';
+    themePref = next;
+    const resolved = effectiveTheme(next);
+    document.documentElement.setAttribute('data-theme', resolved);
+    document.documentElement.setAttribute('data-theme-pref', next);
+    const metaTheme = document.getElementById('meta-theme-color');
+    if (metaTheme) metaTheme.setAttribute('content', resolved === 'dark' ? '#141615' : '#ebebe9');
+    if (o.saveLocal !== false) {
+      themeHydratedFromLocal = true;
+      try { localStorage.setItem(THEME_KEY, next); } catch (_e) { /* private mode */ }
+    }
+    if (state && state.settings && state.settings.general) state.settings.general.theme = next;
+    if (state && state.draft && state.draft.general) state.draft.general.theme = next;
+    if (state && state.dash) state.dash.theme = next;
+    syncThemeControls();
+    if (typeof EDIT !== 'undefined' && EDIT.open && typeof drawEditor === 'function') {
+      drawEditor();
+    }
+    if (o.saveServer) {
+      api('/settings', { method: 'PUT', body: { general: { theme: next } } }).catch(() => {});
+    }
+  }
+
+  if (window.matchMedia) {
+    const darkMq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onMqChange = () => {
+      if (themePref === 'system') applyTheme('system', { saveLocal: false, saveServer: false });
+    };
+    if (darkMq.addEventListener) darkMq.addEventListener('change', onMqChange);
+    else if (darkMq.addListener) darkMq.addListener(onMqChange);
+  }
   const PRESETS = {
     nights: (d, h) => h >= 22 || h < 6,
     weeknights: (d, h) => d < 5 && (h >= 22 || h < 6),
@@ -427,12 +501,19 @@
   };
   const EDIT_MIN_WINDOW = 0.25;          // seconds visible at the deepest zoom
   const ZOOM_STEP = 1.6;
-  const EDIT_COLORS = {
+  const EDIT_COLORS_LIGHT = {
     bg: '#fbfbfa', grid: '#d9d9d5', gridText: '#9d9e99', text: '#6c6d69',
     wave: '#2f7a6b', waveDim: '#8fc0b5',
     sel: 'rgba(47,122,107,.20)', cut: 'rgba(160,63,54,.20)', cutLine: '#a03f36',
     fade: 'rgba(47,122,107,.14)', playhead: '#2f3130',
   };
+  const EDIT_COLORS_DARK = {
+    bg: '#181b1a', grid: '#2e3331', gridText: '#6c736e', text: '#9ca39e',
+    wave: '#3ea38e', waveDim: '#266155',
+    sel: 'rgba(62,163,142,.24)', cut: 'rgba(224,108,98,.22)', cutLine: '#e06c62',
+    fade: 'rgba(62,163,142,.18)', playhead: '#eceee9',
+  };
+  const editColors = () => (effectiveTheme() === 'dark' ? EDIT_COLORS_DARK : EDIT_COLORS_LIGHT);
 
   function fmtClock(sec, decimals) {
     if (!isFinite(sec) || sec < 0) sec = 0;
@@ -569,6 +650,7 @@
       canvas.width = Math.round(W * dpr);
       canvas.height = Math.round(H * dpr);
     }
+    const EDIT_COLORS = editColors();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = EDIT_COLORS.bg;
@@ -1362,8 +1444,16 @@
     if (key === 'dashboard') {
       state.dash = await api('/dashboard');
       state.dashKey = JSON.stringify(state.dash);
+      if (!themeHydratedFromLocal && state.dash && state.dash.theme) {
+        applyTheme(state.dash.theme, { saveLocal: false, saveServer: false });
+      }
     } else if (key === 'settings') {
       state.settings = await api('/settings');
+      if (themeHydratedFromLocal && state.settings && state.settings.general) {
+        state.settings.general.theme = themePref;
+      } else if (state.settings && state.settings.general && state.settings.general.theme) {
+        applyTheme(state.settings.general.theme, { saveLocal: false, saveServer: false });
+      }
       state.draft = clone(state.settings);
     } else if (key === 'schedule') {
       state.sched = await api('/schedule');
@@ -2447,7 +2537,7 @@
       + '</div>'
       + '<div class="sched-wrap"><table class="sched"><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>'
       + '<div class="legend"><span><span class="swatch" style="background:var(--accent)"></span>processing allowed</span>'
-      + '<span><span class="swatch" style="background:#dcdcd8"></span>paused</span>'
+      + '<span><span class="swatch" style="background:var(--track)"></span>paused</span>'
       + '<span id="sched-now"></span></div>'
       + '</section>'
       + '<section class="card"><h2 style="margin-bottom:10px">Windows per day</h2><ul class="sched-list" id="sched-summary"></ul></section>';
@@ -2668,6 +2758,21 @@
       + '</div></div></section>';
   }
 
+  function appearanceCard() {
+    const cur = (state.draft && state.draft.general && state.draft.general.theme) || themePref || 'light';
+    const opts = [
+      ['light', 'Light', 'Crisp warm-grey and paper surfaces for bright environments.', true],
+      ['dark', 'Dark', 'Low-glare charcoal surfaces with balanced contrast for dim rooms and late sessions.', false],
+      ['system', 'Automatic (system)', 'Follows your operating system or browser light/dark preference automatically.', false],
+    ].map(([v, title, d, def]) => '<label class="opt"><input type="radio" name="app-theme" value="' + v + '"'
+      + ' data-scope="general" data-setting="theme"' + (cur === v ? ' checked' : '') + '>'
+      + '<span><strong style="font-weight:500">' + title + '</strong>'
+      + (def ? '<span class="tag">default</span>' : '') + tip(d) + '</span></label>').join('');
+    return '<section class="card" style="margin-bottom:16px"><div class="card-head"><div><h2>Appearance</h2>'
+      + '<div class="sub">Switch the GUI between Light mode, Dark mode, or Automatic system preference. Also available anytime in the left menu.</div></div></div>'
+      + '<div class="field" style="margin:0"><span class="lbl">Theme</span>' + opts + '</div></section>';
+  }
+
   function renderSettings() {
     const t = state.media;
     const g = state.draft.general;
@@ -2675,6 +2780,7 @@
       'Level and output are set separately for audio and video. Changes take effect when you press Save.',
       '<button class="btn" data-action="settings-reset">Reset ' + MEDIA[t].label.toLowerCase() + '</button>'
       + '<button class="btn btn-primary" data-action="settings-save">Save</button>', true)
+      + appearanceCard()
       + modeCard()
       + '<section class="card"><div class="check-list">'
       + '<label class="check" style="padding-top:0"><input class="switch" type="checkbox" data-scope="general" data-setting="dryRun"' + (g.dryRun ? ' checked' : '') + '>'
@@ -4456,6 +4562,14 @@
       state.baselineFrom = el.dataset.media;
     } else if (a === 'baseline-done') {
       state.baselineFrom = null;
+    } else if (a === 'theme-toggle') {
+      const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+      applyTheme(next, { saveLocal: true, saveServer: true });
+      if (currentRoute() === 'settings') render();
+    } else if (a === 'set-theme') {
+      const next = el.dataset.theme || 'light';
+      applyTheme(next, { saveLocal: true, saveServer: true });
+      if (currentRoute() === 'settings') render();
     } else if (a === 'settings-save') {
       const d = state.draft;
       const busy = startBusy('Saving the settings');
@@ -4463,6 +4577,9 @@
       try {
         state.settings = await api('/settings', { method: 'PUT', body: { general: d.general, audio: d.audio, video: d.video } });
         state.draft = clone(state.settings);
+        if (state.settings && state.settings.general && state.settings.general.theme) {
+          applyTheme(state.settings.general.theme, { saveLocal: true, saveServer: false });
+        }
         toast('Settings saved');
         await refreshDash();
       } finally {
@@ -5208,6 +5325,9 @@
         return;
       }
       bucket[key] = el.type === 'checkbox' ? el.checked : el.value;
+      if (el.dataset.scope === 'general' && key === 'theme' && committed) {
+        applyTheme(el.value, { saveLocal: true, saveServer: true });
+      }
       if (committed) render();
       return;
     }
@@ -5865,6 +5985,7 @@
     }
   }, 2500);
 
+  applyTheme(themePref, { saveLocal: false, saveServer: false });
   applyMenu();
   initPlayer();
   initEditor();
