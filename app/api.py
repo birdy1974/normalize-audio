@@ -137,15 +137,17 @@ class FileMetadataCheckBody(BaseModel):
 class MetadataSelectBody(BaseModel):
     ids: list[int] = Field(default_factory=list)
     field: str | None = None
-    choice: Literal["current", "path", "online", "custom"] = "online"
+    choice: Literal["current", "path", "discogs", "musicbrainz", "open", "online", "custom"] = "online"
     value: str | None = None
     custom_value: str | None = None
+    values: dict[str, str] | None = None
 
 
 class MetadataApplyBody(BaseModel):
     ids: list[int] = Field(default_factory=list)
     overrides: dict | None = None
     scope: Literal["file", "album"] = "file"
+    fields: list[str] | None = None
 
 
 SORTS = {
@@ -227,6 +229,7 @@ def dashboard(engine=Engine):
         "current_file": current,
         "approved_pending": approved_pending,
         "scanning": engine.scanning(),
+        "meta_checking": engine.is_metadata_checking(),
         "dry_run": settings["general"]["dryRun"],
         "media": media,
         "log": db.log_list(60),
@@ -351,7 +354,7 @@ def list_files(media: str = "audio", dir: str = ".", engine=Engine):
     rows = engine.db.query(
         "SELECT id, media, name, relpath, dir, ext, lufs, true_peak, status, reason, gain_db, adjust_db, applied_db, "
         "method, measured_at, changed_at, silent_sections, silent_duration, silence_trimmed, "
-        "has_cover, cover_status, cover_candidates, tag_artist, tag_album, tag_title, cover_query_source "
+        "has_cover, cover_status, cover_candidates, cover_updated_at, tag_artist, tag_album, tag_title, cover_query_source "
         "FROM files WHERE media = ? AND dir = ? ORDER BY name LIMIT 500",
         (media, dir))
     for row in rows:
@@ -385,7 +388,39 @@ def file_cover(fid: int, engine=Engine):
     if not extracted:
         raise HTTPException(404, "no embedded cover art")
     data, mime = extracted
-    return Response(content=data, media_type=mime, headers={"Cache-Control": "no-cache"})
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@router.get("/files/{fid}/local-cover")
+def file_local_cover(fid: int, engine=Engine):
+    row = engine.db.one("SELECT media, relpath FROM files WHERE id = ?", (fid,))
+    if not row or row["media"] != "audio":
+        raise HTTPException(404, "audio file not found")
+    path = engine.abs_path("audio", row["relpath"])
+    local = cover.find_local_cover(path)
+    if not local or not local.get("image_url"):
+        raise HTTPException(404, "no local folder cover")
+    try:
+        data, mime = cover.download_cover(local["image_url"])
+    except Exception as exc:
+        raise HTTPException(404, "could not read local cover") from exc
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @router.post("/files/{fid}/cover/search")
@@ -545,6 +580,11 @@ def check_metadata(body: MetadataCheckBody | None = None, engine=Engine):
     )
 
 
+@router.post("/metadata/stop")
+def stop_metadata(engine=Engine):
+    return engine.stop_metadata_check()
+
+
 @router.post("/files/{fid}/metadata/check")
 def check_file_metadata(fid: int, body: FileMetadataCheckBody | None = None, engine=Engine):
     b = body or FileMetadataCheckBody()
@@ -574,6 +614,7 @@ def select_metadata(body: MetadataSelectBody, engine=Engine):
         field=body.field,
         choice=body.choice,
         custom_value=val,
+        updates_map=body.values,
     )
 
 
@@ -584,6 +625,7 @@ def apply_metadata(body: MetadataApplyBody, engine=Engine):
             body.ids,
             field_overrides=body.overrides,
             scope=body.scope,
+            only_fields=body.fields,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
