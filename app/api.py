@@ -43,6 +43,10 @@ class FolderAll(BaseModel):
     enabled: bool
 
 
+class FolderInvert(BaseModel):
+    media: Literal["audio", "video"]
+
+
 class ScanBody(BaseModel):
     media: Literal["audio", "video"] | None = None
 
@@ -123,6 +127,7 @@ class MetadataCheckBody(BaseModel):
     dir: str | None = None
     enabled_only: bool = True
     force: bool = False
+    background: bool = False
     options: dict | None = None
 
 
@@ -140,7 +145,7 @@ class MetadataSelectBody(BaseModel):
     choice: Literal["current", "path", "discogs", "musicbrainz", "open", "online", "custom"] = "online"
     value: str | None = None
     custom_value: str | None = None
-    values: dict[str, str] | None = None
+    values: dict[str, str | dict] | None = None
 
 
 class MetadataApplyBody(BaseModel):
@@ -174,9 +179,22 @@ def health():
 @router.get("/config")
 def config(engine=Engine):
     cfg = engine.cfg
+    db_path = engine.db.path
+    try:
+        db_size = os.path.getsize(db_path) if os.path.isfile(db_path) else 0
+    except OSError:
+        db_size = 0
     return {
         "version": __version__,
         "roots": {"audio": cfg.audio_root, "video": cfg.video_root},
+        "config_dir": cfg.config_dir,
+        "persistence": {
+            "db_path": db_path,
+            "config_dir": cfg.config_dir,
+            "db_exists": os.path.isfile(db_path),
+            "db_size_bytes": db_size,
+            "persistent": True,
+        },
         "tools": {
             "ffmpeg": bool(tool_path(cfg.ffmpeg)),
             "mp3gain": "mp3gain" in engine.tools,
@@ -230,6 +248,7 @@ def dashboard(engine=Engine):
         "approved_pending": approved_pending,
         "scanning": engine.scanning(),
         "meta_checking": engine.is_metadata_checking(),
+        "meta_progress": engine.get_metadata_progress(),
         "dry_run": settings["general"]["dryRun"],
         "media": media,
         "log": db.log_list(60),
@@ -315,6 +334,12 @@ def toggle_folder(body: FolderToggle, engine=Engine):
 @router.post("/folders/all")
 def toggle_all(body: FolderAll, engine=Engine):
     folders.set_all(engine.db, _media_check(body.media), body.enabled)
+    return {"ok": True}
+
+
+@router.post("/folders/invert")
+def invert_folders(body: FolderInvert, engine=Engine):
+    folders.invert_all(engine.db, _media_check(body.media))
     return {"ok": True}
 
 
@@ -572,6 +597,13 @@ def put_metadata_options(body: dict, engine=Engine):
 @router.post("/metadata/check")
 def check_metadata(body: MetadataCheckBody | None = None, engine=Engine):
     b = body or MetadataCheckBody()
+    if b.background:
+        return engine.start_metadata_check(
+            ids=b.ids or None,
+            dir_rel=b.dir,
+            options=b.options,
+            force=b.force,
+        )
     return engine.check_metadata_batch(
         ids=b.ids or None,
         dir_rel=b.dir,

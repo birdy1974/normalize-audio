@@ -22,12 +22,15 @@ RUN apt-get update \
 
 WORKDIR /app
 
+RUN mkdir -p /config /data/audio /data/video && chmod 0777 /config
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY static ./static
 
+VOLUME ["/config"]
 EXPOSE 8080
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \

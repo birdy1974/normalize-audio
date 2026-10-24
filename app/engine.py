@@ -58,6 +58,21 @@ class Engine:
         self._meta_stop = threading.Event()
         self._meta_lock = threading.Lock()
         self._meta_checking = False
+        self._meta_thread: threading.Thread | None = None
+        self._meta_progress: dict = {
+            "running": False,
+            "force": False,
+            "total": 0,
+            "done": 0,
+            "diff": 0,
+            "ok": 0,
+            "path_diff": 0,
+            "current_file": "",
+            "stopped": False,
+            "started_at": None,
+            "finished_at": None,
+            "seq": 0,
+        }
         self._threads: list[threading.Thread] = []
         self._pool = ThreadPoolExecutor(max_workers=cfg.concurrency, thread_name_prefix="normalizer")
         # restart recovery: files that were being processed go back to the queue
@@ -306,11 +321,16 @@ class Engine:
     def shutdown(self) -> None:
         self._stop.set()
         self._wake.set()
+        self._meta_stop.set()
         with self._lock:
             for fid, item in self._inflight.items():
                 if not item["approved"]:
                     self._cancel.add(fid)
         self._pool.shutdown(wait=False, cancel_futures=True)
+        with self._meta_lock:
+            mt = self._meta_thread
+        if mt is not None and mt.is_alive():
+            mt.join(timeout=2.0)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -1219,11 +1239,62 @@ class Engine:
         with self._meta_lock:
             return self._meta_checking
 
+    def get_metadata_progress(self) -> dict:
+        with self._meta_lock:
+            snap = dict(self._meta_progress)
+            snap["running"] = self._meta_checking
+            return snap
+
     def stop_metadata_check(self) -> dict:
         self._meta_stop.set()
         with self._meta_lock:
             was_running = self._meta_checking
         return {"ok": True, "stopping": was_running}
+
+    def start_metadata_check(self, ids: list[int] | None = None, dir_rel: str | None = None,
+                             options: dict | None = None, force: bool = False) -> dict:
+        """Start a metadata batch check in a background thread so intermediate results stream live."""
+        if options:
+            state.put_metadata_options(self.db, options)
+        with self._meta_lock:
+            if self._meta_checking:
+                snap = dict(self._meta_progress)
+                snap["running"] = True
+                snap["already_running"] = True
+                return snap
+            self._meta_stop.clear()
+            self._meta_checking = True
+            self._meta_progress = {
+                "running": True,
+                "force": bool(force),
+                "total": 0,
+                "done": 0,
+                "diff": 0,
+                "ok": 0,
+                "path_diff": 0,
+                "current_file": "",
+                "stopped": False,
+                "started_at": time.time(),
+                "finished_at": None,
+                "seq": int(self._meta_progress.get("seq", 0)) + 1,
+            }
+
+            def _worker():
+                try:
+                    self._run_metadata_batch(ids=ids, dir_rel=dir_rel, options=None, force=force)
+                except Exception as exc:
+                    log.exception("background metadata check failed")
+                    self.db.log("error", f"Metadata check failed: {exc}", "audio")
+                    with self._meta_lock:
+                        self._meta_checking = False
+                        self._meta_progress["running"] = False
+                        self._meta_progress["finished_at"] = time.time()
+                        self._meta_progress["seq"] = int(self._meta_progress.get("seq", 0)) + 1
+
+            t = threading.Thread(target=_worker, name="metadata-checker", daemon=True)
+            self._meta_thread = t
+            t.start()
+            return {"started": True, **dict(self._meta_progress)}
 
     def check_file_metadata(self, row: dict, options: dict | None = None, st: dict | None = None, *,
                             force_refresh: bool = False, custom_query: dict | None = None,
@@ -1316,7 +1387,30 @@ class Engine:
 
     def check_metadata_batch(self, ids: list[int] | None = None, dir_rel: str | None = None,
                              options: dict | None = None, *, force: bool = False) -> dict:
-        """Run metadata check across selected files, a directory, or all enabled audio directories."""
+        """Run metadata check synchronously across selected files, a directory, or all enabled audio directories."""
+        with self._meta_lock:
+            if self._meta_checking:
+                return {"checked": 0, "diff": 0, "ok": 0, "path_diff": 0, "stopped": False, "already_running": True}
+            self._meta_stop.clear()
+            self._meta_checking = True
+            self._meta_progress = {
+                "running": True,
+                "force": bool(force),
+                "total": 0,
+                "done": 0,
+                "diff": 0,
+                "ok": 0,
+                "path_diff": 0,
+                "current_file": "",
+                "stopped": False,
+                "started_at": time.time(),
+                "finished_at": None,
+                "seq": int(self._meta_progress.get("seq", 0)) + 1,
+            }
+        return self._run_metadata_batch(ids=ids, dir_rel=dir_rel, options=options, force=force)
+
+    def _run_metadata_batch(self, ids: list[int] | None = None, dir_rel: str | None = None,
+                            options: dict | None = None, *, force: bool = False) -> dict:
         if options:
             opts = state.put_metadata_options(self.db, options)
         else:
@@ -1328,27 +1422,41 @@ class Engine:
         elif dir_rel is not None:
             rows = self._target_rows("audio", None, dir_rel)
         else:
-            rows = self.db.query(
-                "SELECT f.* FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+            all_rows = self.db.query(
+                "SELECT f.*, m.status AS _meta_status "
+                "FROM dirs d CROSS JOIN files f ON f.media = d.media AND f.dir = d.relpath "
+                "LEFT JOIN file_metadata m ON m.file_id = f.id "
                 "WHERE d.media = 'audio' AND d.enabled = 1 ORDER BY f.dir, f.name"
             )
+            if not force:
+                unchecked_rows = [r for r in all_rows if not r.get("_meta_status") or r.get("_meta_status") == "unchecked"]
+                rows = unchecked_rows if unchecked_rows else all_rows
+            else:
+                rows = all_rows
 
-        self._meta_stop.clear()
+        total = len(rows)
         with self._meta_lock:
-            self._meta_checking = True
+            self._meta_progress["total"] = total
+            self._meta_progress["seq"] = int(self._meta_progress.get("seq", 0)) + 1
+
         checked = diff = ok = path_diff = 0
         stopped = False
         try:
             for r in rows:
-                if self._meta_stop.is_set():
+                if self._meta_stop.is_set() or self._stop.is_set():
                     stopped = True
                     break
                 if r["status"] == "processing":
                     continue
+                with self._meta_lock:
+                    self._meta_progress["current_file"] = r["relpath"]
                 try:
                     res = self.check_file_metadata(
                         r, opts, st, force_refresh=force, cancel=self._meta_stop.is_set
                     )
+                    if self._meta_stop.is_set() or self._stop.is_set():
+                        stopped = True
+                        break
                     checked += 1
                     if res["status"] == "diff":
                         diff += 1
@@ -1356,14 +1464,27 @@ class Engine:
                         ok += 1
                     if res["path_diff"]:
                         path_diff += 1
+                    with self._meta_lock:
+                        self._meta_progress["done"] = checked
+                        self._meta_progress["diff"] = diff
+                        self._meta_progress["ok"] = ok
+                        self._meta_progress["path_diff"] = path_diff
+                        self._meta_progress["seq"] = int(self._meta_progress.get("seq", 0)) + 1
                 except ff.Cancelled:
                     stopped = True
                     break
                 except Exception as exc:
                     self.db.log("error", f"{r['name']}: metadata check failed ({exc})", "audio")
+                    with self._meta_lock:
+                        self._meta_progress["seq"] = int(self._meta_progress.get("seq", 0)) + 1
         finally:
             with self._meta_lock:
                 self._meta_checking = False
+                self._meta_progress["running"] = False
+                self._meta_progress["current_file"] = ""
+                self._meta_progress["stopped"] = stopped
+                self._meta_progress["finished_at"] = time.time()
+                self._meta_progress["seq"] = int(self._meta_progress.get("seq", 0)) + 1
 
         if stopped:
             self.db.log("info", f"Meta data check stopped: {checked} file(s) checked, {diff} with differences", "audio")
@@ -1441,6 +1562,7 @@ class Engine:
         return {
             "options": opts,
             "meta_checking": self.is_metadata_checking(),
+            "meta_progress": self.get_metadata_progress(),
             "files": items,
             "folders": sorted(folders_set),
             "enabled_folders": enabled_dirs,
@@ -1462,9 +1584,9 @@ class Engine:
 
     def select_metadata_choice(self, ids: list[int], field: str | None = None,
                                choice: str = "online", custom_value: str | None = None,
-                               updates_map: dict[str, str] | None = None) -> dict:
+                               updates_map: dict[str, Any] | None = None) -> dict:
         """Update the chosen source ('current', 'path', 'discogs', 'musicbrainz', 'open', 'online', 'custom')
-        for one field, multiple custom fields, or all fields, keeping file_metadata in sync."""
+        for one field, multiple fields (custom or source-mode), or all fields, keeping file_metadata in sync."""
         if not ids:
             return {"updated": 0}
         if field == "all":
@@ -1477,6 +1599,35 @@ class Engine:
             f"WHERE f.id IN ({placeholders})",
             ids,
         )
+
+        def _apply_one_field(selected_dict: dict, f_key: str, f_choice: str, f_custom: str | None,
+                             cur_d: dict, path_d: dict, online_d: dict, by_src_d: dict) -> None:
+            if f_key not in state.METADATA_FIELDS:
+                return
+            if f_choice == "custom":
+                val = str(f_custom if f_custom is not None else "").strip()
+                selected_dict[f_key] = {"choice": "custom", "value": val}
+            elif f_choice == "current":
+                selected_dict[f_key] = {"choice": "current", "value": str(cur_d.get(f_key) or "").strip()}
+            elif f_choice == "path":
+                p_val = str(path_d.get(f_key) or "").strip()
+                if p_val:
+                    selected_dict[f_key] = {"choice": "path", "value": p_val}
+            elif f_choice in ("discogs", "musicbrainz", "open"):
+                s_val = str(by_src_d[f_choice].get(f_key) or "").strip()
+                if s_val:
+                    selected_dict[f_key] = {"choice": f_choice, "value": s_val}
+            elif f_choice == "online":
+                d_val = str(by_src_d["discogs"].get(f_key) or "").strip()
+                m_val = str(by_src_d["musicbrainz"].get(f_key) or "").strip()
+                i_val = str(by_src_d["open"].get(f_key) or "").strip()
+                o_val = d_val or m_val or i_val or str(online_d.get(f_key) or "").strip()
+                picked_src = (
+                    "discogs" if d_val else ("musicbrainz" if m_val else ("open" if i_val else "online"))
+                )
+                if o_val:
+                    selected_dict[f_key] = {"choice": picked_src, "value": o_val}
+
         updated = 0
         for r in rows:
             try:
@@ -1484,44 +1635,23 @@ class Engine:
                 path_meta = json.loads(r["path_json"] or "{}")
                 online_meta = json.loads(r["online_json"] or "{}")
                 selected = json.loads(r["selected_json"] or "{}")
-                diffs = json.loads(r["diffs_json"] or "[]")
             except Exception:
                 continue
 
             by_src = metadata.extract_online_by_source(online_meta)
 
             if updates_map and isinstance(updates_map, dict):
-                for fk, fval in updates_map.items():
-                    if fk in state.METADATA_FIELDS:
-                        selected[fk] = {"choice": "custom", "value": str(fval if fval is not None else "").strip()}
+                for fk, fspec in updates_map.items():
+                    if isinstance(fspec, dict):
+                        m_choice = str(fspec.get("choice") or "custom").strip()
+                        m_val = fspec.get("value")
+                        _apply_one_field(selected, fk, m_choice, m_val, current, path_meta, online_meta, by_src)
+                    else:
+                        _apply_one_field(selected, fk, "custom", str(fspec if fspec is not None else ""), current, path_meta, online_meta, by_src)
             else:
                 target_fields = [field] if field else list(state.METADATA_FIELDS)
                 for f in target_fields:
-                    if f not in state.METADATA_FIELDS:
-                        continue
-                    if choice == "custom":
-                        val = str(custom_value if custom_value is not None else "").strip()
-                        selected[f] = {"choice": "custom", "value": val}
-                    elif choice == "current":
-                        selected[f] = {"choice": "current", "value": str(current.get(f) or "").strip()}
-                    elif choice == "path":
-                        p_val = str(path_meta.get(f) or "").strip()
-                        if p_val or field:
-                            selected[f] = {"choice": "path", "value": p_val}
-                    elif choice in ("discogs", "musicbrainz", "open"):
-                        s_val = str(by_src[choice].get(f) or "").strip()
-                        if s_val or field:
-                            selected[f] = {"choice": choice, "value": s_val}
-                    elif choice == "online":
-                        d_val = str(by_src["discogs"].get(f) or "").strip()
-                        m_val = str(by_src["musicbrainz"].get(f) or "").strip()
-                        i_val = str(by_src["open"].get(f) or "").strip()
-                        o_val = d_val or m_val or i_val or str(online_meta.get(f) or "").strip()
-                        picked_src = (
-                            "discogs" if d_val else ("musicbrainz" if m_val else ("open" if i_val else "online"))
-                        )
-                        if o_val or field:
-                            selected[f] = {"choice": picked_src, "value": o_val}
+                    _apply_one_field(selected, f, choice, custom_value, current, path_meta, online_meta, by_src)
 
             cmp = metadata.compare_file_metadata(r["relpath"], current, path_meta, online_meta, opts, selected)
             self.db.execute(
@@ -1560,6 +1690,7 @@ class Engine:
         )
         ALBUM_SHARED_FIELDS = ("artist", "album", "album_artist", "year", "genre", "cover")
         updated = 0
+        unchanged = 0
         errors: list[str] = []
 
         for idx, r in enumerate(rows):
@@ -1580,6 +1711,7 @@ class Engine:
                 selected = {}
             if not path_meta:
                 path_meta = metadata.parse_path_full(r["relpath"])
+            by_src = metadata.extract_online_by_source(online_meta)
 
             working_selected = dict(selected)
             if field_overrides and isinstance(field_overrides, dict):
@@ -1600,17 +1732,22 @@ class Engine:
                 sel_item = working_selected.get(f)
                 if not sel_item or not isinstance(sel_item, dict):
                     continue
-                choice = sel_item.get("choice", "current")
+                choice = str(sel_item.get("choice") or "current").strip()
                 val = str(sel_item.get("value") or "").strip()
                 if choice == "current":
                     continue
-                is_explicit_override = bool(
-                    (field_overrides and f in field_overrides)
-                    or allowed_fields is not None
-                    or choice == "custom"
-                )
-                if not enabled_fields.get(f, True) and not is_explicit_override:
-                    continue
+                if not val and choice != "custom":
+                    if choice in ("discogs", "musicbrainz", "open"):
+                        val = str(by_src[choice].get(f) or "").strip()
+                    elif choice == "path":
+                        val = str(path_meta.get(f) or "").strip()
+                    elif choice == "online":
+                        val = (
+                            str(by_src["discogs"].get(f) or "").strip()
+                            or str(by_src["musicbrainz"].get(f) or "").strip()
+                            or str(by_src["open"].get(f) or "").strip()
+                            or str(online_meta.get(f) or "").strip()
+                        )
                 if f == "cover":
                     # Allow embedding OR replacing cover art whenever a valid cover URL/source is selected
                     if val and val.startswith(("http://", "https://", "data:", "local://")):
@@ -1622,12 +1759,17 @@ class Engine:
                     updates[f] = val
 
             if not updates:
+                unchanged += 1
                 # Even if disk already had the desired values, ensure DB tables match live disk state
                 now_ts = time.time()
-                preserved_sel = {
-                    fk: fv for fk, fv in selected.items()
-                    if allowed_fields is not None and fk not in allowed_fields and isinstance(fv, dict)
-                }
+                preserved_sel: dict[str, Any] = {}
+                for fk, fv in working_selected.items():
+                    if not isinstance(fv, dict):
+                        continue
+                    if allowed_fields is None or fk in allowed_fields:
+                        preserved_sel[fk] = {"choice": "current", "value": str(live_current.get(fk) or "")}
+                    else:
+                        preserved_sel[fk] = fv
                 cmp = metadata.compare_file_metadata(r["relpath"], live_current, path_meta, online_meta, opts, preserved_sel or None)
                 self.db.execute(
                     "INSERT INTO file_metadata (file_id, status, current_json, path_json, online_json, selected_json, diffs_json, path_diff, checked_at) "
@@ -1654,7 +1796,7 @@ class Engine:
             try:
                 if st["audio"]["writeMode"] == "backup":
                     self._backup(src, "audio", r["relpath"])
-                metadata.write_full_tags(src, updates, discogs_token=token)
+                metadata.write_full_tags(src, updates, discogs_token=token, preserve_mtime=True)
                 wrote_disk = True
             except metadata.CoverUpdateError as warn_exc:
                 wrote_disk = warn_exc.tags_written
@@ -1668,11 +1810,19 @@ class Engine:
 
             if wrote_disk:
                 now_ts = time.time()
+                st_after = os.stat(src)
                 new_current = metadata.read_full_tags(src)
-                preserved_sel = {
-                    fk: fv for fk, fv in selected.items()
-                    if fk not in updates and isinstance(fv, dict) and fv.get("choice") == "custom"
-                }
+                preserved_sel = {}
+                for fk, fv in working_selected.items():
+                    if not isinstance(fv, dict):
+                        continue
+                    if fk in updates:
+                        preserved_sel[fk] = {"choice": "current", "value": str(new_current.get(fk) or "")}
+                    else:
+                        preserved_sel[fk] = fv
+                for fk in updates:
+                    if fk not in preserved_sel:
+                        preserved_sel[fk] = {"choice": "current", "value": str(new_current.get(fk) or "")}
                 cmp = metadata.compare_file_metadata(
                     r["relpath"], new_current, path_meta, online_meta, opts, preserved_sel or None
                 )
@@ -1705,9 +1855,11 @@ class Engine:
                 cov_ts = now_ts if "cover" in updates else (r.get("cover_updated_at") or now_ts)
                 resolved_after = cover.resolve_search_metadata(r["relpath"], new_current)
                 self.db.execute(
-                    "UPDATE files SET has_cover = ?, cover_status = ?, cover_candidates = ?, cover_updated_at = ?, "
+                    "UPDATE files SET size = ?, mtime_ns = ?, has_cover = ?, cover_status = ?, cover_candidates = ?, cover_updated_at = ?, "
                     "tag_artist = ?, tag_album = ?, tag_title = ?, cover_query_source = ? WHERE id = ?",
                     (
+                        st_after.st_size,
+                        st_after.st_mtime_ns,
                         has_cov,
                         c_stat,
                         c_cands,
@@ -1722,6 +1874,6 @@ class Engine:
                 updated += 1
 
         if updated:
-            self.db.log("ok", f"Updated metadata for {updated} file(s)", "audio")
-        return {"updated": updated, "errors": errors}
+            self.db.log("ok", f"Updated ID3/metadata tags in {updated} file(s) (timestamps preserved)", "audio")
+        return {"updated": updated, "unchanged": unchanged, "errors": errors}
 

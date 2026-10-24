@@ -135,7 +135,10 @@
       out.push({ busy: true, text: 'Applying parked changes', sub: sub });
     }
     if (d.meta_checking) {
-      out.push({ busy: true, text: 'Checking metadata', sub: 'comparing tags, paths and online sources' });
+      const mp = d.meta_progress || (state.metadata && state.metadata.meta_progress) || {};
+      const progPart = mp.total > 0 ? mp.done + ' / ' + mp.total + ' files' : 'preparing files';
+      const curPart = mp.current_file ? ' · ' + folderTail(mp.current_file) : '';
+      out.push({ busy: true, text: 'Checking metadata', sub: progPart + curPart });
     }
     if (d.status === 'running') {
       out.push({ busy: true, text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
@@ -1089,6 +1092,21 @@
     try { localStorage.setItem(META_COLS_KEY, JSON.stringify(cols)); } catch (_err) { /* ignore */ }
   }
 
+  let metaUiSaveTimer = null;
+  function persistMetaUiPrefs() {
+    clearTimeout(metaUiSaveTimer);
+    metaUiSaveTimer = setTimeout(() => {
+      api('/metadata/options', {
+        method: 'PUT',
+        body: {
+          visible_fields: state.metaVisibleFields,
+          only_diff_rows: !!state.metaOnlyDiffRows,
+          col_widths: state.metaColWidths,
+        },
+      }).catch(() => { /* best-effort DB sync */ });
+    }, 220);
+  }
+
   /* ---------------------------------------------------------------- state */
   const state = {
     media: 'audio',                 // media tab shown on media-specific pages
@@ -1122,10 +1140,13 @@
     metaSearch: '',                 // search query on the Meta data tab
     metaSort: 'folder',             // 'folder' | 'name' | 'diffs_desc' | 'path_first'
     metaVisibleFields: loadStoredMetaVis(), // which parameters are shown directly in Pane 2
+    metaForceShowFields: [],        // bulk-edited parameters guaranteed visible even when Only diff rows is on
     metaOnlyDiffRows: false,        // when true, hide non-differing parameter rows
     metaColWidths: loadStoredMetaCols(),    // resizable column widths (px) for Pane 2 table
+    metaPrefsHydrated: false,       // hydrated once from persistent SQLite metadata_options
+    metaTableScroll: { top: 0, left: 0 },   // preserved horizontal/vertical scroll during live checks
     metaBulkOpen: false,            // whether the Bulk specific-parameter editor is expanded
-    metaBulkFields: {},             // { [fieldKey]: { enabled: bool, mode: string, value: string } }
+    metaBulkFields: {},             // { [fieldKey]: { enabled: bool, mode: string, value: string, dirty: bool } }
     metaEditing: {},                // { "fileId:field": true } for inline custom input
     parkSel: [],                    // selected parked file ids
     parkSort: 'order',
@@ -1220,6 +1241,25 @@
       state.coverParked = await api('/covers/parked');
     } else if (key === 'metadata') {
       state.metadata = await api('/metadata');
+      const opts = (state.metadata && state.metadata.options) || {};
+      if (!state.metaPrefsHydrated) {
+        state.metaPrefsHydrated = true;
+        if (Array.isArray(opts.visible_fields) && opts.visible_fields.length) {
+          state.metaVisibleFields = opts.visible_fields.filter((k) => ALL_META_FIELD_KEYS.includes(k));
+          saveStoredMetaVis(state.metaVisibleFields);
+        }
+        if (typeof opts.only_diff_rows === 'boolean') {
+          state.metaOnlyDiffRows = opts.only_diff_rows;
+        }
+        if (opts.col_widths && typeof opts.col_widths === 'object' && Object.keys(opts.col_widths).length) {
+          state.metaColWidths = Object.assign({}, DEFAULT_META_COLS, opts.col_widths);
+          saveStoredMetaCols(state.metaColWidths);
+        }
+      }
+      if (state.metadata && state.metadata.meta_checking) {
+        state.metaChecking = true;
+        watchMetaCheck();
+      }
     }
   }
 
@@ -1263,7 +1303,116 @@
     if (d.status === 'running' || d.scanning || d.approved_pending > 0) {
       watchApprovedWork();
     }
+    if (d.meta_checking) {
+      state.metaChecking = true;
+      watchMetaCheck();
+    }
     showActivity();                 // the run state lives in the dashboard data
+  }
+
+  let metaWatchTimer = null;
+  let metaWatchInFlight = false;
+  let lastMetaRenderSig = '';
+  let metaDeferredRender = false;
+
+  function isAppControlFocused() {
+    const ae = document.activeElement;
+    if (!ae || ae === document.body) return false;
+    const appEl = document.getElementById('app');
+    if (!appEl || !appEl.contains(ae)) return false;
+    return /^(INPUT|SELECT|TEXTAREA)$/.test(ae.tagName) && ae.type !== 'checkbox' && ae.type !== 'radio';
+  }
+
+  function patchLiveMetaProgressDom(mp) {
+    const txtEl = document.getElementById('meta-live-progress-text');
+    const fillEl = document.getElementById('meta-live-progress-fill');
+    if (!txtEl && !fillEl) return;
+    const done = Number(mp.done || 0);
+    const total = Number(mp.total || 0);
+    const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+    if (txtEl) {
+      txtEl.innerHTML = '<span class="working" aria-hidden="true"></span> '
+        + '<strong>' + (mp.force ? 'Re-checking all metadata' : 'Checking metadata') + ':</strong> '
+        + (total > 0 ? fmt(done) + ' / ' + fmt(total) + ' files (' + pct + '%)' : 'starting…')
+        + (done > 0 ? ' · <strong>' + fmt(mp.diff || 0) + '</strong> with differences · ' + fmt(mp.ok || 0) + ' matching' : '')
+        + (mp.current_file ? ' · <span class="muted">Current: ' + esc(mp.current_file) + '</span>' : '');
+    }
+    if (fillEl) {
+      fillEl.style.width = (total > 0 ? Math.max(2, pct) : 8) + '%';
+    }
+  }
+
+  function renderPreservingMetaScroll() {
+    const winY = window.scrollY;
+    const winX = window.scrollX;
+    const tw = document.getElementById('meta-table-wrap');
+    if (tw) {
+      state.metaTableScroll = { top: tw.scrollTop, left: tw.scrollLeft };
+    }
+    render();
+    window.scrollTo(winX, winY);
+  }
+
+  function watchMetaCheck() {
+    if (metaWatchTimer) return;
+    metaWatchTimer = setInterval(async () => {
+      if (metaWatchInFlight) return;
+      metaWatchInFlight = true;
+      try {
+        const data = await api('/metadata');
+        state.metadata = data;
+        state.loaded.metadata = true;
+        const mp = data.meta_progress || {};
+        const stillRunning = !!(data.meta_checking || mp.running);
+        if (state.dash) {
+          state.dash.meta_checking = stillRunning;
+          state.dash.meta_progress = mp;
+        }
+        showActivity();
+        updateNavBadge();
+
+        const sig = [stillRunning ? 1 : 0, mp.seq || 0, data.checked_count || 0, data.diff_count || 0].join(':');
+        if (currentRoute() === 'metadata') {
+          if (sig !== lastMetaRenderSig || metaDeferredRender) {
+            if ((isAppControlFocused() || colResizeState) && stillRunning) {
+              patchLiveMetaProgressDom(mp);
+              metaDeferredRender = true;
+            } else {
+              lastMetaRenderSig = sig;
+              metaDeferredRender = false;
+              renderPreservingMetaScroll();
+            }
+          } else if (stillRunning) {
+            patchLiveMetaProgressDom(mp);
+          }
+        }
+
+        if (!stillRunning) {
+          clearInterval(metaWatchTimer);
+          metaWatchTimer = null;
+          state.metaChecking = false;
+          metaDeferredRender = false;
+          await refreshDash().catch(() => {});
+          if (currentRoute() === 'directories' && state.browse && state.browse.rel) {
+            await loadBrowse(state.browse.rel, true).catch(() => {});
+          }
+          if (currentRoute() === 'metadata') {
+            renderPreservingMetaScroll();
+          } else {
+            render();
+          }
+          if (mp.stopped) {
+            toast('Metadata check stopped (' + fmt(mp.done || 0) + ' file' + ((mp.done || 0) === 1 ? '' : 's') + ' checked · ' + fmt(mp.diff || 0) + ' with differences)');
+          } else if ((mp.total || 0) > 0 || (mp.done || 0) > 0) {
+            toast('Metadata check complete (' + fmt(mp.done || 0) + ' file' + ((mp.done || 0) === 1 ? '' : 's') + '): ' + fmt(mp.diff || 0) + ' with differences · ' + fmt(mp.ok || 0) + ' matching');
+          }
+        }
+      } catch (_err) {
+        /* transient network hiccup: keep polling */
+      } finally {
+        metaWatchInFlight = false;
+      }
+    }, 1100);
   }
 
   let browseSeq = 0;
@@ -1798,6 +1947,7 @@
       + (scanning ? 'Scanning…' : 'Rescan') + '</button>'
       + tip('Updates the folder tree and file list with new and removed files and folders on disk, without resetting files that were already scanned.')
       + '<button class="btn btn-sm" data-action="select-all">Select all</button>'
+      + '<button class="btn btn-sm" data-action="invert-dirs" title="Invert the enabled/disabled selection of all folders">Invert</button>'
       + '<button class="btn btn-sm" data-action="select-none">Select none</button>'
       + '<button class="btn btn-sm" data-action="expand-all">Expand all</button>'
       + '<button class="btn btn-sm" data-action="collapse-all">Collapse all</button>', true)
@@ -2628,12 +2778,64 @@
 
   function getBulkFieldDraft(k) {
     if (!state.metaBulkFields[k]) {
-      state.metaBulkFields[k] = { enabled: false, mode: 'custom', value: '' };
+      state.metaBulkFields[k] = { enabled: false, mode: 'custom', value: '', dirty: false };
     }
     return state.metaBulkFields[k];
   }
 
-  function renderMetaBulkPanel(selIds, visibleFiles) {
+  function ensureMetaFieldsVisible(fieldKeys) {
+    if (!fieldKeys || !fieldKeys.length) return;
+    let visChanged = false;
+    fieldKeys.forEach((k) => {
+      if (!state.metaVisibleFields.includes(k)) {
+        state.metaVisibleFields.push(k);
+        visChanged = true;
+      }
+      if (!state.metaForceShowFields.includes(k)) {
+        state.metaForceShowFields.push(k);
+      }
+    });
+    if (visChanged) {
+      state.metaVisibleFields = ALL_META_FIELD_KEYS.filter((k) => state.metaVisibleFields.includes(k));
+      saveStoredMetaVis(state.metaVisibleFields);
+    }
+    if (state.metaFilterField !== 'all' && !fieldKeys.includes(state.metaFilterField)) {
+      state.metaFilterField = 'all';
+    }
+  }
+
+  function buildBulkValuesMap(keys) {
+    const out = {};
+    keys.forEach((k) => {
+      const bf = getBulkFieldDraft(k);
+      out[k] = {
+        choice: bf.mode || 'custom',
+        value: bf.mode === 'custom' ? (bf.value || '') : '',
+      };
+    });
+    return out;
+  }
+
+  function syncBulkPanelDom() {
+    const enabledCount = META_FIELDS.filter(([k]) => getBulkFieldDraft(k).enabled).length;
+    const selCount = state.metaSel.length;
+    META_FIELDS.forEach(([k]) => {
+      const bf = getBulkFieldDraft(k);
+      const chk = document.querySelector('input[data-meta-bulk-enable="' + k + '"]');
+      if (chk && chk.checked !== !!bf.enabled) chk.checked = !!bf.enabled;
+      const item = chk && chk.closest('.meta-bulk-item');
+      if (item) item.classList.toggle('is-enabled', !!bf.enabled);
+    });
+    const stageBtn = document.querySelector('[data-action="meta-bulk-stage"]');
+    if (stageBtn) {
+      stageBtn.disabled = !selCount || !enabledCount;
+      stageBtn.textContent = 'Apply bulk edit (' + selCount + ')';
+    }
+    const resetBtn = document.querySelector('[data-action="meta-bulk-reset"]');
+    if (resetBtn) resetBtn.disabled = !enabledCount;
+  }
+
+  function renderMetaBulkPanel(selIds, visibleFiles, isChecking) {
     const targetIds = selIds.length ? selIds : [];
     const enabledCount = META_FIELDS.filter(([k]) => getBulkFieldDraft(k).enabled).length;
     const rowsHtml = META_FIELDS.map(([k, lbl]) => {
@@ -2643,7 +2845,7 @@
         ['discogs', 'From Discogs'],
         ['musicbrainz', 'From MusicBrainz'],
         ['open', 'From Open (iTunes)'],
-        ['path', 'From Folder / file'],
+        ['path', 'From Folder / File'],
         ['current', 'Keep Current tag'],
       ].map(([mk, ml]) => '<option value="' + mk + '"' + (bf.mode === mk ? ' selected' : '') + '>' + ml + '</option>').join('');
       const inpDisabled = bf.mode !== 'custom';
@@ -2659,20 +2861,25 @@
 
     return '<div class="meta-bulk-panel">'
       + '<div class="meta-bulk-head">'
-      + '<div><strong>Bulk change specific parameters</strong>'
-      + ' <span class="muted small">· Tick the parameters you want to modify for <strong>'
-      + (targetIds.length ? targetIds.length + ' selected file' + (targetIds.length === 1 ? '' : 's') : 'selected files (tick files in column 1 or click Select all shown)')
-      + '</strong>. You can also drag any value pill from the table into an input below.</span></div>'
+      + '<div><strong>Bulk edit parameters</strong>'
+      + ' <span class="muted small">· Edit parameters for <strong>'
+      + (targetIds.length ? targetIds.length + ' selected file' + (targetIds.length === 1 ? '' : 's') : '0 selected files (tick files in column 1 or click Select all)')
+      + '</strong>: press <strong>Apply bulk edit (' + targetIds.length + ')</strong> to select the updated parameter(s) in the list, then press <strong>Update Selected (' + targetIds.length + ')</strong> to write ID3 tags into the actual file(s) (preserving timestamps).</span></div>'
       + '<div class="btns">'
-      + (!targetIds.length && visibleFiles.length
-        ? '<button type="button" class="btn btn-sm" data-action="meta-select-all-shown">Select all shown (' + visibleFiles.length + ')</button>'
+      + (targetIds.length < visibleFiles.length && visibleFiles.length
+        ? '<button type="button" class="btn btn-sm" data-action="meta-select-all-shown">Select all (' + visibleFiles.length + ')</button>'
         : '')
-      + '<button type="button" class="btn btn-sm" data-action="meta-bulk-stage"'
+      + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-bulk-stage"'
       + ((!targetIds.length || !enabledCount) ? ' disabled' : '')
-      + ' title="Stage the checked parameter changes on the selected files without writing to disk yet">Stage on selected (' + targetIds.length + ')</button>'
-      + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-bulk-apply-now"'
-      + ((!targetIds.length || !enabledCount) ? ' disabled' : '')
-      + ' title="Immediately write ONLY the checked parameters to the selected audio files (preserving timestamps)">Write checked parameters (' + enabledCount + ') to selected (' + targetIds.length + ')</button>'
+      + ' title="Apply the checked parameter edits and select the updated parameter values in the list below">'
+      + 'Apply bulk edit (' + targetIds.length + ')</button>'
+      + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-selected"'
+      + (!targetIds.length ? ' disabled' : '')
+      + ' title="Write selected ID3 tags and cover art into the actual audio files on disk (file date/time stamp stays the same)">'
+      + 'Update Selected (' + targetIds.length + ')</button>'
+      + '<button type="button" class="btn btn-sm" data-action="meta-bulk-reset"'
+      + (!enabledCount ? ' disabled' : '')
+      + ' title="Clear the bulk edit parameter fields">Reset bulk</button>'
       + '<button type="button" class="btn btn-sm" data-action="meta-bulk-toggle">Hide</button>'
       + '</div></div>'
       + '<div class="meta-bulk-grid">' + rowsHtml + '</div>'
@@ -2690,6 +2897,10 @@
     const enabledFields = opts.fields || META_FIELDS.map((x) => x[0]);
     const enabledSources = opts.sources || ['discogs', 'musicbrainz', 'open'];
     const isChecking = !!(state.metaChecking || m.meta_checking || (state.dash && state.dash.meta_checking));
+    const mp = m.meta_progress || (state.dash && state.dash.meta_progress) || {};
+    const mpDone = Number(mp.done || 0);
+    const mpTotal = Number(mp.total || 0);
+    const mpPct = mpTotal > 0 ? Math.min(100, Math.round((mpDone / mpTotal) * 100)) : 0;
 
     const visibleFiles = filterAndSortMetaFiles(m.files || [], opts);
     const visIds = visibleFiles.map((f) => f.id);
@@ -2706,9 +2917,9 @@
       + '<button class="btn' + (isChecking ? ' btn-danger' : '') + '" data-action="meta-check-stop"' + (isChecking ? '' : ' disabled')
       + ' title="Stop the running metadata check immediately">'
       + 'Stop</button>'
-      + '<button class="btn btn-primary" data-action="meta-apply-selected"' + (sel.length && !isChecking ? '' : ' disabled')
-      + ' title="Write selected metadata values into the selected audio files without changing their timestamps">'
-      + 'Update selected' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>'
+      + '<button class="btn btn-primary" data-action="meta-apply-selected"' + (sel.length ? '' : ' disabled')
+      + ' title="Update ID3 tags and cover art in the selected audio files on disk (file date/time stamp stays the same)">'
+      + 'Update Selected (' + sel.length + ')</button>'
       + '</div>';
 
     const fieldChecks = META_FIELDS.map(([k, lbl]) => {
@@ -2721,6 +2932,21 @@
       return '<label class="inline"><input type="checkbox" data-meta-opt-source="' + k + '"' + (on ? ' checked' : '') + '> ' + esc(lbl) + '</label>';
     }).join('');
 
+    const liveProgressBanner = isChecking
+      ? '<div class="meta-live-progress" id="meta-live-progress" role="status" aria-live="polite">'
+        + '<div class="meta-live-progress-top">'
+        + '<span id="meta-live-progress-text"><span class="working" aria-hidden="true"></span> '
+        + '<strong>' + (mp.force ? 'Re-checking all metadata' : 'Checking metadata') + ':</strong> '
+        + (mpTotal > 0 ? fmt(mpDone) + ' / ' + fmt(mpTotal) + ' files (' + mpPct + '%)' : 'starting…')
+        + (mpDone > 0 ? ' · <strong>' + fmt(mp.diff || 0) + '</strong> with differences · ' + fmt(mp.ok || 0) + ' matching' : '')
+        + (mp.current_file ? ' · <span class="muted">Current: ' + esc(mp.current_file) + '</span>' : '')
+        + '</span>'
+        + '<span class="small muted">Intermediate results appear live in section 2 below</span>'
+        + '</div>'
+        + '<div class="meta-live-progress-track"><div class="meta-live-progress-fill" id="meta-live-progress-fill" style="width:' + (mpTotal > 0 ? Math.max(2, mpPct) : 8) + '%"></div></div>'
+        + '</div>'
+      : '';
+
     const optionsCard = '<section class="card" style="margin-bottom:16px">'
       + '<div class="card-head"><div><h2>1 · Scope &amp; check options'
       + tip('Checks audio files inside the folders enabled on the Directories tab. Updating metadata preserves the original file modification timestamp (mtime).')
@@ -2731,7 +2957,7 @@
       + fmt(m.checked_count) + ' checked · '
       + '<strong>' + fmt(m.diff_count) + '</strong> with differences'
       + (m.path_diff_count ? ' · <span class="warn-text">' + fmt(m.path_diff_count) + ' folder/file name mismatch' + (m.path_diff_count === 1 ? '' : 'es') + '</span>' : '')
-      + (isChecking ? ' · <span class="scan-note">checking metadata… (press Stop to halt immediately)</span>' : '')
+      + (isChecking ? ' · <span class="scan-note">checking metadata… (intermediate results shown live below)</span>' : '')
       + '</div></div></div>'
       + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Fields to check</span>'
       + fieldChecks + '</div>'
@@ -2743,6 +2969,7 @@
       + sourceChecks
       + '<span class="small muted">Configure your Discogs token in <a href="#/settings">Settings → General</a>.</span>'
       + '</div>'
+      + liveProgressBanner
       + '</section>';
 
     const statusOpts = [
@@ -2793,35 +3020,43 @@
       + '<button type="button" class="btn btn-sm" data-action="meta-cols-reset" title="Reset column widths to default">Reset column widths</button>'
       + '</div>';
 
-    const bulkScopeLabel = sel.length ? sel.length + ' selected' : visibleFiles.length + ' visible';
-    const bulkBar = visibleFiles.length
-      ? '<div class="park-bar" style="margin-bottom:12px">'
-        + '<span><strong>' + (sel.length ? sel.length + ' selected' : visibleFiles.length + ' file' + (visibleFiles.length === 1 ? '' : 's') + ' shown') + '</strong>'
-        + ' · Quick select source for ' + bulkScopeLabel + ':</span>'
-        + '<div class="btns">'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="discogs">Discogs</button>'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="musicbrainz">MusicBrainz</button>'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="open">Open (iTunes)</button>'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path">Folder / File</button>'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current">Current tag</button>'
-        + '<button class="btn btn-sm' + (state.metaBulkOpen ? ' btn-primary' : '') + '" data-action="meta-bulk-toggle" aria-expanded="' + state.metaBulkOpen + '">'
-        + 'Bulk edit parameters' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>'
-        + (sel.length
-          ? '<button class="btn btn-sm btn-primary" data-action="meta-apply-selected">Update selected (' + sel.length + ')</button>'
-            + '<button class="btn btn-sm" data-action="meta-clear-sel">Clear selection</button>'
-          : '<button class="btn btn-sm btn-primary" data-action="meta-apply-visible">Update all shown (' + visibleFiles.length + ')</button>')
-        + '</div></div>'
-      : '';
+    const selCount = sel.length;
+    const bulkSrcDisabled = !selCount ? ' disabled' : '';
+    const bulkBar = '<div class="park-bar" style="margin-bottom:12px">'
+      + '<span><strong>' + selCount + ' of ' + visibleFiles.length + ' selected</strong>'
+      + ' · Select source for selected files:</span>'
+      + '<div class="btns">'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="discogs"' + bulkSrcDisabled + ' title="Select Discogs values on the ' + selCount + ' selected file(s)">Discogs (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="musicbrainz"' + bulkSrcDisabled + ' title="Select MusicBrainz values on the ' + selCount + ' selected file(s)">MusicBrainz (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="open"' + bulkSrcDisabled + ' title="Select Open (iTunes) values on the ' + selCount + ' selected file(s)">Open (iTunes) (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path"' + bulkSrcDisabled + ' title="Select Folder / File values on the ' + selCount + ' selected file(s)">Folder / File (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current"' + bulkSrcDisabled + ' title="Select Current tag values on the ' + selCount + ' selected file(s)">Current tag (' + selCount + ')</button>'
+      + '<button class="btn btn-sm' + (state.metaBulkOpen ? ' btn-primary' : '') + '" data-action="meta-bulk-toggle" aria-expanded="' + state.metaBulkOpen + '">'
+      + 'Bulk edit parameters (' + selCount + ')</button>'
+      + '<button class="btn btn-sm btn-primary" data-action="meta-apply-selected"' + bulkSrcDisabled
+      + ' title="Update ID3 tags and cover art in the actual audio file(s) on disk (time/date stamp stays the same)">'
+      + 'Update Selected (' + selCount + ')</button>'
+      + (selCount < visibleFiles.length && visibleFiles.length
+        ? '<button class="btn btn-sm" data-action="meta-select-all-shown">Select all (' + visibleFiles.length + ')</button>'
+        : '')
+      + (selCount
+        ? '<button class="btn btn-sm" data-action="meta-clear-sel">Clear selection</button>'
+        : '')
+      + '</div></div>';
 
-    const bulkPanelHtml = (visibleFiles.length && state.metaBulkOpen)
-      ? renderMetaBulkPanel(sel, visibleFiles)
+    const bulkPanelHtml = state.metaBulkOpen
+      ? renderMetaBulkPanel(sel, visibleFiles, isChecking)
       : '';
 
     let tableHtml = '';
     if (!m.checked_count) {
-      tableHtml = '<p class="muted">No files have been checked for metadata differences yet. Press <strong>Check meta data</strong> above to compare your enabled audio folders against folder/file names and internet sources.</p>';
+      tableHtml = isChecking
+        ? '<p class="muted"><span class="working" aria-hidden="true"></span> Checking first audio file… intermediate results will appear here automatically as each file finishes.</p>'
+        : '<p class="muted">No files have been checked for metadata differences yet. Press <strong>Check meta data</strong> above to compare your enabled audio folders against folder/file names and internet sources.</p>';
     } else if (!visibleFiles.length) {
-      tableHtml = '<p class="muted">No files match the current filter. Change the <strong>Show</strong> filter above to <em>All checked files</em> or press <strong>Check meta data</strong>.</p>';
+      tableHtml = isChecking
+        ? '<p class="muted"><span class="working" aria-hidden="true"></span> ' + fmt(m.checked_count) + ' file' + (m.checked_count === 1 ? '' : 's') + ' checked so far — none match the current filter yet (switch <strong>Show</strong> to <em>All checked files</em> to watch every checked file live).</p>'
+        : '<p class="muted">No files match the current filter. Change the <strong>Show</strong> filter above to <em>All checked files</em> or press <strong>Check meta data</strong>.</p>';
     } else {
       const allOn = visibleFiles.length > 0 && visibleFiles.every((f) => sel.includes(f.id));
       const allowedListFields = META_FIELDS.map((x) => x[0]).filter((k) => state.metaVisibleFields.includes(k));
@@ -2833,6 +3068,7 @@
         const fFields = f.fields || {};
         let rowFields = activeListFields.filter((k) => {
           if (state.metaFilterField !== 'all' && k !== state.metaFilterField) return false;
+          if (state.metaForceShowFields.includes(k)) return true;
           const fo = fFields[k];
           if (!fo) return true;
           if (!state.metaOnlyDiffRows) return true;
@@ -2884,7 +3120,7 @@
 
       const resizer = (ck) => '<span class="col-resizer" data-resize-col="' + ck + '" title="Drag to resize column (double-click to reset)"></span>';
 
-      tableHtml = '<div class="table-wrap"><table class="meta-table meta-table-resizable" id="meta-diff-table" style="width:' + colsTotalWidth + 'px;min-width:100%">'
+      tableHtml = '<div class="table-wrap" id="meta-table-wrap"><table class="meta-table meta-table-resizable" id="meta-diff-table" style="width:' + colsTotalWidth + 'px;min-width:100%">'
         + colGroupHtml
         + '<thead><tr>'
         + '<th class="pick"><input type="checkbox" data-meta-all aria-label="Select all visible files"' + (allOn ? ' checked' : '') + '></th>'
@@ -2917,6 +3153,11 @@
       headBtns,
       false
     ) + optionsCard + diffCard;
+    const tw = document.getElementById('meta-table-wrap');
+    if (tw && state.metaTableScroll) {
+      tw.scrollTop = state.metaTableScroll.top || 0;
+      tw.scrollLeft = state.metaTableScroll.left || 0;
+    }
   }
 
   /* ------------------------------------------------ per-file metadata modal */
@@ -2978,11 +3219,11 @@
         + ' <span class="small muted">· Tip: drag ⋮⋮ pills onto another row to copy values across parameters</span>'
         + '</div>'
         + '<div class="btns">'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="discogs">All Discogs</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="musicbrainz">All MusicBrainz</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="open">All Open (iTunes)</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="path">All Folder/File</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="current">Keep all Current</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="discogs">Discogs (1)</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="musicbrainz">MusicBrainz (1)</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="open">Open (iTunes) (1)</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="path">Folder / File (1)</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="current">Current tag (1)</button>'
         + '</div></div>';
 
       const rows = META_FIELDS.map(([k]) => {
@@ -3154,6 +3395,23 @@
   }
 
   function updateNavBadge() {
+    const dirsEl = document.getElementById('dirsBadge');
+    const dirsLink = document.querySelector('#nav a[data-route="directories"]');
+    if (dirsEl && state.dash) {
+      const aMed = dashMedia('audio') || {};
+      const vMed = dashMedia('video') || {};
+      const selDirs = (aMed.directories_enabled || 0) + (vMed.directories_enabled || 0);
+      const totDirs = (aMed.directories_total || 0) + (vMed.directories_total || 0);
+      const selFiles = (aMed.files_total || 0) + (vMed.files_total || 0);
+      dirsEl.textContent = fmt(selDirs) + ' / ' + fmt(selFiles);
+      const tipText = (vMed.directories_total || vMed.files_total)
+        ? 'Directories — ' + fmt(selDirs) + ' of ' + fmt(totDirs) + ' folders · ' + fmt(selFiles) + ' files selected'
+          + ' (Audio: ' + fmt(aMed.directories_enabled || 0) + ' folders, ' + fmt(aMed.files_total || 0) + ' files'
+          + ' · Video: ' + fmt(vMed.directories_enabled || 0) + ' folders, ' + fmt(vMed.files_total || 0) + ' files)'
+        : 'Directories — ' + fmt(selDirs) + ' of ' + fmt(totDirs) + ' folders · ' + fmt(selFiles) + ' files selected';
+      dirsEl.title = tipText;
+      if (dirsLink) dirsLink.title = tipText;
+    }
     const el = document.getElementById('parkedBadge');
     if (el && state.dash) {
       const audioParked = ALL.reduce((a, t) => a + dashMedia(t).files_parked, 0);
@@ -3581,6 +3839,22 @@
       try {
         await api('/folders/all', { method: 'POST', body: { media: t, enabled: a === 'select-all' } });
         invalidate('dir:' + t);
+        invalidate('metadata');
+        invalidate('parked:' + t);
+        invalidate('coverParked');
+        await refreshDash();
+      } finally {
+        endBusy(busy);
+      }
+      render();
+    } else if (a === 'invert-dirs') {
+      const busy = startBusy('Inverting folder selection');
+      try {
+        await api('/folders/invert', { method: 'POST', body: { media: t } });
+        invalidate('dir:' + t);
+        invalidate('metadata');
+        invalidate('parked:' + t);
+        invalidate('coverParked');
         await refreshDash();
       } finally {
         endBusy(busy);
@@ -3974,37 +4248,27 @@
       const force = a === 'meta-check-force';
       if (state.metaChecking) return;
       state.metaChecking = true;
-      metaCheckAbort = new AbortController();
-      const busy = startBusy(force ? 'Re-checking metadata in enabled audio folders' : 'Checking metadata in enabled audio folders');
-      const elapsed = tickBusy(busy);
-      render();
+      if (state.metadata) {
+        state.metadata.meta_checking = true;
+        state.metadata.meta_progress = { running: true, force: force, total: 0, done: 0, diff: 0, ok: 0, current_file: '' };
+      }
+      if (state.dash) state.dash.meta_checking = true;
+      renderPreservingMetaScroll();
       try {
         const r = await api('/metadata/check', {
           method: 'POST',
-          body: { enabled_only: true, force: force },
-          signal: metaCheckAbort.signal,
+          body: { enabled_only: true, force: force, background: true },
         });
-        invalidate('metadata');
-        await Promise.all([loadKey('metadata'), refreshDash()]);
-        if (r && r.stopped) {
-          toast('Metadata check stopped (' + r.checked + ' file' + (r.checked === 1 ? '' : 's') + ' checked)');
-        } else if (r) {
-          toast('Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences · ' + r.ok + ' matching');
-        }
+        if (state.metadata && r) state.metadata.meta_progress = r;
+        watchMetaCheck();
+        toast(force ? 'Re-checking all metadata — intermediate results appear live below' : 'Checking metadata — intermediate results appear live below');
       } catch (err) {
-        if (err && err.name === 'AbortError') {
-          invalidate('metadata');
-          await Promise.all([loadKey('metadata'), refreshDash()]).catch(() => {});
-        } else {
-          throw err;
-        }
-      } finally {
         state.metaChecking = false;
-        metaCheckAbort = null;
-        elapsed.stop();
-        endBusy(busy);
+        if (state.metadata) state.metadata.meta_checking = false;
+        if (state.dash) state.dash.meta_checking = false;
+        renderPreservingMetaScroll();
+        throw err;
       }
-      render();
     } else if (a === 'meta-check-stop') {
       try {
         await api('/metadata/stop', { method: 'POST' });
@@ -4013,50 +4277,46 @@
         metaCheckAbort.abort();
         metaCheckAbort = null;
       }
+      if (metaWatchTimer) {
+        clearInterval(metaWatchTimer);
+        metaWatchTimer = null;
+      }
       state.metaChecking = false;
       if (state.metadata) state.metadata.meta_checking = false;
       if (state.dash) state.dash.meta_checking = false;
       invalidate('metadata');
       await Promise.all([loadKey('metadata'), refreshDash()]).catch(() => {});
       toast('Metadata check stopped');
-      render();
+      renderPreservingMetaScroll();
     } else if (a === 'check-meta-dir') {
       const b = state.browse;
       if (!b || !b.rows || !b.rows.length) return;
       const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
       state.metaChecking = true;
-      metaCheckAbort = new AbortController();
-      const busy = startBusy('Checking metadata for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
-      const elapsed = tickBusy(busy);
+      if (state.dash) state.dash.meta_checking = true;
       render();
       try {
-        const r = await api('/metadata/check', {
+        await api('/metadata/check', {
           method: 'POST',
-          body: { ids: ids, dir: b.rel, force: true },
-          signal: metaCheckAbort.signal,
+          body: { ids: ids, dir: b.rel, force: true, background: true },
         });
-        invalidate('metadata');
-        await refreshDash();
-        toast(r.stopped
-          ? 'Metadata check stopped (' + r.checked + ' checked)'
-          : 'Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences');
+        watchMetaCheck();
+        toast('Checking metadata for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' (open Meta data tab for live intermediate results)');
       } catch (err) {
-        if (!err || err.name !== 'AbortError') toast(err.message);
-      } finally {
         state.metaChecking = false;
-        metaCheckAbort = null;
-        elapsed.stop();
-        endBusy(busy);
+        if (state.dash) state.dash.meta_checking = false;
+        render();
+        toast(err.message);
       }
-      if (b.rel) await loadBrowse(b.rel, true);
-      else render();
     } else if (a === 'meta-vis-all') {
       state.metaVisibleFields = ALL_META_FIELD_KEYS.slice();
       saveStoredMetaVis(state.metaVisibleFields);
+      persistMetaUiPrefs();
       render();
     } else if (a === 'meta-cols-reset') {
       state.metaColWidths = Object.assign({}, DEFAULT_META_COLS);
       saveStoredMetaCols(state.metaColWidths);
+      persistMetaUiPrefs();
       toast('Column widths reset');
       render();
     } else if (a === 'meta-bulk-toggle') {
@@ -4067,57 +4327,46 @@
       const visible = filterAndSortMetaFiles(m.files || [], m.options || {});
       state.metaSel = visible.map((f) => f.id);
       render();
+    } else if (a === 'meta-bulk-reset') {
+      state.metaBulkFields = {};
+      render();
     } else if (a === 'meta-bulk-stage' || a === 'meta-bulk-apply-now') {
       const ids = state.metaSel.slice();
       const enabledKeys = META_FIELDS.map((x) => x[0]).filter((k) => getBulkFieldDraft(k).enabled);
       if (!ids.length || !enabledKeys.length) return;
+      ensureMetaFieldsVisible(enabledKeys);
+      const valuesMap = buildBulkValuesMap(enabledKeys);
       if (a === 'meta-bulk-stage') {
-        const customMap = {};
-        const modeCalls = [];
-        enabledKeys.forEach((k) => {
-          const bf = getBulkFieldDraft(k);
-          if (bf.mode === 'custom') {
-            customMap[k] = bf.value || '';
-          } else {
-            modeCalls.push(api('/metadata/select', {
-              method: 'POST',
-              body: { ids: ids, field: k, choice: bf.mode },
-            }));
-          }
+        await api('/metadata/select', {
+          method: 'POST',
+          body: { ids: ids, values: valuesMap },
         });
-        if (Object.keys(customMap).length) {
-          modeCalls.push(api('/metadata/select', {
-            method: 'POST',
-            body: { ids: ids, choice: 'custom', values: customMap },
-          }));
-        }
-        await Promise.all(modeCalls);
+        enabledKeys.forEach((k) => { getBulkFieldDraft(k).dirty = false; });
         invalidate('metadata');
         await loadKey('metadata');
-        toast('Staged ' + enabledKeys.length + ' parameter' + (enabledKeys.length === 1 ? '' : 's') + ' on ' + ids.length + ' selected file' + (ids.length === 1 ? '' : 's'));
+        // Ensure edited files stay visible & selected so the updated parameters are shown selected in the list
+        const mNow = state.metadata || {};
+        const visAfter = filterAndSortMetaFiles(mNow.files || [], mNow.options || {});
+        const visSet = new Set(visAfter.map((f) => f.id));
+        if (!ids.some((id) => visSet.has(id)) && state.metaFilterStatus !== 'all') {
+          state.metaFilterStatus = 'all';
+        }
+        state.metaSel = ids.slice();
+        const paramLabels = enabledKeys.map((k) => META_FIELD_MAP[k] || k).join(', ');
+        toast('Selected updated ' + paramLabels + ' in list for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
         render();
       } else {
         const busy = startBusy('Writing ' + enabledKeys.length + ' parameter(s) to ' + ids.length + ' selected file(s)');
         const elapsed = tickBusy(busy);
         try {
-          // Stage non-custom source selections on the target files first, and build overrides for custom ones
-          const overrides = {};
-          const stagePromises = [];
-          enabledKeys.forEach((k) => {
-            const bf = getBulkFieldDraft(k);
-            if (bf.mode === 'custom') {
-              overrides[k] = { choice: 'custom', value: bf.value || '' };
-            } else {
-              stagePromises.push(api('/metadata/select', {
-                method: 'POST',
-                body: { ids: ids, field: k, choice: bf.mode },
-              }));
-            }
+          await api('/metadata/select', {
+            method: 'POST',
+            body: { ids: ids, values: valuesMap },
           });
-          if (stagePromises.length) await Promise.all(stagePromises);
+          enabledKeys.forEach((k) => { getBulkFieldDraft(k).dirty = false; });
           const r = await api('/metadata/apply', {
             method: 'POST',
-            body: { ids: ids, scope: 'file', overrides: overrides, fields: enabledKeys },
+            body: { ids: ids, scope: 'file', overrides: valuesMap, fields: enabledKeys },
           });
           bumpCoverCache();
           invalidate('metadata');
@@ -4129,7 +4378,7 @@
             state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
           ]);
           const warnNote = r.errors && r.errors.length ? ' · Note: ' + r.errors[0] : '';
-          toast('Updated ' + enabledKeys.length + ' parameter' + (enabledKeys.length === 1 ? '' : 's') + ' across ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + warnNote);
+          toast('Updated ID3 tags in ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (date/time stamp preserved)' + warnNote);
         } finally {
           elapsed.stop();
           endBusy(busy);
@@ -4180,13 +4429,24 @@
       render();
     } else if (a === 'meta-bulk-choice') {
       const choice = el.dataset.choice || 'online';
-      const m = state.metadata || {};
-      const visible = filterAndSortMetaFiles(m.files || [], m.options || {});
-      const ids = state.metaSel.length ? state.metaSel.slice() : visible.map((f) => f.id);
-      if (!ids.length) return;
+      const ids = state.metaSel.slice();
+      if (!ids.length) {
+        toast('Select one or more files in column 1 first');
+        return;
+      }
       const fieldFilter = state.metaFilterField !== 'all' ? state.metaFilterField : 'all';
       await api('/metadata/select', { method: 'POST', body: { ids: ids, field: fieldFilter, choice: choice } });
+      invalidate('metadata');
       await loadKey('metadata');
+      const mNow = state.metadata || {};
+      const visAfter = filterAndSortMetaFiles(mNow.files || [], mNow.options || {});
+      const visSet = new Set(visAfter.map((f) => f.id));
+      if (!ids.some((id) => visSet.has(id)) && state.metaFilterStatus !== 'all') {
+        state.metaFilterStatus = 'all';
+      }
+      state.metaSel = ids.slice();
+      const srcNames = { discogs: 'Discogs', musicbrainz: 'MusicBrainz', open: 'Open (iTunes)', path: 'Folder / File', current: 'Current tag' };
+      toast('Selected ' + (srcNames[choice] || choice) + ' on ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
       render();
     } else if (a === 'meta-clear-sel') {
       state.metaSel = [];
@@ -4202,9 +4462,22 @@
         ids = filterAndSortMetaFiles(m.files || [], m.options || {}).map((f) => f.id);
       }
       if (!ids.length) return;
-      const busy = startBusy('Updating metadata (preserving timestamp) for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const busy = startBusy('Writing ID3 tags to ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' (preserving file date/time stamp)');
       const elapsed = tickBusy(busy);
       try {
+        // If user edited fields in Bulk edit parameters and directly clicked "Update Selected ()", apply those bulk edits too
+        if (a === 'meta-apply-selected' && state.metaBulkOpen) {
+          const dirtyBulkKeys = META_FIELDS.map((x) => x[0]).filter((k) => {
+            const bf = getBulkFieldDraft(k);
+            return bf.enabled && bf.dirty;
+          });
+          if (dirtyBulkKeys.length) {
+            ensureMetaFieldsVisible(dirtyBulkKeys);
+            const valuesMap = buildBulkValuesMap(dirtyBulkKeys);
+            await api('/metadata/select', { method: 'POST', body: { ids: ids, values: valuesMap } });
+            dirtyBulkKeys.forEach((k) => { getBulkFieldDraft(k).dirty = false; });
+          }
+        }
         const r = await api('/metadata/apply', { method: 'POST', body: { ids: ids, scope: 'file' } });
         bumpCoverCache();
         invalidate('metadata');
@@ -4216,7 +4489,11 @@
           state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
         ]);
         const warnNote = r.errors && r.errors.length ? ' · Note: ' + r.errors[0] : '';
-        toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (file timestamp preserved)' + warnNote);
+        if (r.updated > 0) {
+          toast('Updated ID3 tags in ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (file date/time stamp kept unchanged)' + warnNote);
+        } else {
+          toast('All selected ID3 tags already match the file(s) on disk' + warnNote);
+        }
       } finally {
         elapsed.stop();
         endBusy(busy);
@@ -4312,6 +4589,9 @@
       try {
         await api('/folders/toggle', { method: 'POST', body: { media: t, relpath: el.dataset.check, enabled: el.checked } });
         invalidate('dir:' + t);
+        invalidate('metadata');
+        invalidate('parked:' + t);
+        invalidate('coverParked');
         await refreshDash();
       } finally {
         endBusy(busy);
@@ -4526,8 +4806,12 @@
         toast('Keep at least one parameter visible in the list');
         return;
       }
+      if (!el.checked) {
+        state.metaForceShowFields = state.metaForceShowFields.filter((k) => k !== fld);
+      }
       state.metaVisibleFields = next;
       saveStoredMetaVis(next);
+      persistMetaUiPrefs();
       render();
       return;
     }
@@ -4535,6 +4819,7 @@
     if (el.dataset.metaOnlyDiff !== undefined) {
       if (!committed) return;
       state.metaOnlyDiffRows = !!el.checked;
+      persistMetaUiPrefs();
       render();
       return;
     }
@@ -4543,6 +4828,7 @@
       if (!committed) return;
       const bf = getBulkFieldDraft(el.dataset.metaBulkEnable);
       bf.enabled = !!el.checked;
+      bf.dirty = !!el.checked;
       render();
       return;
     }
@@ -4552,6 +4838,7 @@
       const bf = getBulkFieldDraft(el.dataset.metaBulkMode);
       bf.mode = el.value;
       bf.enabled = true;
+      bf.dirty = true;
       render();
       return;
     }
@@ -4560,10 +4847,11 @@
       const k = el.dataset.metaBulkVal;
       const bf = getBulkFieldDraft(k);
       bf.value = el.value;
-      if (!bf.enabled && el.value.trim()) {
+      bf.dirty = true;
+      if (el.value.trim()) {
         bf.enabled = true;
-        if (committed) render();
       }
+      syncBulkPanelDom();
       return;
     }
   }
@@ -4581,6 +4869,8 @@
         top: el.scrollTop,
         left: el.scrollLeft,
       };
+    } else if (el.id === 'meta-table-wrap') {
+      state.metaTableScroll = { top: el.scrollTop, left: el.scrollLeft };
     }
   }, true);
 
@@ -4692,6 +4982,12 @@
     });
   }
   document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.metaBulkVal) {
+      ev.preventDefault();
+      const stageBtn = document.querySelector('[data-action="meta-bulk-stage"]');
+      if (stageBtn && !stageBtn.disabled) stageBtn.click();
+      return;
+    }
     if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.metaCustomInput) {
       ev.preventDefault();
       const editKey = ev.target.dataset.metaCustomInput;
@@ -4798,6 +5094,7 @@
         bf.mode = 'custom';
         bf.value = val;
         bf.enabled = true;
+        bf.dirty = true;
         render();
         toast('Dropped value into bulk ' + (META_FIELD_MAP[k] || k));
       }
@@ -4902,6 +5199,7 @@
     if (colResizeState.grip) colResizeState.grip.classList.remove('is-active');
     document.body.classList.remove('is-col-resizing');
     saveStoredMetaCols(state.metaColWidths);
+    persistMetaUiPrefs();
     colResizeState = null;
   });
 
@@ -4911,6 +5209,7 @@
     const colKey = grip.dataset.resizeCol;
     state.metaColWidths[colKey] = DEFAULT_META_COLS[colKey] || 180;
     saveStoredMetaCols(state.metaColWidths);
+    persistMetaUiPrefs();
     render();
   });
 
@@ -4949,10 +5248,8 @@
         }
       }).catch(() => { /* keep the last view */ });
     }
-    if (currentRoute() === 'metadata' && (state.metaChecking || (state.dash && state.dash.meta_checking)) && !colResizeState) {
-      loadKey('metadata').then(() => {
-        if (currentRoute() === 'metadata' && !colResizeState) render();
-      }).catch(() => {});
+    if (state.metaChecking || (state.dash && state.dash.meta_checking)) {
+      watchMetaCheck();
     }
   }, 2500);
 
@@ -4962,4 +5259,7 @@
   syncJumpTop();
   if (currentRoute() === 'directories') openDirectories();   // also when the app opens on this page
   render();
+  if (!state.loaded.dashboard && !state.pending.dashboard) {
+    refreshDash().catch(() => {});
+  }
 })();

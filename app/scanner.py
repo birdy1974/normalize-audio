@@ -80,6 +80,7 @@ class Scanner:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)", inserts)
             for old in existing.values():
                 if old["status"] != "processing":
+                    self.db.execute("DELETE FROM file_metadata WHERE file_id = ?", (old["id"],))
                     self.db.execute("DELETE FROM files WHERE id = ?", (old["id"],))
                     removed += 1
 

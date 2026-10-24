@@ -419,3 +419,220 @@ def test_partial_text_tags_preserved_and_synced_when_cover_download_fails(client
     assert meta_after["current"]["artist"] == "New Artist"
     assert meta_after["current"]["year"] == "2020"
 
+
+def test_bulk_parameter_edit_selects_updated_parameter_and_update_selected_writes_id3_preserving_timestamp(client, cfg, monkeypatch):
+    """Verify:
+    1. After bulk parameter edit (both custom values and source modes, even on fields disabled in check options),
+       the updated parameters are selected in the metadata list.
+    2. 'Update Selected ()' (/api/metadata/apply) writes ID3v2.3 + ID3v1 tags into the actual MP3 files on disk
+       while keeping exact file modification timestamps unchanged, and keeps the updated parameter selected
+       on 'current' rather than reverting to Discogs."""
+    p1 = tone(os.path.join(cfg.audio_root, "BulkEditAlbum", "01 - Track One.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    p2 = tone(os.path.join(cfg.audio_root, "BulkEditAlbum", "02 - Track Two.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    meta_mod.write_full_tags(p1, {"artist": "Init Artist", "title": "Track One", "album": "Init Album", "genre": "Pop", "year": "1999"})
+    meta_mod.write_full_tags(p2, {"artist": "Init Artist", "title": "Track Two", "album": "Init Album", "genre": "Pop", "year": "1999"})
+
+    fixed_mtime_1 = 1_640_000_123
+    fixed_mtime_2 = 1_640_000_456
+    os.utime(p1, (fixed_mtime_1, fixed_mtime_1))
+    os.utime(p2, (fixed_mtime_2, fixed_mtime_2))
+    mtime_ns_1 = os.stat(p1).st_mtime_ns
+    mtime_ns_2 = os.stat(p2).st_mtime_ns
+
+    monkeypatch.setattr(
+        meta_mod,
+        "lookup_online_metadata",
+        lambda artist, album, title, *a, **kw: {
+            "source": "Discogs",
+            "score": 0.95,
+            "artist": "Discogs Artist",
+            "album": "Discogs Album",
+            "title": title,
+            "year": "2001",
+            "genre": "French House",
+            "by_source": {
+                "discogs": {"source": "Discogs", "artist": "Discogs Artist", "album": "Discogs Album", "year": "2001", "genre": "French House"},
+                "musicbrainz": {"source": "MusicBrainz", "artist": "MB Artist", "album": "MB Album", "year": "2002", "genre": "Electronic"},
+                "open": {"source": "Open (iTunes)", "artist": "iTunes Artist", "album": "iTunes Album", "year": "2003", "genre": "Dance"},
+            },
+        },
+    )
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    # Even if 'genre' was unchecked in check options, bulk parameter edit must still select & apply it!
+    assert client.put(
+        "/api/metadata/options",
+        json={"fields": ["artist", "title", "album", "year"], "check_path_vs_tags": True, "sources": ["discogs", "musicbrainz", "open"]},
+    ).status_code == 200
+    assert client.post("/api/metadata/check", json={"enabled_only": True}).status_code == 200
+
+    files_before = client.get("/api/metadata").json()["files"]
+    ids = [f["id"] for f in files_before]
+    assert len(ids) == 2
+
+    # 1) Bulk parameter edit: set genre -> Custom 'Synthwave', year -> MusicBrainz ('2002') in one atomic call
+    sel_resp = client.post(
+        "/api/metadata/select",
+        json={
+            "ids": ids,
+            "values": {
+                "genre": {"choice": "custom", "value": "Synthwave"},
+                "year": {"choice": "musicbrainz", "value": ""},
+            },
+        },
+    )
+    assert sel_resp.status_code == 200
+    assert sel_resp.json()["updated"] == 2
+
+    # Verify both updated parameters are SELECTED in the list right after bulk edit!
+    files_staged = client.get("/api/metadata").json()["files"]
+    for item in files_staged:
+        assert item["fields"]["genre"]["choice"] == "custom"
+        assert item["fields"]["genre"]["custom_value"] == "Synthwave"
+        assert item["fields"]["year"]["choice"] == "musicbrainz"
+
+    # 2) Press "Update Selected ()" (/api/metadata/apply) to write ID3 tags into actual files on disk
+    os.utime(p1, ns=(mtime_ns_1, mtime_ns_1))
+    os.utime(p2, ns=(mtime_ns_2, mtime_ns_2))
+    apply_resp = client.post("/api/metadata/apply", json={"ids": ids, "scope": "file"})
+    assert apply_resp.status_code == 200
+    assert apply_resp.json()["updated"] == 2
+
+    # Verify exact file modification timestamps were strictly preserved!
+    assert os.stat(p1).st_mtime_ns == mtime_ns_1
+    assert os.stat(p2).st_mtime_ns == mtime_ns_2
+
+    # Verify ID3v2.3 + ID3v1 tags were written into the actual MP3 files on disk
+    for path in (p1, p2):
+        disk_tags = meta_mod.read_full_tags(path)
+        assert disk_tags["genre"] == "Synthwave"
+        assert disk_tags["year"] == "2002"
+        assert disk_tags["album"] == "Discogs Album"
+        with open(path, "rb") as fh:
+            fh.seek(-128, os.SEEK_END)
+            assert fh.read(3) == b"TAG"
+
+    # Verify in the list after disk write: updated parameters stay selected on 'current' (NOT reverting to 'discogs'!)
+    files_after = client.get("/api/metadata").json()["files"]
+    for item in files_after:
+        assert item["fields"]["genre"]["current"] == "Synthwave"
+        assert item["fields"]["genre"]["choice"] == "current"
+        assert item["fields"]["year"]["current"] == "2002"
+        assert item["fields"]["year"]["choice"] == "current"
+
+
+def test_background_metadata_check_streams_intermediate_results_and_resumes_unchecked(client, cfg, monkeypatch):
+    import threading
+    import time
+
+    p1 = os.path.join(cfg.audio_root, "StreamArtist - StreamAlbum", "01 - One.mp3")
+    p2 = os.path.join(cfg.audio_root, "StreamArtist - StreamAlbum", "02 - Two.mp3")
+    p3 = os.path.join(cfg.audio_root, "StreamArtist - StreamAlbum", "03 - Three.mp3")
+    for idx, p in enumerate((p1, p2, p3), start=1):
+        tone(p, 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+        meta_mod.write_full_tags(p, {"artist": "StreamArtist", "album": "StreamAlbum", "title": f"Track {idx}"})
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+
+    first_done = threading.Event()
+    release_second = threading.Event()
+    calls: list[str] = []
+
+    def slow_online(artist, album, title, *a, **kw):
+        calls.append(title)
+        if len(calls) == 2:
+            first_done.set()
+            release_second.wait(timeout=5.0)
+        return {
+            "artist": "StreamArtist",
+            "album": "StreamAlbum",
+            "title": title,
+            "year": "2010",
+            "genre": "Ambient",
+            "source": "Discogs",
+            "score": 0.96,
+            "by_source": {
+                "discogs": {
+                    "artist": "StreamArtist",
+                    "album": "StreamAlbum",
+                    "title": title,
+                    "year": "2010",
+                    "genre": "Ambient",
+                    "source": "Discogs",
+                    "score": 0.96,
+                }
+            },
+        }
+
+    monkeypatch.setattr(meta_mod, "lookup_online_metadata", slow_online)
+
+    # Start non-blocking background check
+    start_resp = client.post("/api/metadata/check", json={"enabled_only": True, "force": False, "background": True})
+    assert start_resp.status_code == 200
+    assert start_resp.json()["started"] is True
+
+    # Wait until file #1 has committed and file #2 is paused mid-flight
+    assert first_done.wait(timeout=5.0)
+
+    mid = client.get("/api/metadata").json()
+    assert mid["meta_checking"] is True
+    assert mid["meta_progress"]["running"] is True
+    assert mid["meta_progress"]["total"] == 3
+    assert mid["meta_progress"]["done"] == 1
+    assert mid["checked_count"] == 1
+    assert len(mid["files"]) == 1
+    assert mid["files"][0]["name"] == "01 - One.mp3"
+
+    # Stop after file #1 while file #2 is in-flight, then release file #2
+    assert client.post("/api/metadata/stop").status_code == 200
+    release_second.set()
+
+    # Wait for background worker to finish stopping
+    for _ in range(50):
+        cur = client.get("/api/metadata").json()
+        if not cur["meta_checking"]:
+            break
+        time.sleep(0.05)
+    assert cur["meta_checking"] is False
+    assert cur["checked_count"] == 1
+
+    # Resume with "Check meta data" (force=False): should only check the 2 remaining unchecked files!
+    calls.clear()
+    resume_resp = client.post("/api/metadata/check", json={"enabled_only": True, "force": False})
+    assert resume_resp.status_code == 200
+    assert resume_resp.json()["checked"] == 2
+    final = client.get("/api/metadata").json()
+    assert final["checked_count"] == 3
+    assert len(final["files"]) == 3
+
+
+def test_ui_source_buttons_selected_count_and_invert_button_markup():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as fh:
+        js = fh.read()
+    for expected in (
+        "Discogs (' + selCount + ')",
+        "MusicBrainz (' + selCount + ')",
+        "Open (iTunes) (' + selCount + ')",
+        "Folder / File (' + selCount + ')",
+        "Current tag (' + selCount + ')",
+        "Update Selected (' + selCount + ')",
+    ):
+        assert expected in js
+
+    idx_all = js.index('data-action="select-all">Select all</button>')
+    idx_inv = js.index('data-action="invert-dirs"')
+    idx_none = js.index('data-action="select-none">Select none</button>')
+    assert idx_all < idx_inv < idx_none
+
+    with open(os.path.join(root, "static", "index.html"), "r", encoding="utf-8") as hf:
+        html_txt = hf.read()
+    assert 'id="dirsBadge"' in html_txt
+    assert "document.getElementById('dirsBadge')" in js
+
+    with open(os.path.join(root, "Dockerfile"), "r", encoding="utf-8") as df:
+        docker_txt = df.read()
+    assert 'VOLUME ["/config"]' in docker_txt
+
+
+
