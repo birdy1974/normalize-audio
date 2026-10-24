@@ -175,6 +175,14 @@ def read_full_tags(path: str) -> dict[str, Any]:
     return out
 
 
+class CoverUpdateError(ValueError):
+    """Raised when text tags were saved on disk, but downloading/embedding cover art failed."""
+
+    def __init__(self, message: str, *, tags_written: bool = False):
+        super().__init__(message)
+        self.tags_written = tags_written
+
+
 def _apply_id3_updates(id3: ID3, updates: dict[str, Any]) -> None:
     mapping = {
         "artist": ("TPE1", TPE1),
@@ -192,6 +200,7 @@ def _apply_id3_updates(id3: ID3, updates: dict[str, Any]) -> None:
         id3.delall(frame_id)
         if field == "year":
             id3.delall("TYER")
+            id3.delall("TDAT")
         if val:
             id3.add(cls(encoding=3, text=[val]))
 
@@ -214,7 +223,7 @@ def write_full_tags(
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
     folder = os.path.dirname(path) or "."
     base = os.path.basename(path)
-    tmp = os.path.join(folder, f".{base}.meta-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp")
+    tmp = os.path.join(folder, f".{base}.meta-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp.{ext}")
     shutil.copy2(path, tmp)
     try:
         tag_updates = {k: v for k, v in updates.items() if k != "cover"}
@@ -225,7 +234,8 @@ def write_full_tags(
                 except ID3NoHeaderError:
                     id3 = ID3()
                 _apply_id3_updates(id3, tag_updates)
-                id3.save(tmp, v2_version=3)
+                id3.update_to_v23()
+                id3.save(tmp, v1=1, v2_version=3)
             elif ext in ("flac", "ogg", "oga", "opus"):
                 audio = FLAC(tmp) if ext == "flac" else mutagen.File(tmp)
                 if audio is None:
@@ -248,6 +258,8 @@ def write_full_tags(
                             audio[vkey] = [val]
                         elif vkey in audio:
                             del audio[vkey]
+                        if field == "year" and "year" in audio and vkey != "year":
+                            del audio["year"]
                 audio.save()
             elif ext == "m4a":
                 audio = MP4(tmp)
@@ -283,7 +295,8 @@ def write_full_tags(
                 if audio.tags is None:
                     audio.add_tags()
                 _apply_id3_updates(audio.tags, tag_updates)
-                audio.save()
+                audio.tags.update_to_v23()
+                audio.save(v2_version=3)
             elif ext == "wma":
                 audio = ASF(tmp)
                 if audio.tags is None:
@@ -307,14 +320,22 @@ def write_full_tags(
                 audio.save()
 
         cover_val = updates.get("cover")
+        cover_error: Exception | None = None
         if cover_val and str(cover_val).startswith(("http://", "https://", "data:", "local://")):
-            data, mime = cover.download_cover(str(cover_val), token=discogs_token)
-            cover.embed_cover(tmp, data, mime=mime, preserve_mtime=False)
+            try:
+                data, mime = cover.download_cover(str(cover_val), token=discogs_token)
+                cover.embed_cover(tmp, data, mime=mime, preserve_mtime=False, ext_override=ext)
+            except Exception as exc:
+                if not tag_updates:
+                    raise
+                cover_error = exc
 
         os.replace(tmp, path)
         if preserve_mtime:
             # Strictly preserve the file's original timestamp on disk
             os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+        if cover_error is not None:
+            raise CoverUpdateError(f"tags updated, but cover art failed ({cover_error})", tags_written=True) from cover_error
         return True
     finally:
         if os.path.exists(tmp):
@@ -371,7 +392,7 @@ def _clean_discogs_artist(name: str) -> str:
     return re.sub(r"\s*\(\d+\)$", "", (name or "").strip())
 
 
-def _lookup_discogs(artist: str, album: str, title: str, track: str, token: str = "") -> list[dict]:
+def _lookup_discogs(artist: str, album: str, title: str, track: str, token: str = "", cancel=None) -> list[dict]:
     headers = cover._discogs_headers(token)
     params_list = []
     if artist and album:
@@ -386,6 +407,8 @@ def _lookup_discogs(artist: str, album: str, title: str, track: str, token: str 
     matches: list[dict] = []
     seen_ids: set[Any] = set()
     for params in params_list:
+        if cancel and cancel():
+            return matches
         try:
             r = httpx.get("https://api.discogs.com/database/search", params=params, headers=headers, timeout=6.0)
             if r.status_code != 200:
@@ -428,7 +451,32 @@ def _lookup_discogs(artist: str, album: str, title: str, track: str, token: str 
     return matches
 
 
-def _lookup_musicbrainz(artist: str, album: str, title: str, track: str) -> list[dict]:
+def _caa_front_url(rg_id: str | None, rel_id: str | None, headers: dict[str, str]) -> str:
+    """Resolve a verified front cover URL from Cover Art Archive, or empty string if none exists."""
+    endpoints = []
+    if rg_id:
+        endpoints.append(f"https://coverartarchive.org/release-group/{rg_id}")
+    if rel_id:
+        endpoints.append(f"https://coverartarchive.org/release/{rel_id}")
+    for url in endpoints:
+        try:
+            r = httpx.get(url, headers=headers, follow_redirects=True, timeout=3.5)
+            if r.status_code != 200:
+                continue
+            images = r.json().get("images") or []
+            front = next((img for img in images if img.get("front")), images[0] if images else None)
+            if not front or not front.get("image"):
+                continue
+            thumbs = front.get("thumbnails") or {}
+            return str(thumbs.get("500") or thumbs.get("large") or front["image"]).strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _lookup_musicbrainz(artist: str, album: str, title: str, track: str, cancel=None) -> list[dict]:
+    if cancel and cancel():
+        return []
     headers = {"User-Agent": cover.USER_AGENT, "Accept": "application/json"}
     q_parts = []
     if artist:
@@ -453,7 +501,10 @@ def _lookup_musicbrainz(artist: str, album: str, title: str, track: str) -> list
         return []
 
     matches: list[dict] = []
-    for rec in recs[:3]:
+    caa_checked: dict[str, str] = {}
+    for idx, rec in enumerate(recs[:3]):
+        if cancel and cancel():
+            break
         rec_title = (rec.get("title") or title).strip()
         ac = rec.get("artist-credit") or []
         rec_artist = (ac[0].get("name") if ac and isinstance(ac[0], dict) else artist) or artist
@@ -473,7 +524,13 @@ def _lookup_musicbrainz(artist: str, album: str, title: str, track: str) -> list
             genre = (tags[0].get("name") or "").title()
         rg = rel.get("release-group") or {}
         rg_id = rg.get("id")
-        cover_url = f"https://coverartarchive.org/release-group/{rg_id}/front-500" if rg_id else ""
+        rel_id = rel.get("id")
+        cover_url = ""
+        if idx == 0 and (rg_id or rel_id):
+            ckey = f"{rg_id}:{rel_id}"
+            if ckey not in caa_checked:
+                caa_checked[ckey] = _caa_front_url(rg_id, rel_id, headers)
+            cover_url = caa_checked[ckey]
 
         matches.append({
             "source": "MusicBrainz",
@@ -489,7 +546,9 @@ def _lookup_musicbrainz(artist: str, album: str, title: str, track: str) -> list
     return matches
 
 
-def _lookup_itunes(artist: str, album: str, title: str, track: str) -> list[dict]:
+def _lookup_itunes(artist: str, album: str, title: str, track: str, cancel=None) -> list[dict]:
+    if cancel and cancel():
+        return []
     term = " ".join(x for x in (artist, album, title) if x).strip()
     if not term:
         return []
@@ -531,6 +590,21 @@ def _lookup_itunes(artist: str, album: str, title: str, track: str) -> list[dict
     return matches
 
 
+def _merge_candidate_list(cands: list[dict]) -> dict[str, Any]:
+    if not cands:
+        return {}
+    merged = dict(cands[0])
+    if not merged.get("cover") and merged.get("cover_url"):
+        merged["cover"] = merged["cover_url"]
+    for sec in cands[1:]:
+        for f in METADATA_FIELDS:
+            if not merged.get(f):
+                val = sec.get(f) or (sec.get("cover_url") if f == "cover" else "")
+                if val:
+                    merged[f] = val
+    return merged
+
+
 def lookup_online_metadata(
     artist: str,
     album: str,
@@ -542,8 +616,12 @@ def lookup_online_metadata(
     sources: list[str] | dict[str, bool] | None = None,
     db=None,
     force_refresh: bool = False,
+    cancel=None,
 ) -> dict[str, Any]:
-    """Query enabled internet sources (Discogs, MusicBrainz, Open/iTunes) and return merged canonical metadata."""
+    """Query enabled internet sources (Discogs, MusicBrainz, Open/iTunes) and return merged canonical
+    metadata as well as independent per-source matches under 'by_source'."""
+    if cancel and cancel():
+        return {}
     opts = options or {}
     raw_sources = sources if sources is not None else opts.get("sources_map") or opts.get("sources")
     if isinstance(raw_sources, dict):
@@ -558,7 +636,7 @@ def lookup_online_metadata(
         return {}
 
     src_sig = ",".join(k for k in ("discogs", "musicbrainz", "open") if sources_cfg.get(k))
-    query_key = f"{src_sig}|{artist.lower().strip()}|{album.lower().strip()}|{title.lower().strip()}"
+    query_key = f"v2|{src_sig}|{artist.lower().strip()}|{album.lower().strip()}|{title.lower().strip()}"
 
     if db is not None and not force_refresh:
         row = db.one("SELECT payload FROM metadata_cache WHERE query_key = ?", (query_key,))
@@ -572,26 +650,33 @@ def lookup_online_metadata(
 
     st = settings or {}
     token = st.get("general", {}).get("discogsToken", "") if isinstance(st.get("general"), dict) else ""
+    by_source: dict[str, dict[str, Any]] = {}
     candidates: list[dict] = []
-    if sources_cfg.get("discogs"):
-        candidates.extend(_lookup_discogs(artist, album, title, track, token=token))
-    if sources_cfg.get("musicbrainz"):
-        candidates.extend(_lookup_musicbrainz(artist, album, title, track))
-    if sources_cfg.get("open"):
-        candidates.extend(_lookup_itunes(artist, album, title, track))
 
+    if sources_cfg.get("discogs") and not (cancel and cancel()):
+        d_cands = _lookup_discogs(artist, album, title, track, token=token, cancel=cancel)
+        if d_cands:
+            by_source["discogs"] = _merge_candidate_list(d_cands)
+            candidates.extend(d_cands)
+    if sources_cfg.get("musicbrainz") and not (cancel and cancel()):
+        m_cands = _lookup_musicbrainz(artist, album, title, track, cancel=cancel)
+        if m_cands:
+            by_source["musicbrainz"] = _merge_candidate_list(m_cands)
+            candidates.extend(m_cands)
+    if sources_cfg.get("open") and not (cancel and cancel()):
+        o_cands = _lookup_itunes(artist, album, title, track, cancel=cancel)
+        if o_cands:
+            by_source["open"] = _merge_candidate_list(o_cands)
+            candidates.extend(o_cands)
+
+    if cancel and cancel():
+        return {}
     if not candidates:
         return {}
 
-    primary = dict(candidates[0])
-    # Fill any blank field in the primary match from subsequent matches (e.g. Discogs genre + MusicBrainz track #)
-    for secondary in candidates[1:]:
-        for f in METADATA_FIELDS:
-            if not primary.get(f) and secondary.get(f):
-                primary[f] = secondary[f]
-    if not primary.get("cover") and primary.get("cover_url"):
-        primary["cover"] = primary["cover_url"]
+    primary = _merge_candidate_list(candidates)
     primary["candidates"] = candidates
+    primary["by_source"] = by_source
 
     if db is not None:
         try:
@@ -607,6 +692,56 @@ def lookup_online_metadata(
 
 # ------------------------------------------------------------ comparison & selection
 
+def extract_online_by_source(o_meta: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Extract normalized {'discogs': {...}, 'musicbrainz': {...}, 'open': {...}} from online_meta,
+    handling new 'by_source' dicts, legacy 'candidates' arrays, and single-source dicts."""
+    out: dict[str, dict[str, Any]] = {"discogs": {}, "musicbrainz": {}, "open": {}}
+    if not o_meta or not isinstance(o_meta, dict):
+        return out
+
+    raw_bs = o_meta.get("by_source")
+    if isinstance(raw_bs, dict):
+        for k in ("discogs", "musicbrainz", "open"):
+            sub = raw_bs.get(k)
+            if isinstance(sub, dict) and sub:
+                d = dict(sub)
+                if not d.get("cover") and d.get("cover_url"):
+                    d["cover"] = d["cover_url"]
+                out[k] = d
+
+    cands = o_meta.get("candidates")
+    if isinstance(cands, list) and cands:
+        grouped: dict[str, list[dict]] = {"discogs": [], "musicbrainz": [], "open": []}
+        for c in cands:
+            if not isinstance(c, dict):
+                continue
+            s_lbl = str(c.get("source") or "").lower()
+            if "discogs" in s_lbl:
+                grouped["discogs"].append(c)
+            elif "musicbrainz" in s_lbl:
+                grouped["musicbrainz"].append(c)
+            elif "open" in s_lbl or "itunes" in s_lbl:
+                grouped["open"].append(c)
+        for k, grp in grouped.items():
+            if not out[k] and grp:
+                out[k] = _merge_candidate_list(grp)
+
+    if not any(out.values()):
+        has_any_field = any(o_meta.get(f) or (f == "cover" and o_meta.get("cover_url")) for f in METADATA_FIELDS)
+        if has_any_field:
+            d = dict(o_meta)
+            if not d.get("cover") and d.get("cover_url"):
+                d["cover"] = d["cover_url"]
+            s_lbl = str(o_meta.get("source") or "").lower()
+            if "musicbrainz" in s_lbl:
+                out["musicbrainz"] = d
+            elif "open" in s_lbl or "itunes" in s_lbl:
+                out["open"] = d
+            else:
+                out["discogs"] = d
+    return out
+
+
 def _values_differ(field: str, a: str, b: str) -> bool:
     sa = (a or "").strip()
     sb = (b or "").strip()
@@ -615,7 +750,7 @@ def _values_differ(field: str, a: str, b: str) -> bool:
     if field == "year":
         return _norm_year(sa) != _norm_year(sb)
     if field == "cover":
-        # If current cover is 'present', it is not missing
+        # If current cover is 'present', it is not flagged as missing during automatic comparison
         if sa == "present":
             return False
         return bool(sb)
@@ -652,10 +787,20 @@ def compare_file_metadata(
     else:
         enabled_fields = {f: True for f in METADATA_FIELDS}
 
+    raw_sources = opts.get("sources_map") or opts.get("sources")
+    if isinstance(raw_sources, dict):
+        enabled_sources = {k: bool(raw_sources.get(k, True)) for k in ("discogs", "musicbrainz", "open")}
+    elif isinstance(raw_sources, (list, tuple, set)):
+        s_set = {str(x) for x in raw_sources}
+        enabled_sources = {k: (k in s_set) for k in ("discogs", "musicbrainz", "open")}
+    else:
+        enabled_sources = {"discogs": True, "musicbrainz": True, "open": True}
+
     check_path = bool(
         opts.get("check_path_vs_tags", opts.get("checkPath", True))
     )
 
+    by_src = extract_online_by_source(o_meta)
     resolved = cover.resolve_search_metadata(relpath, cur)
     diffs: list[str] = []
     path_mismatches: list[str] = []
@@ -675,16 +820,50 @@ def compare_file_metadata(
         is_enabled = enabled_fields.get(f, True)
         c_val = (cur.get(f) or "").strip()
         p_val = (p_meta.get(f) or "").strip() if check_path else ""
-        o_val = (o_meta.get(f) or "").strip()
+        d_val = (by_src["discogs"].get(f) or "").strip() if enabled_sources.get("discogs", True) else ""
+        m_val = (by_src["musicbrainz"].get(f) or "").strip() if enabled_sources.get("musicbrainz", True) else ""
+        i_val = (by_src["open"].get(f) or "").strip() if enabled_sources.get("open", True) else ""
+        o_val = d_val or m_val or i_val or ((o_meta.get(f) or "").strip() if any(enabled_sources.values()) else "")
 
-        has_online_diff = bool(is_enabled and o_val and _values_differ(f, c_val, o_val))
+        has_discogs_diff = bool(is_enabled and d_val and _values_differ(f, c_val, d_val))
+        has_mb_diff = bool(is_enabled and m_val and _values_differ(f, c_val, m_val))
+        has_open_diff = bool(is_enabled and i_val and _values_differ(f, c_val, i_val))
+        has_online_diff = has_discogs_diff or has_mb_diff or has_open_diff or bool(is_enabled and o_val and _values_differ(f, c_val, o_val))
         has_path_diff = bool(is_enabled and check_path and p_val and _values_differ(f, c_val, p_val))
-        is_diff = has_online_diff or has_path_diff
+
+        prior_sel = existing_selected.get(f) if (existing_selected and isinstance(existing_selected.get(f), dict)) else None
+        has_custom_diff = False
+        if prior_sel and prior_sel.get("choice") == "custom":
+            c_custom = str(prior_sel.get("value") or "").strip()
+            if f == "cover":
+                has_custom_diff = bool(c_custom)
+            else:
+                has_custom_diff = _values_differ(f, c_val, c_custom)
+
+        is_diff = has_online_diff or has_path_diff or has_custom_diff
 
         if is_diff:
             diffs.append(f)
-            if existing_selected and f in existing_selected and isinstance(existing_selected[f], dict):
-                selected[f] = existing_selected[f]
+            if prior_sel:
+                p_choice = prior_sel.get("choice", "current")
+                p_sval = str(prior_sel.get("value") or "").strip()
+                if p_choice == "online":
+                    if d_val and p_sval == d_val:
+                        selected[f] = {"choice": "discogs", "value": d_val}
+                    elif m_val and p_sval == m_val:
+                        selected[f] = {"choice": "musicbrainz", "value": m_val}
+                    elif i_val and p_sval == i_val:
+                        selected[f] = {"choice": "open", "value": i_val}
+                    else:
+                        selected[f] = {"choice": "online", "value": p_sval or o_val}
+                else:
+                    selected[f] = prior_sel
+            elif has_discogs_diff:
+                selected[f] = {"choice": "discogs", "value": d_val}
+            elif has_mb_diff:
+                selected[f] = {"choice": "musicbrainz", "value": m_val}
+            elif has_open_diff:
+                selected[f] = {"choice": "open", "value": i_val}
             elif has_online_diff:
                 selected[f] = {"choice": "online", "value": o_val}
             elif has_path_diff:
@@ -692,8 +871,13 @@ def compare_file_metadata(
             else:
                 selected[f] = {"choice": "current", "value": c_val}
         else:
-            if existing_selected and f in existing_selected and isinstance(existing_selected[f], dict) and existing_selected[f].get("choice") == "custom":
-                selected[f] = existing_selected[f]
+            if prior_sel and prior_sel.get("choice") in ("custom", "discogs", "musicbrainz", "open") and f == "cover" and prior_sel.get("value"):
+                # Keep user's explicit cover replacement choice even when current cover is already 'present'
+                selected[f] = prior_sel
+                diffs.append(f)
+                is_diff = True
+            elif prior_sel and prior_sel.get("choice") == "custom":
+                selected[f] = prior_sel
             else:
                 selected[f] = {"choice": "current", "value": c_val}
 
@@ -703,6 +887,9 @@ def compare_file_metadata(
         fields_out[f] = {
             "current": c_val,
             "path": p_val,
+            "discogs": d_val,
+            "musicbrainz": m_val,
+            "open": i_val,
             "online": o_val,
             "choice": choice,
             "custom_value": custom_val,

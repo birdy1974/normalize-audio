@@ -345,6 +345,36 @@ def test_legacy_database_migration_adds_cover_columns_and_index(tmp_path):
     assert "cover_status" in cols
     assert "has_cover" in cols
     assert "cover_candidates" in cols
+    assert "cover_updated_at" in cols
     assert "tag_artist" in cols
     assert "cover_query_source" in cols
+
+
+def test_cover_apply_syncs_file_metadata_table_and_local_cover_endpoint(client, cfg):
+    """Applying cover art from the Cover Picker must also sync file_metadata and serve /local-cover."""
+    folder = os.path.join(cfg.audio_root, "LocalArtBand", "AlbumOne")
+    p = tone(os.path.join(folder, "01 - Intro.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    cover_file = os.path.join(folder, "cover.jpg")
+    with open(cover_file, "wb") as fh:
+        fh.write(FAKE_JPEG + b"\x00" * 80)
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    files = client.get("/api/files", params={"media": "audio", "dir": "LocalArtBand/AlbumOne"}).json()["files"]
+    fid = files[0]["id"]
+
+    # Local cover endpoint serves the folder's cover.jpg for browser previews
+    loc_res = client.get(f"/api/files/{fid}/local-cover")
+    assert loc_res.status_code == 200
+    assert loc_res.content.startswith(b"\xff\xd8\xff")
+
+    # Populate file_metadata first, then apply PNG cover via /cover/apply and ensure file_metadata is immediately synced
+    assert client.post(f"/api/files/{fid}/metadata/check", json={"force": False}).status_code == 200
+    png_url = "data:image/png;base64," + base64.b64encode(FAKE_PNG).decode("ascii")
+    assert client.post(f"/api/files/{fid}/cover/apply", json={"image_url": png_url, "scope": "file"}).status_code == 200
+
+    meta_item = client.get("/api/metadata").json()["files"][0]
+    assert meta_item["has_cover"] == 1
+    assert meta_item["current"]["cover"] == "present"
+    assert client.get(f"/api/files/{fid}/cover").content == FAKE_PNG
+
 

@@ -134,6 +134,9 @@
       const sub = d.approved_pending > 1 ? fileSub + ' · ' + d.approved_pending + ' left' : fileSub;
       out.push({ busy: true, text: 'Applying parked changes', sub: sub });
     }
+    if (d.meta_checking) {
+      out.push({ busy: true, text: 'Checking metadata', sub: 'comparing tags, paths and online sources' });
+    }
     if (d.status === 'running') {
       out.push({ busy: true, text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
     } else if (d.status === 'paused') {
@@ -1018,6 +1021,7 @@
   async function api(path, options) {
     const opts = options || {};
     const init = { method: opts.method || 'GET', headers: {} };
+    if (opts.signal) init.signal = opts.signal;
     if (opts.body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(opts.body);
@@ -1033,6 +1037,56 @@
       throw new Error(msg);
     }
     return data;
+  }
+
+  const META_VIS_KEY = 'audio-normalizer-meta-vis-fields';
+  const META_COLS_KEY = 'audio-normalizer-meta-cols';
+  const DEFAULT_META_COLS = {
+    pick: 38,
+    file: 230,
+    path: 190,
+    field: 120,
+    current: 200,
+    discogs: 185,
+    musicbrainz: 185,
+    open: 185,
+    custom: 265,
+  };
+  const ALL_META_FIELD_KEYS = ['artist', 'title', 'album', 'album_artist', 'year', 'track', 'genre', 'cover'];
+  let metaCheckAbort = null;
+
+  function loadStoredMetaVis() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(META_VIS_KEY));
+      if (Array.isArray(raw) && raw.length) {
+        const clean = raw.filter((k) => ALL_META_FIELD_KEYS.includes(k));
+        if (clean.length) return clean;
+      }
+    } catch (_err) { /* ignore */ }
+    return ALL_META_FIELD_KEYS.slice();
+  }
+
+  function saveStoredMetaVis(list) {
+    try { localStorage.setItem(META_VIS_KEY, JSON.stringify(list)); } catch (_err) { /* ignore */ }
+  }
+
+  function loadStoredMetaCols() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(META_COLS_KEY));
+      if (raw && typeof raw === 'object') {
+        const out = Object.assign({}, DEFAULT_META_COLS);
+        Object.keys(DEFAULT_META_COLS).forEach((k) => {
+          const n = Number(raw[k]);
+          if (isFinite(n) && n >= 32 && n <= 1200) out[k] = Math.round(n);
+        });
+        return out;
+      }
+    } catch (_err) { /* ignore */ }
+    return Object.assign({}, DEFAULT_META_COLS);
+  }
+
+  function saveStoredMetaCols(cols) {
+    try { localStorage.setItem(META_COLS_KEY, JSON.stringify(cols)); } catch (_err) { /* ignore */ }
   }
 
   /* ---------------------------------------------------------------- state */
@@ -1057,14 +1111,21 @@
     parked: { audio: null, video: null },  // GET /api/parked
     coverParked: null,              // GET /api/covers/parked (separate cover art pane)
     coverParkMode: 'album',         // 'album' | 'file' in the cover art parked pane
+    coverBust: Date.now(),          // cache-buster bumped after any cover or metadata write
     discogsTest: '',
     metadata: null,                 // GET /api/metadata
+    metaChecking: false,            // true while a metadata check run is active
     metaSel: [],                    // selected file ids on the Meta data tab
     metaFilterStatus: 'diff',       // 'diff' | 'path_diff' | 'missing' | 'all'
     metaFilterField: 'all',         // 'all' or field key
     metaFilterFolder: 'all',        // 'all' or folder relpath
     metaSearch: '',                 // search query on the Meta data tab
     metaSort: 'folder',             // 'folder' | 'name' | 'diffs_desc' | 'path_first'
+    metaVisibleFields: loadStoredMetaVis(), // which parameters are shown directly in Pane 2
+    metaOnlyDiffRows: false,        // when true, hide non-differing parameter rows
+    metaColWidths: loadStoredMetaCols(),    // resizable column widths (px) for Pane 2 table
+    metaBulkOpen: false,            // whether the Bulk specific-parameter editor is expanded
+    metaBulkFields: {},             // { [fieldKey]: { enabled: bool, mode: string, value: string } }
     metaEditing: {},                // { "fileId:field": true } for inline custom input
     parkSel: [],                    // selected parked file ids
     parkSort: 'order',
@@ -1073,6 +1134,25 @@
     loaded: {}, pending: {}, errors: {},
     dragging: false,                // a slider is being dragged: do not re-render parked rows
   };
+
+  function bumpCoverCache() {
+    state.coverBust = Date.now();
+  }
+
+  function fileCoverUrl(fileId, versionHint) {
+    const v = String(versionHint || 0) + '-' + String(state.coverBust);
+    return '/api/files/' + fileId + '/cover?v=' + encodeURIComponent(v);
+  }
+
+  function candThumbUrl(fileId, rawUrl, versionHint) {
+    const u = String(rawUrl || '');
+    if (!u) return '';
+    if (u.startsWith('local://')) {
+      const v = String(versionHint || 0) + '-' + String(state.coverBust);
+      return '/api/files/' + fileId + '/local-cover?v=' + encodeURIComponent(v);
+    }
+    return u;
+  }
 
   /* ----------------------------------------------------------- data loading */
   function keysFor(route) {
@@ -1559,7 +1639,7 @@
     if (f.has_cover) {
       const emb = f.cover_status === 'embedded';
       return '<button type="button" class="cover-chip-btn' + (emb ? ' is-embedded' : '') + '" data-action="open-cover-modal" data-idx="' + i + '" title="Click to view or change cover art">'
-        + '<img class="cover-mini-thumb" src="/api/files/' + f.id + '/cover?v=' + encodeURIComponent(f.changed_at || f.measured_at || 1) + '" alt="" loading="lazy">'
+        + '<img class="cover-mini-thumb" src="' + esc(fileCoverUrl(f.id, f.cover_updated_at || f.changed_at || f.measured_at || 1)) + '" alt="" loading="lazy">'
         + '<span>' + (emb ? 'embedded' : 'present') + '</span></button>';
     }
     if (f.cover_status === 'choices') {
@@ -1810,7 +1890,7 @@
               : '';
             const idsStr = g.file_ids.join(',');
             const candsHtml = g.candidates.map((c) => {
-              const thumb = c.thumb_url || c.image_url || '';
+              const thumb = candThumbUrl(g.primary_file_id, c.thumb_url || c.image_url || '');
               return '<div class="cover-cand">'
                 + '<div class="cover-cand-img-wrap">'
                 + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
@@ -1845,7 +1925,7 @@
               ? '<span class="cover-override-tag" title="ID3 tag was totally different from the folder/file name, so the folder/file name was used">Folder/file name used (ID3 differed)</span>'
               : '';
             const candsHtml = f.candidates.map((c) => {
-              const thumb = c.thumb_url || c.image_url || '';
+              const thumb = candThumbUrl(f.id, c.thumb_url || c.image_url || '');
               return '<div class="cover-cand">'
                 + '<div class="cover-cand-img-wrap">'
                 + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
@@ -2324,11 +2404,67 @@
     ['open', 'Open (iTunes)'],
   ];
 
-  function renderMetaFieldCells(fileItem, fieldKey, fieldObj, isModal) {
+  const META_COL_SPECS = [
+    ['pick', '', 34, false],
+    ['file', 'File & folder', 90, true],
+    ['path', 'Folder / file name', 80, true],
+    ['field', 'Field', 75, true],
+    ['current', 'Current tag (file)', 85, true],
+    ['discogs', 'Discogs', 85, true],
+    ['musicbrainz', 'MusicBrainz', 85, true],
+    ['open', 'Open (iTunes)', 85, true],
+    ['custom', 'Custom (✎)', 140, true],
+  ];
+
+  function makeDragAttr(fileId, fieldKey, source, val, isModal) {
+    if (!val || (fieldKey === 'cover' && val === 'present')) return '';
+    const payload = JSON.stringify({
+      fileId: fileId,
+      field: fieldKey,
+      source: source,
+      value: String(val),
+      modal: !!isModal,
+    });
+    return ' draggable="true" data-drag-meta="' + esc(payload) + '"';
+  }
+
+  function renderOnlineSourceCell(fileItem, fieldKey, srcKey, srcLabel, rawVal, chosen, pickAct, isModal) {
+    const val = String(rawVal || '').trim();
+    const dropAttrs = ' data-drop-file="' + fileItem.id + '" data-drop-field="' + fieldKey + '"'
+      + (isModal ? ' data-drop-modal="1"' : '');
+    if (!val) {
+      return '<td class="meta-choice-cell"' + dropAttrs + '><span class="muted small">—</span></td>';
+    }
+    const dragAttr = makeDragAttr(fileItem.id, fieldKey, srcKey, val, isModal);
+    if (fieldKey === 'cover') {
+      const thumb = candThumbUrl(fileItem.id, val, fileItem.cover_updated_at || fileItem.checked_at);
+      return '<td class="meta-choice-cell"' + dropAttrs + '>'
+        + '<button type="button" class="meta-pill' + (chosen ? ' is-chosen' : '') + '"'
+        + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="' + srcKey + '"'
+        + dragAttr + ' title="Use ' + esc(srcLabel) + ' cover (' + esc(val) + ') · drag to copy">'
+        + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
+        + '<span class="meta-radio-dot"></span>'
+        + '<img class="meta-cover-mini" src="' + esc(thumb) + '" alt="" loading="lazy">'
+        + '<span class="meta-pill-text">' + esc(srcLabel) + ' cover</span></button></td>';
+    }
+    return '<td class="meta-choice-cell"' + dropAttrs + '>'
+      + '<button type="button" class="meta-pill' + (chosen ? ' is-chosen' : '') + '"'
+      + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="' + srcKey + '"'
+      + dragAttr + ' title="' + esc(srcLabel + ': ' + val + ' · click to select or drag to another parameter') + '">'
+      + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
+      + '<span class="meta-radio-dot"></span>'
+      + '<span class="meta-pill-text">' + esc(val) + '</span></button></td>';
+  }
+
+  function renderMetaFieldCells(fileItem, fieldKey, fieldObj, isModal, rowOpts) {
+    const ro = rowOpts || {};
     const choice = (fieldObj && fieldObj.choice) || 'current';
     const curVal = (fieldObj && fieldObj.current) || '';
     const pathVal = (fieldObj && fieldObj.path) || '';
-    const onlineVal = (fieldObj && fieldObj.online) || '';
+    const discogsVal = (fieldObj && fieldObj.discogs) || '';
+    const mbVal = (fieldObj && fieldObj.musicbrainz) || '';
+    const openVal = (fieldObj && fieldObj.open) || '';
+    const onlineVal = (fieldObj && fieldObj.online) || discogsVal || mbVal || openVal || '';
     const customVal = (fieldObj && fieldObj.custom_value) || '';
     const pathWarn = !!(fieldObj && fieldObj.path_vs_tag_diff);
     const pickAct = isModal ? 'meta-modal-pick' : 'meta-pick';
@@ -2336,69 +2472,117 @@
     const saveCustomAct = isModal ? 'meta-modal-save-custom' : 'meta-save-custom';
     const editKey = (isModal ? 'modal:' : '') + fileItem.id + ':' + fieldKey;
     const isEditing = !!state.metaEditing[editKey];
+    const fieldLabel = META_FIELD_MAP[fieldKey] || fieldKey;
+    const dropAttrs = ' data-drop-file="' + fileItem.id + '" data-drop-field="' + fieldKey + '"'
+      + (isModal ? ' data-drop-modal="1"' : '');
 
-    // 1. Current Tag cell
-    let curHtml = '';
+    // If legacy 'online' choice is active, highlight whichever specific source matches onlineVal
+    const isDiscogsChosen = choice === 'discogs' || (choice === 'online' && !!discogsVal && discogsVal === onlineVal);
+    const isMbChosen = choice === 'musicbrainz' || (choice === 'online' && !isDiscogsChosen && !!mbVal && mbVal === onlineVal);
+    const isOpenChosen = choice === 'open' || (choice === 'online' && !isDiscogsChosen && !isMbChosen && !!openVal);
+
+    // Col 3: Folder / file name
+    let pathInner = '<span class="muted small">—</span>';
+    if (fieldKey === 'cover') {
+      if (pathVal) {
+        const dragAttr = makeDragAttr(fileItem.id, fieldKey, 'path', pathVal, isModal);
+        const lThumb = candThumbUrl(fileItem.id, pathVal, fileItem.cover_updated_at || fileItem.checked_at);
+        pathInner = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
+          + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path"'
+          + dragAttr + ' title="Use local folder cover image · drag to copy">'
+          + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
+          + '<span class="meta-radio-dot"></span>'
+          + '<img class="meta-cover-mini" src="' + esc(lThumb) + '" alt="" loading="lazy">'
+          + '<span class="meta-pill-text">Local cover</span></button>';
+      }
+    } else if (pathVal) {
+      const dragAttr = makeDragAttr(fileItem.id, fieldKey, 'path', pathVal, isModal);
+      pathInner = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
+        + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path"'
+        + dragAttr + ' title="' + esc('Folder/file name: ' + pathVal + ' · click to select or drag to another parameter') + '">'
+        + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
+        + '<span class="meta-radio-dot"></span>'
+        + '<span class="meta-pill-text">' + esc(pathVal) + '</span></button>';
+    }
+    const pathCell = '<td class="meta-choice-cell"' + dropAttrs + '>' + pathInner + '</td>';
+
+    // Col 4: Field (also a drop target!)
+    const fieldCell = '<td class="meta-field-name"' + dropAttrs
+      + ' title="' + esc(fieldLabel + ' — drop any dragged value onto this row to set ' + fieldLabel) + '">'
+      + esc(fieldLabel) + '</td>';
+
+    // Col 5: Current tag (file)
+    let curInner = '';
     if (fieldKey === 'cover') {
       const hasCov = curVal === 'present' || !!fileItem.has_cover;
       const thumb = hasCov
-        ? '<img class="meta-cover-mini" src="/api/files/' + fileItem.id + '/cover?v=' + encodeURIComponent(fileItem.checked_at || 1) + '" alt="">'
+        ? '<img class="meta-cover-mini" src="' + esc(fileCoverUrl(fileItem.id, fileItem.cover_updated_at || fileItem.checked_at || 1)) + '" alt="">'
         : '';
-      curHtml = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current">'
-        + '<span class="meta-radio-dot"></span>' + thumb + '<span>' + (hasCov ? 'Present' : 'Missing') + '</span></button>';
+      curInner = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + '"'
+        + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current"'
+        + ' title="' + (hasCov ? 'Keep embedded cover art currently in file' : 'No cover currently embedded in file') + '">'
+        + '<span class="meta-radio-dot"></span>' + thumb
+        + '<span class="meta-pill-text">' + (hasCov ? 'Present' : 'Missing') + '</span></button>';
     } else {
-      curHtml = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + (pathWarn ? ' is-warn' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current" title="Keep current tag value">'
+      const dragAttr = curVal ? makeDragAttr(fileItem.id, fieldKey, 'current', curVal, isModal) : '';
+      const curTip = (curVal ? 'Current tag: ' + curVal : 'Current tag is empty')
+        + (pathWarn ? ' (differs from folder/file name)' : '')
+        + (curVal ? ' · drag to another parameter' : '');
+      curInner = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + (pathWarn ? ' is-warn' : '') + '"'
+        + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current"'
+        + dragAttr + ' title="' + esc(curTip) + '">'
+        + (curVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
         + '<span class="meta-radio-dot"></span>'
-        + '<span>' + (curVal ? esc(curVal) : '<em class="muted">(empty)</em>') + '</span>'
-        + (pathWarn ? '<span class="cover-override-tag" title="Differs from folder/file name">⚠️ vs path</span>' : '')
+        + '<span class="meta-pill-text">' + (curVal ? esc(curVal) : '<em class="muted">(empty)</em>') + '</span>'
+        + (pathWarn ? '<span class="cover-override-tag" title="Differs from folder/file name">⚠️</span>' : '')
         + '</button>';
     }
+    const curCell = '<td class="meta-choice-cell"' + dropAttrs + '>' + curInner + '</td>';
 
-    // 2. Folder / File Name cell
-    let pathHtml = '<span class="muted small">—</span>';
-    if (fieldKey !== 'cover' && pathVal) {
-      pathHtml = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path" title="Use value from folder/file name">'
-        + '<span class="meta-radio-dot"></span><span>' + esc(pathVal) + '</span></button>';
-    }
+    // Cols 6, 7, 8: Discogs, MusicBrainz, Open (iTunes)
+    const discogsCell = renderOnlineSourceCell(fileItem, fieldKey, 'discogs', 'Discogs', discogsVal, isDiscogsChosen, pickAct, isModal);
+    const mbCell = renderOnlineSourceCell(fileItem, fieldKey, 'musicbrainz', 'MusicBrainz', mbVal, isMbChosen, pickAct, isModal);
+    const openCell = renderOnlineSourceCell(fileItem, fieldKey, 'open', 'Open (iTunes)', openVal, isOpenChosen, pickAct, isModal);
 
-    // 3. Internet Match cell
-    let onlineHtml = '<span class="muted small">—</span>';
-    if (fieldKey === 'cover') {
-      if (onlineVal) {
-        onlineHtml = '<button type="button" class="meta-pill' + (choice === 'online' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="online" title="Embed cover art from internet source">'
-          + '<span class="meta-radio-dot"></span>'
-          + '<img class="meta-cover-mini" src="' + esc(onlineVal) + '" alt="Online cover" loading="lazy">'
-          + '<span>Online cover</span></button>';
-      }
-    } else if (onlineVal) {
-      onlineHtml = '<button type="button" class="meta-pill' + (choice === 'online' ? ' is-chosen' : '') + '" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="online" title="Use value from internet match">'
-        + '<span class="meta-radio-dot"></span><span>' + esc(onlineVal) + '</span></button>';
-    }
-
-    // 4. Custom (✎) cell
-    let customHtml = '';
+    // Col 9: Custom (✎) + Update & Popup buttons under Custom (✎)
+    let customInner = '';
     const defaultCustom = customVal !== '' ? customVal : (onlineVal || pathVal || (fieldKey === 'cover' ? '' : curVal) || '');
     if (isEditing) {
-      customHtml = '<span class="meta-edit-wrap">'
-        + '<input type="text" class="meta-custom-input" data-meta-custom-input="' + editKey + '" value="' + esc(defaultCustom) + '" placeholder="' + esc(fieldKey === 'cover' ? 'Cover image URL…' : 'Custom ' + (META_FIELD_MAP[fieldKey] || fieldKey)) + '">'
+      customInner = '<span class="meta-edit-wrap">'
+        + '<input type="text" class="meta-custom-input" data-meta-custom-input="' + editKey + '" value="' + esc(defaultCustom) + '" placeholder="' + esc(fieldKey === 'cover' ? 'Cover image URL…' : 'Custom ' + fieldLabel) + '">'
         + '<button type="button" class="btn btn-sm btn-primary" data-action="' + saveCustomAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '">Set</button>'
         + '<button type="button" class="meta-edit-btn is-active" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Cancel custom edit">✕</button>'
         + '</span>';
     } else {
-      const chosenCustom = choice === 'custom'
-        ? '<button type="button" class="meta-pill is-chosen" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Click to edit custom value">'
-          + '<span class="meta-radio-dot"></span><span>' + (customVal ? esc(customVal) : '<em class="muted">(empty)</em>') + '</span></button>'
-        : '';
-      customHtml = '<span class="meta-edit-wrap">'
+      let chosenCustom = '';
+      if (choice === 'custom') {
+        const cDrag = customVal ? makeDragAttr(fileItem.id, fieldKey, 'custom', customVal, isModal) : '';
+        const covThumb = (fieldKey === 'cover' && customVal)
+          ? '<img class="meta-cover-mini" src="' + esc(candThumbUrl(fileItem.id, customVal, fileItem.cover_updated_at)) + '" alt="" loading="lazy">'
+          : '';
+        chosenCustom = '<button type="button" class="meta-pill is-chosen" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '"'
+          + cDrag + ' title="' + esc('Custom value: ' + (customVal || '(empty)') + ' · click to edit or drag to another parameter') + '">'
+          + (customVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
+          + '<span class="meta-radio-dot"></span>' + covThumb
+          + '<span class="meta-pill-text">' + (customVal ? esc(customVal) : '<em class="muted">(clear)</em>') + '</span></button>';
+      }
+      customInner = '<span class="meta-edit-wrap">'
         + chosenCustom
-        + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Enter a custom ' + esc(META_FIELD_MAP[fieldKey] || fieldKey) + ' value">✎</button>'
+        + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Enter a custom ' + esc(fieldLabel) + ' value (or drop a dragged value here)">✎</button>'
         + '</span>';
     }
 
-    return '<td class="meta-choice-cell">' + curHtml + '</td>'
-      + '<td class="meta-choice-cell">' + pathHtml + '</td>'
-      + '<td class="meta-choice-cell">' + onlineHtml + '</td>'
-      + '<td class="meta-choice-cell">' + customHtml + '</td>';
+    const rowActions = (!isModal && ro.showActions)
+      ? '<span class="meta-row-actions">'
+        + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + fileItem.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
+        + '<button type="button" class="btn btn-sm" data-action="open-meta-by-id" data-file="' + fileItem.id + '" title="Open full metadata popup for this file">Popup</button>'
+        + '</span>'
+      : '';
+
+    const customCell = '<td class="meta-choice-cell"' + dropAttrs + '><div class="meta-custom-cell-row">'
+      + customInner + rowActions + '</div></td>';
+
+    return pathCell + fieldCell + curCell + discogsCell + mbCell + openCell + customCell;
   }
 
   function filterAndSortMetaFiles(files, opts) {
@@ -2442,15 +2626,70 @@
     return filtered;
   }
 
+  function getBulkFieldDraft(k) {
+    if (!state.metaBulkFields[k]) {
+      state.metaBulkFields[k] = { enabled: false, mode: 'custom', value: '' };
+    }
+    return state.metaBulkFields[k];
+  }
+
+  function renderMetaBulkPanel(selIds, visibleFiles) {
+    const targetIds = selIds.length ? selIds : [];
+    const enabledCount = META_FIELDS.filter(([k]) => getBulkFieldDraft(k).enabled).length;
+    const rowsHtml = META_FIELDS.map(([k, lbl]) => {
+      const bf = getBulkFieldDraft(k);
+      const modeOpts = [
+        ['custom', 'Custom value'],
+        ['discogs', 'From Discogs'],
+        ['musicbrainz', 'From MusicBrainz'],
+        ['open', 'From Open (iTunes)'],
+        ['path', 'From Folder / file'],
+        ['current', 'Keep Current tag'],
+      ].map(([mk, ml]) => '<option value="' + mk + '"' + (bf.mode === mk ? ' selected' : '') + '>' + ml + '</option>').join('');
+      const inpDisabled = bf.mode !== 'custom';
+      return '<div class="meta-bulk-item' + (bf.enabled ? ' is-enabled' : '') + '">'
+        + '<label class="inline" style="min-width:0;overflow:hidden"><input type="checkbox" data-meta-bulk-enable="' + k + '"' + (bf.enabled ? ' checked' : '') + '> '
+        + '<span class="meta-one-line" title="' + esc(lbl) + '">' + esc(lbl) + '</span></label>'
+        + '<select class="input" data-meta-bulk-mode="' + k + '" aria-label="Source for ' + esc(lbl) + '">' + modeOpts + '</select>'
+        + '<input type="text" class="input" data-meta-bulk-val="' + k + '" value="' + esc(bf.value) + '"'
+        + (inpDisabled ? ' disabled placeholder="Uses ' + esc(bf.mode) + '"' : ' placeholder="' + esc(k === 'cover' ? 'Image URL (or drop pill)…' : 'Set ' + lbl + ' (or drop pill)…') + '"')
+        + '>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="meta-bulk-panel">'
+      + '<div class="meta-bulk-head">'
+      + '<div><strong>Bulk change specific parameters</strong>'
+      + ' <span class="muted small">· Tick the parameters you want to modify for <strong>'
+      + (targetIds.length ? targetIds.length + ' selected file' + (targetIds.length === 1 ? '' : 's') : 'selected files (tick files in column 1 or click Select all shown)')
+      + '</strong>. You can also drag any value pill from the table into an input below.</span></div>'
+      + '<div class="btns">'
+      + (!targetIds.length && visibleFiles.length
+        ? '<button type="button" class="btn btn-sm" data-action="meta-select-all-shown">Select all shown (' + visibleFiles.length + ')</button>'
+        : '')
+      + '<button type="button" class="btn btn-sm" data-action="meta-bulk-stage"'
+      + ((!targetIds.length || !enabledCount) ? ' disabled' : '')
+      + ' title="Stage the checked parameter changes on the selected files without writing to disk yet">Stage on selected (' + targetIds.length + ')</button>'
+      + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-bulk-apply-now"'
+      + ((!targetIds.length || !enabledCount) ? ' disabled' : '')
+      + ' title="Immediately write ONLY the checked parameters to the selected audio files (preserving timestamps)">Write checked parameters (' + enabledCount + ') to selected (' + targetIds.length + ')</button>'
+      + '<button type="button" class="btn btn-sm" data-action="meta-bulk-toggle">Hide</button>'
+      + '</div></div>'
+      + '<div class="meta-bulk-grid">' + rowsHtml + '</div>'
+      + '</div>';
+  }
+
   function renderMetadata() {
     const m = state.metadata || {
       options: { fields: META_FIELDS.map((x) => x[0]), check_path_vs_tags: true, sources: ['discogs', 'musicbrainz', 'open'] },
+      meta_checking: false,
       enabled_folders: 0, total_folders: 0, total_files_in_scope: 0,
       checked_count: 0, diff_count: 0, path_diff_count: 0, folders: [], files: [],
     };
     const opts = m.options || { fields: META_FIELDS.map((x) => x[0]), check_path_vs_tags: true, sources: ['discogs', 'musicbrainz', 'open'] };
     const enabledFields = opts.fields || META_FIELDS.map((x) => x[0]);
     const enabledSources = opts.sources || ['discogs', 'musicbrainz', 'open'];
+    const isChecking = !!(state.metaChecking || m.meta_checking || (state.dash && state.dash.meta_checking));
 
     const visibleFiles = filterAndSortMetaFiles(m.files || [], opts);
     const visIds = visibleFiles.map((f) => f.id);
@@ -2458,11 +2697,16 @@
     state.metaSel = sel;
 
     const headBtns = '<div class="btns">'
-      + '<button class="btn" data-action="meta-check-run" title="Check metadata for audio files in enabled folders">'
-      + 'Check meta data</button>'
-      + '<button class="btn" data-action="meta-check-force" title="Re-check all audio files in enabled folders against online sources">'
+      + '<button class="btn' + (isChecking ? ' is-busy' : '') + '" data-action="meta-check-run"' + (isChecking ? ' disabled' : '')
+      + ' title="Check metadata for audio files in enabled folders">'
+      + (isChecking ? 'Checking…' : 'Check meta data') + '</button>'
+      + '<button class="btn" data-action="meta-check-force"' + (isChecking ? ' disabled' : '')
+      + ' title="Re-check all audio files in enabled folders against online sources">'
       + 'Re-check all</button>'
-      + '<button class="btn btn-primary" data-action="meta-apply-selected"' + (sel.length ? '' : ' disabled')
+      + '<button class="btn' + (isChecking ? ' btn-danger' : '') + '" data-action="meta-check-stop"' + (isChecking ? '' : ' disabled')
+      + ' title="Stop the running metadata check immediately">'
+      + 'Stop</button>'
+      + '<button class="btn btn-primary" data-action="meta-apply-selected"' + (sel.length && !isChecking ? '' : ' disabled')
       + ' title="Write selected metadata values into the selected audio files without changing their timestamps">'
       + 'Update selected' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>'
       + '</div>';
@@ -2487,6 +2731,7 @@
       + fmt(m.checked_count) + ' checked · '
       + '<strong>' + fmt(m.diff_count) + '</strong> with differences'
       + (m.path_diff_count ? ' · <span class="warn-text">' + fmt(m.path_diff_count) + ' folder/file name mismatch' + (m.path_diff_count === 1 ? '' : 'es') + '</span>' : '')
+      + (isChecking ? ' · <span class="scan-note">checking metadata… (press Stop to halt immediately)</span>' : '')
       + '</div></div></div>'
       + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Fields to check</span>'
       + fieldChecks + '</div>'
@@ -2534,21 +2779,42 @@
       + '<select class="input" id="meta-flt-sort" data-meta-filter="sort">' + sortOpts + '</select></div>'
       + '</div>';
 
-    const bulkTargets = sel.length ? sel : visIds;
+    const visChecks = META_FIELDS.map(([k, lbl]) => {
+      const on = state.metaVisibleFields.includes(k);
+      return '<label class="inline"><input type="checkbox" data-meta-vis-field="' + k + '"' + (on ? ' checked' : '') + '> ' + esc(lbl) + '</label>';
+    }).join('');
+
+    const visBar = '<div class="meta-vis-bar">'
+      + '<span class="meta-vis-title">Parameters shown in list:</span>'
+      + visChecks
+      + '<span class="grow"></span>'
+      + '<label class="inline small muted" title="When enabled, only parameter rows with detected differences are shown for each file"><input type="checkbox" data-meta-only-diff' + (state.metaOnlyDiffRows ? ' checked' : '') + '> Only diff rows</label>'
+      + '<button type="button" class="btn btn-sm" data-action="meta-vis-all" title="Show all parameters in the list">All parameters</button>'
+      + '<button type="button" class="btn btn-sm" data-action="meta-cols-reset" title="Reset column widths to default">Reset column widths</button>'
+      + '</div>';
+
     const bulkScopeLabel = sel.length ? sel.length + ' selected' : visibleFiles.length + ' visible';
     const bulkBar = visibleFiles.length
       ? '<div class="park-bar" style="margin-bottom:12px">'
         + '<span><strong>' + (sel.length ? sel.length + ' selected' : visibleFiles.length + ' file' + (visibleFiles.length === 1 ? '' : 's') + ' shown') + '</strong>'
         + ' · Quick select source for ' + bulkScopeLabel + ':</span>'
         + '<div class="btns">'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="online">Use Internet match</button>'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path">Use Folder / File name</button>'
-        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current">Keep Current tag</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="discogs">Discogs</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="musicbrainz">MusicBrainz</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="open">Open (iTunes)</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path">Folder / File</button>'
+        + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current">Current tag</button>'
+        + '<button class="btn btn-sm' + (state.metaBulkOpen ? ' btn-primary' : '') + '" data-action="meta-bulk-toggle" aria-expanded="' + state.metaBulkOpen + '">'
+        + 'Bulk edit parameters' + (sel.length ? ' (' + sel.length + ')' : '') + '</button>'
         + (sel.length
-          ? '<button class="btn btn-sm btn-primary" data-action="meta-apply-selected">Update selected (' + sel.length + ') — keep timestamp</button>'
+          ? '<button class="btn btn-sm btn-primary" data-action="meta-apply-selected">Update selected (' + sel.length + ')</button>'
             + '<button class="btn btn-sm" data-action="meta-clear-sel">Clear selection</button>'
-          : '<button class="btn btn-sm btn-primary" data-action="meta-apply-visible">Update all shown (' + visibleFiles.length + ') — keep timestamp</button>')
+          : '<button class="btn btn-sm btn-primary" data-action="meta-apply-visible">Update all shown (' + visibleFiles.length + ')</button>')
         + '</div></div>'
+      : '';
+
+    const bulkPanelHtml = (visibleFiles.length && state.metaBulkOpen)
+      ? renderMetaBulkPanel(sel, visibleFiles)
       : '';
 
     let tableHtml = '';
@@ -2558,25 +2824,30 @@
       tableHtml = '<p class="muted">No files match the current filter. Change the <strong>Show</strong> filter above to <em>All checked files</em> or press <strong>Check meta data</strong>.</p>';
     } else {
       const allOn = visibleFiles.length > 0 && visibleFiles.every((f) => sel.includes(f.id));
+      const allowedListFields = META_FIELDS.map((x) => x[0]).filter((k) => state.metaVisibleFields.includes(k));
+      const activeListFields = allowedListFields.length ? allowedListFields : META_FIELDS.map((x) => x[0]);
+
       const bodyRows = [];
       visibleFiles.forEach((f) => {
         const on = sel.includes(f.id);
         const fFields = f.fields || {};
-        // Determine which fields to show as rows for this file
-        let rowFields = enabledFields.filter((k) => {
+        let rowFields = activeListFields.filter((k) => {
           if (state.metaFilterField !== 'all' && k !== state.metaFilterField) return false;
           const fo = fFields[k];
-          if (!fo) return false;
+          if (!fo) return true;
+          if (!state.metaOnlyDiffRows) return true;
           if (state.metaFilterStatus === 'all') return true;
           if (state.metaFilterStatus === 'path_diff') return !!fo.path_vs_tag_diff || !!fo.diff;
           return !!fo.diff;
         });
         if (!rowFields.length) {
-          rowFields = enabledFields.filter((k) => state.metaFilterField === 'all' || k === state.metaFilterField);
+          rowFields = activeListFields.filter((k) => state.metaFilterField === 'all' || k === state.metaFilterField);
         }
+        if (!rowFields.length) rowFields = [activeListFields[0]];
+
         const span = Math.max(1, rowFields.length);
         rowFields.forEach((k, idx) => {
-          const fo = fFields[k] || { current: '', path: '', online: '', choice: 'current', custom_value: '' };
+          const fo = fFields[k] || { current: '', path: '', discogs: '', musicbrainz: '', open: '', online: '', choice: 'current', custom_value: '' };
           const firstRow = idx === 0;
           const trCls = [firstRow ? 'meta-file-group-start' : '', on ? 'row-sel' : ''].filter(Boolean).join(' ');
           const srcTag = f.online_source
@@ -2585,46 +2856,58 @@
           const overrideBadge = f.query_source === 'path_override'
             ? '<span class="cover-override-tag" title="Tags were totally different from folder/file name; folder/file name was used">Folder/file used</span>'
             : '';
+          const folderStr = folderLabel(f.dir);
           const fileCols = firstRow
-            ? '<td class="pick" rowspan="' + span + '"><input type="checkbox" data-meta-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
-              + '<td rowspan="' + span + '" style="min-width:210px">'
-              + '<div style="font-weight:600;overflow-wrap:anywhere">' + esc(f.name) + '</div>'
-              + '<div class="small muted mono" style="margin-top:2px">' + esc(folderLabel(f.dir)) + '</div>'
-              + '<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' + srcTag + overrideBadge + '</div>'
-              + '<div class="btns" style="margin-top:8px">'
-              + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + f.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
-              + '<button type="button" class="btn btn-sm" data-action="open-meta-by-id" data-file="' + f.id + '" title="Open full metadata popup for this file">Popup</button>'
+            ? '<td class="pick meta-pick-col" rowspan="' + span + '"><input type="checkbox" data-meta-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
+              + '<td class="meta-file-col" rowspan="' + span + '">'
+              + '<div class="meta-file-cell-inner">'
+              + '<strong class="meta-one-line" title="' + esc(f.relpath) + '">' + esc(f.name) + '</strong>'
+              + '<span class="small muted mono meta-one-line" title="' + esc(f.dir) + '">' + esc(folderStr) + '</span>'
+              + '<div class="meta-badges-line">' + srcTag + overrideBadge + '</div>'
               + '</div>'
               + '</td>'
             : '';
           bodyRows.push(
-            '<tr' + (trCls ? ' class="' + trCls + '"' : '') + '>'
+            '<tr' + (trCls ? ' class="' + trCls + '"' : '') + ' data-meta-row-file="' + f.id + '" data-meta-row-field="' + k + '">'
             + fileCols
-            + '<td class="meta-field-name">' + esc(META_FIELD_MAP[k] || k) + '</td>'
-            + renderMetaFieldCells(f, k, fo, false)
+            + renderMetaFieldCells(f, k, fo, false, { showActions: firstRow })
             + '</tr>'
           );
         });
       });
 
-      tableHtml = '<div class="table-wrap"><table class="meta-table"><thead><tr>'
+      const colsTotalWidth = META_COL_SPECS.reduce((acc, [ck]) => acc + (state.metaColWidths[ck] || DEFAULT_META_COLS[ck]), 0);
+      const colGroupHtml = '<colgroup>' + META_COL_SPECS.map(([ck]) => {
+        const w = state.metaColWidths[ck] || DEFAULT_META_COLS[ck];
+        return '<col data-col-key="' + ck + '" style="width:' + w + 'px">';
+      }).join('') + '</colgroup>';
+
+      const resizer = (ck) => '<span class="col-resizer" data-resize-col="' + ck + '" title="Drag to resize column (double-click to reset)"></span>';
+
+      tableHtml = '<div class="table-wrap"><table class="meta-table meta-table-resizable" id="meta-diff-table" style="width:' + colsTotalWidth + 'px;min-width:100%">'
+        + colGroupHtml
+        + '<thead><tr>'
         + '<th class="pick"><input type="checkbox" data-meta-all aria-label="Select all visible files"' + (allOn ? ' checked' : '') + '></th>'
-        + '<th>File &amp; folder</th>'
-        + '<th>Field</th>'
-        + '<th>Current tag (file)' + tip('Value currently stored in the audio file metadata. Click to keep the current value.') + '</th>'
-        + '<th>Folder / file name' + tip('Value parsed from the folder and file name on disk. Highlighted when it differs from the file tag.') + '</th>'
-        + '<th>Internet match' + tip('Best match found on Discogs, MusicBrainz or Open (iTunes). Click to select.') + '</th>'
-        + '<th>Custom (✎)' + tip('Click the ✎ pencil button to enter a custom value for any field.') + '</th>'
+        + '<th class="is-resizable" title="File &amp; folder">File &amp; folder' + resizer('file') + '</th>'
+        + '<th class="is-resizable" title="Folder / file name">Folder / file name' + tip('Value parsed from the folder and file name on disk. Click to select, or drag onto another parameter.') + resizer('path') + '</th>'
+        + '<th class="is-resizable" title="Field">Field' + tip('Metadata parameter name. Drop any dragged value pill onto a row to assign it to that parameter.') + resizer('field') + '</th>'
+        + '<th class="is-resizable" title="Current tag (file)">Current tag (file)' + tip('Value currently stored in the audio file metadata. Click to keep, or drag onto another parameter.') + resizer('current') + '</th>'
+        + '<th class="is-resizable" title="Discogs">Discogs' + tip('Match found on Discogs. Click to select or drag to another parameter.') + resizer('discogs') + '</th>'
+        + '<th class="is-resizable" title="MusicBrainz">MusicBrainz' + tip('Match found on MusicBrainz / Cover Art Archive. Click to select or drag to another parameter.') + resizer('musicbrainz') + '</th>'
+        + '<th class="is-resizable" title="Open (iTunes)">Open (iTunes)' + tip('Match found on Open (iTunes). Click to select or drag to another parameter.') + resizer('open') + '</th>'
+        + '<th class="is-resizable" title="Custom (✎)">Custom (✎)' + tip('Click ✎ to enter a custom value, drop a dragged value here, or use Update / Popup to apply or inspect.') + resizer('custom') + '</th>'
         + '</tr></thead><tbody>' + bodyRows.join('') + '</tbody></table></div>';
     }
 
     const diffCard = '<section class="card">'
       + '<div class="card-head"><div><h2>2 · Metadata differences &amp; selection'
-      + tip('Click any pill to select which value to use for that field, or click ✎ to type a custom value. Press Update to write the chosen values into the file without changing its modification timestamp.')
+      + tip('Click any pill to select which value to use, drag any value pill onto another parameter row to copy it there, resize columns via header dividers, or use Bulk edit parameters for selected files.')
       + '</h2>'
-      + '<div class="sub">Click a value pill to select it, or click <strong>✎</strong> to enter a custom value. Updating preserves the file timestamp.</div></div></div>'
+      + '<div class="sub">Click a pill to choose it · drag <strong>⋮⋮</strong> pills to copy values across parameters · drag column borders to resize · <strong>Update</strong> writes without changing file timestamps.</div></div></div>'
       + filterBar
+      + visBar
       + bulkBar
+      + bulkPanelHtml
       + tableHtml
       + '</section>';
 
@@ -2659,8 +2942,8 @@
     const titleEl = document.getElementById('metadata-modal-title');
     const subEl = document.getElementById('metadata-modal-sub');
     const bodyEl = document.getElementById('metadata-modal-body');
-    const btnFile = document.getElementById('metadata-apply-file');
-    const btnAlbum = document.getElementById('metadata-apply-album');
+    const btnFile = document.getElementById('meta-modal-apply-file');
+    const btnAlbum = document.getElementById('meta-modal-apply-album');
 
     titleEl.textContent = 'Meta data check — ' + (META_MODAL.name || 'File');
     subEl.textContent = MEDIA.audio.root + '/' + (META_MODAL.relpath || '');
@@ -2692,27 +2975,31 @@
         + (it.online_source
           ? '<span class="tag">' + esc(it.online_source) + (it.online_score ? ' · ' + Math.round(it.online_score * 100) + '%' : '') + '</span>'
           : '<span class="small muted">none found</span>')
+        + ' <span class="small muted">· Tip: drag ⋮⋮ pills onto another row to copy values across parameters</span>'
         + '</div>'
         + '<div class="btns">'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="online">Select all Internet</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="path">Select all Folder/File</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="discogs">All Discogs</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="musicbrainz">All MusicBrainz</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="open">All Open (iTunes)</button>'
+        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="path">All Folder/File</button>'
         + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="current">Keep all Current</button>'
         + '</div></div>';
 
-      const rows = META_FIELDS.map(([k, lbl]) => {
-        const fo = fields[k] || { current: '', path: '', online: '', choice: 'current', custom_value: '' };
-        return '<tr>'
-          + '<td class="meta-field-name">' + esc(lbl) + '</td>'
-          + renderMetaFieldCells(it, k, fo, true)
+      const rows = META_FIELDS.map(([k]) => {
+        const fo = fields[k] || { current: '', path: '', discogs: '', musicbrainz: '', open: '', online: '', choice: 'current', custom_value: '' };
+        return '<tr data-meta-row-file="' + it.id + '" data-meta-row-field="' + k + '" data-drop-modal="1">'
+          + renderMetaFieldCells(it, k, fo, true, { showActions: false })
           + '</tr>';
       }).join('');
 
       contentHtml = overrideBanner + srcLine
         + '<div class="table-wrap"><table class="meta-table"><thead><tr>'
+        + '<th>Folder / file name</th>'
         + '<th>Field</th>'
         + '<th>Current tag (file)</th>'
-        + '<th>Folder / file name</th>'
-        + '<th>Internet match</th>'
+        + '<th>Discogs</th>'
+        + '<th>MusicBrainz</th>'
+        + '<th>Open (iTunes)</th>'
         + '<th>Custom (✎)</th>'
         + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
     }
@@ -2804,22 +3091,31 @@
         const fo = f[k];
         if (!fo) return;
         const ch = fo.choice || 'current';
-        if (ch === 'custom') overrides[k] = fo.custom_value || '';
-        else if (ch === 'online' && fo.online) overrides[k] = fo.online;
-        else if (ch === 'path' && fo.path) overrides[k] = fo.path;
+        if (ch === 'custom') overrides[k] = { choice: 'custom', value: fo.custom_value || '' };
+        else if (ch === 'discogs' && fo.discogs) overrides[k] = { choice: 'discogs', value: fo.discogs };
+        else if (ch === 'musicbrainz' && fo.musicbrainz) overrides[k] = { choice: 'musicbrainz', value: fo.musicbrainz };
+        else if (ch === 'open' && fo.open) overrides[k] = { choice: 'open', value: fo.open };
+        else if (ch === 'online' && fo.online) overrides[k] = { choice: 'online', value: fo.online };
+        else if (ch === 'path' && fo.path) overrides[k] = { choice: 'path', value: fo.path };
+        else if (ch === 'current') overrides[k] = { choice: 'current', value: fo.current || '' };
       });
       const r = await api('/metadata/apply', {
         method: 'POST',
         body: { ids: [META_MODAL.fileId], scope: scope, overrides: overrides },
       });
+      bumpCoverCache();
       closeMetaModal();
       invalidate('metadata');
+      invalidate('coverParked');
+      state.browse.stale = true;
       await Promise.all([
         refreshDash(),
         currentRoute() === 'metadata' ? loadKey('metadata') : Promise.resolve(),
         currentRoute() === 'directories' && state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
+        currentRoute() === 'parked' ? loadKey('coverParked') : Promise.resolve(),
       ]);
-      toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (timestamp preserved)');
+      const warnNote = r.errors && r.errors.length ? ' · Note: ' + r.errors[0] : '';
+      toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (timestamp preserved)' + warnNote);
       render();
     } catch (err) {
       META_MODAL.error = err.message;
@@ -2952,7 +3248,7 @@
 
     const currentHtml = COVER.hasCover
       ? '<div class="cover-current-row">'
-        + '<img class="cover-current-img" src="/api/files/' + COVER.fileId + '/cover?t=' + Date.now() + '" alt="Current cover">'
+        + '<img class="cover-current-img" src="' + esc(fileCoverUrl(COVER.fileId, Date.now())) + '" alt="Current cover">'
         + '<div><strong>Embedded cover art is present</strong><div class="small muted">Select a new picture below to replace it for this file or the whole album.</div></div>'
         + '</div>'
       : '';
@@ -2994,7 +3290,7 @@
     } else {
       gridHtml = '<div class="cover-grid">' + COVER.candidates.map((c, idx) => {
         const sel = COVER.selectedUrl === c.image_url;
-        const thumb = c.thumb_url || c.image_url || '';
+        const thumb = candThumbUrl(COVER.fileId, c.thumb_url || c.image_url || '');
         return '<div class="cover-cand' + (sel ? ' is-selected' : '') + '" data-action="cover-select-cand" data-idx="' + idx + '" tabindex="0" role="button" aria-pressed="' + sel + '">'
           + '<div class="cover-cand-img-wrap">'
           + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
@@ -3108,11 +3404,15 @@
         body.target_ids = COVER.targetIds;
       }
       const r = await api('/files/' + COVER.fileId + '/cover/apply', { method: 'POST', body });
+      bumpCoverCache();
       closeCoverModal();
       invalidate('coverParked');
+      invalidate('metadata');
+      state.browse.stale = true;
       await Promise.all([
         refreshDash(),
         currentRoute() === 'parked' ? loadKey('coverParked') : Promise.resolve(),
+        currentRoute() === 'metadata' ? loadKey('metadata') : Promise.resolve(),
         currentRoute() === 'directories' && state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
       ]);
       toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
@@ -3558,7 +3858,10 @@
           method: 'POST',
           body: { image_url: url, scope: scope, target_ids: ids },
         });
+        bumpCoverCache();
         invalidate('coverParked');
+        invalidate('metadata');
+        state.browse.stale = true;
         await Promise.all([loadKey('coverParked'), refreshDash()]);
         toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
       } finally {
@@ -3588,7 +3891,9 @@
       render();
       try {
         const r = await api('/covers/check', { method: 'POST', body: { ids: ids, dir: b.rel } });
+        bumpCoverCache();
         invalidate('coverParked');
+        invalidate('metadata');
         await refreshDash();
         const parts = [];
         if (r.embedded) parts.push(r.embedded + ' embedded');
@@ -3610,7 +3915,10 @@
       render();
       try {
         const r = await api('/covers/check', { method: 'POST', body: { enabled_only: true } });
+        bumpCoverCache();
         invalidate('coverParked');
+        invalidate('metadata');
+        state.browse.stale = true;
         await Promise.all([
           refreshDash(),
           currentRoute() === 'parked' ? loadKey('coverParked') : Promise.resolve(),
@@ -3630,7 +3938,10 @@
       const elapsed = tickBusy(busy);
       try {
         const r = await api('/covers/apply-first-all', { method: 'POST', body: {} });
+        bumpCoverCache();
         invalidate('coverParked');
+        invalidate('metadata');
+        state.browse.stale = true;
         await Promise.all([loadKey('coverParked'), refreshDash()]);
         toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
       } finally {
@@ -3653,53 +3964,192 @@
         endBusy(busy);
       }
       render();
+    } else if (a === 'jump-top') {
+      const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      window.scrollTo({ top: 0, left: 0, behavior: reduced ? 'auto' : 'smooth' });
+      document.querySelectorAll('.split-dirs > .tree, .split-dirs > .files-pane').forEach((pane) => {
+        pane.scrollTo({ top: 0, left: 0, behavior: reduced ? 'auto' : 'smooth' });
+      });
     } else if (a === 'meta-check-run' || a === 'meta-check-force') {
       const force = a === 'meta-check-force';
+      if (state.metaChecking) return;
+      state.metaChecking = true;
+      metaCheckAbort = new AbortController();
       const busy = startBusy(force ? 'Re-checking metadata in enabled audio folders' : 'Checking metadata in enabled audio folders');
       const elapsed = tickBusy(busy);
       render();
       try {
-        const r = await api('/metadata/check', { method: 'POST', body: { enabled_only: true, force: force } });
+        const r = await api('/metadata/check', {
+          method: 'POST',
+          body: { enabled_only: true, force: force },
+          signal: metaCheckAbort.signal,
+        });
         invalidate('metadata');
         await Promise.all([loadKey('metadata'), refreshDash()]);
-        toast('Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences · ' + r.ok + ' matching');
+        if (r && r.stopped) {
+          toast('Metadata check stopped (' + r.checked + ' file' + (r.checked === 1 ? '' : 's') + ' checked)');
+        } else if (r) {
+          toast('Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences · ' + r.ok + ' matching');
+        }
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          invalidate('metadata');
+          await Promise.all([loadKey('metadata'), refreshDash()]).catch(() => {});
+        } else {
+          throw err;
+        }
       } finally {
+        state.metaChecking = false;
+        metaCheckAbort = null;
         elapsed.stop();
         endBusy(busy);
       }
+      render();
+    } else if (a === 'meta-check-stop') {
+      try {
+        await api('/metadata/stop', { method: 'POST' });
+      } catch (_err) { /* ignore */ }
+      if (metaCheckAbort) {
+        metaCheckAbort.abort();
+        metaCheckAbort = null;
+      }
+      state.metaChecking = false;
+      if (state.metadata) state.metadata.meta_checking = false;
+      if (state.dash) state.dash.meta_checking = false;
+      invalidate('metadata');
+      await Promise.all([loadKey('metadata'), refreshDash()]).catch(() => {});
+      toast('Metadata check stopped');
       render();
     } else if (a === 'check-meta-dir') {
       const b = state.browse;
       if (!b || !b.rows || !b.rows.length) return;
       const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
+      state.metaChecking = true;
+      metaCheckAbort = new AbortController();
       const busy = startBusy('Checking metadata for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
       const elapsed = tickBusy(busy);
       render();
       try {
-        const r = await api('/metadata/check', { method: 'POST', body: { ids: ids, dir: b.rel, force: true } });
+        const r = await api('/metadata/check', {
+          method: 'POST',
+          body: { ids: ids, dir: b.rel, force: true },
+          signal: metaCheckAbort.signal,
+        });
         invalidate('metadata');
         await refreshDash();
-        toast('Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences');
+        toast(r.stopped
+          ? 'Metadata check stopped (' + r.checked + ' checked)'
+          : 'Metadata check (' + r.checked + ' files): ' + r.diff + ' with differences');
       } catch (err) {
-        toast(err.message);
+        if (!err || err.name !== 'AbortError') toast(err.message);
       } finally {
+        state.metaChecking = false;
+        metaCheckAbort = null;
         elapsed.stop();
         endBusy(busy);
       }
+      if (b.rel) await loadBrowse(b.rel, true);
+      else render();
+    } else if (a === 'meta-vis-all') {
+      state.metaVisibleFields = ALL_META_FIELD_KEYS.slice();
+      saveStoredMetaVis(state.metaVisibleFields);
       render();
+    } else if (a === 'meta-cols-reset') {
+      state.metaColWidths = Object.assign({}, DEFAULT_META_COLS);
+      saveStoredMetaCols(state.metaColWidths);
+      toast('Column widths reset');
+      render();
+    } else if (a === 'meta-bulk-toggle') {
+      state.metaBulkOpen = !state.metaBulkOpen;
+      render();
+    } else if (a === 'meta-select-all-shown') {
+      const m = state.metadata || {};
+      const visible = filterAndSortMetaFiles(m.files || [], m.options || {});
+      state.metaSel = visible.map((f) => f.id);
+      render();
+    } else if (a === 'meta-bulk-stage' || a === 'meta-bulk-apply-now') {
+      const ids = state.metaSel.slice();
+      const enabledKeys = META_FIELDS.map((x) => x[0]).filter((k) => getBulkFieldDraft(k).enabled);
+      if (!ids.length || !enabledKeys.length) return;
+      if (a === 'meta-bulk-stage') {
+        const customMap = {};
+        const modeCalls = [];
+        enabledKeys.forEach((k) => {
+          const bf = getBulkFieldDraft(k);
+          if (bf.mode === 'custom') {
+            customMap[k] = bf.value || '';
+          } else {
+            modeCalls.push(api('/metadata/select', {
+              method: 'POST',
+              body: { ids: ids, field: k, choice: bf.mode },
+            }));
+          }
+        });
+        if (Object.keys(customMap).length) {
+          modeCalls.push(api('/metadata/select', {
+            method: 'POST',
+            body: { ids: ids, choice: 'custom', values: customMap },
+          }));
+        }
+        await Promise.all(modeCalls);
+        invalidate('metadata');
+        await loadKey('metadata');
+        toast('Staged ' + enabledKeys.length + ' parameter' + (enabledKeys.length === 1 ? '' : 's') + ' on ' + ids.length + ' selected file' + (ids.length === 1 ? '' : 's'));
+        render();
+      } else {
+        const busy = startBusy('Writing ' + enabledKeys.length + ' parameter(s) to ' + ids.length + ' selected file(s)');
+        const elapsed = tickBusy(busy);
+        try {
+          // Stage non-custom source selections on the target files first, and build overrides for custom ones
+          const overrides = {};
+          const stagePromises = [];
+          enabledKeys.forEach((k) => {
+            const bf = getBulkFieldDraft(k);
+            if (bf.mode === 'custom') {
+              overrides[k] = { choice: 'custom', value: bf.value || '' };
+            } else {
+              stagePromises.push(api('/metadata/select', {
+                method: 'POST',
+                body: { ids: ids, field: k, choice: bf.mode },
+              }));
+            }
+          });
+          if (stagePromises.length) await Promise.all(stagePromises);
+          const r = await api('/metadata/apply', {
+            method: 'POST',
+            body: { ids: ids, scope: 'file', overrides: overrides, fields: enabledKeys },
+          });
+          bumpCoverCache();
+          invalidate('metadata');
+          invalidate('coverParked');
+          state.browse.stale = true;
+          await Promise.all([
+            loadKey('metadata'),
+            refreshDash(),
+            state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
+          ]);
+          const warnNote = r.errors && r.errors.length ? ' · Note: ' + r.errors[0] : '';
+          toast('Updated ' + enabledKeys.length + ' parameter' + (enabledKeys.length === 1 ? '' : 's') + ' across ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + warnNote);
+        } finally {
+          elapsed.stop();
+          endBusy(busy);
+        }
+        render();
+      }
     } else if (a === 'meta-pick') {
       const fid = Number(el.dataset.file);
       const field = el.dataset.field;
       const choice = el.dataset.choice;
       const editKey = fid + ':' + field;
       delete state.metaEditing[editKey];
-      // Optimistically update local state so UI responds immediately
       const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === fid);
       if (item && item.fields && item.fields[field]) {
         item.fields[field].choice = choice;
       }
       render();
       await api('/metadata/select', { method: 'POST', body: { ids: [fid], field: field, choice: choice } });
+      await loadKey('metadata');
+      render();
     } else if (a === 'meta-edit-toggle') {
       const fid = Number(el.dataset.file);
       const field = el.dataset.field;
@@ -3726,6 +4176,8 @@
         method: 'POST',
         body: { ids: [fid], field: field, choice: 'custom', custom_value: val },
       });
+      await loadKey('metadata');
+      render();
     } else if (a === 'meta-bulk-choice') {
       const choice = el.dataset.choice || 'online';
       const m = state.metadata || {};
@@ -3754,9 +4206,17 @@
       const elapsed = tickBusy(busy);
       try {
         const r = await api('/metadata/apply', { method: 'POST', body: { ids: ids, scope: 'file' } });
+        bumpCoverCache();
         invalidate('metadata');
-        await Promise.all([loadKey('metadata'), refreshDash()]);
-        toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (file timestamp preserved)');
+        invalidate('coverParked');
+        state.browse.stale = true;
+        await Promise.all([
+          loadKey('metadata'),
+          refreshDash(),
+          state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
+        ]);
+        const warnNote = r.errors && r.errors.length ? ' · Note: ' + r.errors[0] : '';
+        toast('Updated metadata for ' + r.updated + ' file' + (r.updated === 1 ? '' : 's') + ' (file timestamp preserved)' + warnNote);
       } finally {
         elapsed.stop();
         endBusy(busy);
@@ -3817,7 +4277,10 @@
         META_FIELDS.forEach(([k]) => {
           const fo = META_MODAL.item.fields[k];
           if (!fo) return;
-          if (choice === 'online' && fo.online) fo.choice = 'online';
+          if (choice === 'discogs' && fo.discogs) fo.choice = 'discogs';
+          else if (choice === 'musicbrainz' && fo.musicbrainz) fo.choice = 'musicbrainz';
+          else if (choice === 'open' && fo.open) fo.choice = 'open';
+          else if (choice === 'online' && fo.online) fo.choice = 'online';
           else if (choice === 'path' && fo.path) fo.choice = 'path';
           else if (choice === 'current') fo.choice = 'current';
         });
@@ -4047,7 +4510,60 @@
       }
       const saved = await api('/metadata/options', { method: 'PUT', body: opts });
       if (state.metadata) state.metadata.options = saved;
+      await loadKey('metadata');
       render();
+      return;
+    }
+
+    if (el.dataset.metaVisField !== undefined) {
+      if (!committed) return;
+      const fld = el.dataset.metaVisField;
+      const next = el.checked
+        ? ALL_META_FIELD_KEYS.filter((k) => state.metaVisibleFields.includes(k) || k === fld)
+        : state.metaVisibleFields.filter((k) => k !== fld);
+      if (!next.length) {
+        el.checked = true;
+        toast('Keep at least one parameter visible in the list');
+        return;
+      }
+      state.metaVisibleFields = next;
+      saveStoredMetaVis(next);
+      render();
+      return;
+    }
+
+    if (el.dataset.metaOnlyDiff !== undefined) {
+      if (!committed) return;
+      state.metaOnlyDiffRows = !!el.checked;
+      render();
+      return;
+    }
+
+    if (el.dataset.metaBulkEnable !== undefined) {
+      if (!committed) return;
+      const bf = getBulkFieldDraft(el.dataset.metaBulkEnable);
+      bf.enabled = !!el.checked;
+      render();
+      return;
+    }
+
+    if (el.dataset.metaBulkMode !== undefined) {
+      if (!committed) return;
+      const bf = getBulkFieldDraft(el.dataset.metaBulkMode);
+      bf.mode = el.value;
+      bf.enabled = true;
+      render();
+      return;
+    }
+
+    if (el.dataset.metaBulkVal !== undefined) {
+      const k = el.dataset.metaBulkVal;
+      const bf = getBulkFieldDraft(k);
+      bf.value = el.value;
+      if (!bf.enabled && el.value.trim()) {
+        bf.enabled = true;
+        if (committed) render();
+      }
       return;
     }
   }
@@ -4208,6 +4724,203 @@
     }
   });
 
+  /* ------------------------------------------------ metadata drag-and-drop & column resizing */
+  let activeMetaDrag = null;
+
+  function clearMetaDropHighlights() {
+    document.querySelectorAll('.is-drop-row').forEach((el) => el.classList.remove('is-drop-row'));
+    document.querySelectorAll('.is-drop-cell').forEach((el) => el.classList.remove('is-drop-cell'));
+  }
+
+  document.addEventListener('dragstart', (ev) => {
+    const dragEl = ev.target && ev.target.closest && ev.target.closest('[data-drag-meta]');
+    if (!dragEl) return;
+    try {
+      const payload = JSON.parse(dragEl.dataset.dragMeta);
+      activeMetaDrag = payload;
+      if (ev.dataTransfer) {
+        ev.dataTransfer.effectAllowed = 'copy';
+        ev.dataTransfer.setData('application/x-audio-norm-meta', dragEl.dataset.dragMeta);
+        ev.dataTransfer.setData('text/plain', String(payload.value || ''));
+      }
+    } catch (_err) {
+      activeMetaDrag = null;
+    }
+  });
+
+  document.addEventListener('dragover', (ev) => {
+    const bulkInp = ev.target && ev.target.closest && ev.target.closest('input[data-meta-bulk-val], input[data-meta-custom-input]');
+    if (bulkInp) {
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+      return;
+    }
+    const cell = ev.target && ev.target.closest && ev.target.closest('td[data-drop-field]');
+    const row = ev.target && ev.target.closest && ev.target.closest('tr[data-meta-row-field]');
+    if (!cell && !row) return;
+    ev.preventDefault();
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+    clearMetaDropHighlights();
+    if (row) row.classList.add('is-drop-row');
+    if (cell) cell.classList.add('is-drop-cell');
+  });
+
+  document.addEventListener('dragleave', (ev) => {
+    const related = ev.relatedTarget;
+    if (!related || !(related.closest && (related.closest('td[data-drop-field]') || related.closest('tr[data-meta-row-field]')))) {
+      clearMetaDropHighlights();
+    }
+  });
+
+  document.addEventListener('dragend', () => {
+    activeMetaDrag = null;
+    clearMetaDropHighlights();
+  });
+
+  document.addEventListener('drop', (ev) => {
+    clearMetaDropHighlights();
+    const bulkInp = ev.target && ev.target.closest && ev.target.closest('input[data-meta-bulk-val]');
+    if (bulkInp) {
+      let val = '';
+      if (ev.dataTransfer) {
+        const raw = ev.dataTransfer.getData('application/x-audio-norm-meta');
+        if (raw) {
+          try { val = JSON.parse(raw).value || ''; } catch (_e) { /* ignore */ }
+        }
+        if (!val) val = ev.dataTransfer.getData('text/plain') || '';
+      } else if (activeMetaDrag) {
+        val = activeMetaDrag.value || '';
+      }
+      if (val) {
+        ev.preventDefault();
+        const k = bulkInp.dataset.metaBulkVal;
+        const bf = getBulkFieldDraft(k);
+        bf.mode = 'custom';
+        bf.value = val;
+        bf.enabled = true;
+        render();
+        toast('Dropped value into bulk ' + (META_FIELD_MAP[k] || k));
+      }
+      activeMetaDrag = null;
+      return;
+    }
+
+    const cell = ev.target && ev.target.closest && ev.target.closest('td[data-drop-field]');
+    const row = ev.target && ev.target.closest && ev.target.closest('tr[data-meta-row-field]');
+    if (!cell && !row) return;
+
+    let payload = activeMetaDrag;
+    if (ev.dataTransfer) {
+      const raw = ev.dataTransfer.getData('application/x-audio-norm-meta');
+      if (raw) {
+        try { payload = JSON.parse(raw); } catch (_e) { /* ignore */ }
+      }
+      if (!payload) {
+        const txt = ev.dataTransfer.getData('text/plain');
+        if (txt) payload = { value: txt };
+      }
+    }
+    activeMetaDrag = null;
+    if (!payload || payload.value === undefined) return;
+    ev.preventDefault();
+
+    const targetFileId = Number((cell && cell.dataset.dropFile) || (row && row.dataset.metaRowFile));
+    const targetField = (cell && cell.dataset.dropField) || (row && row.dataset.metaRowField);
+    const inModal = !!((cell && cell.dataset.dropModal) || (row && row.dataset.dropModal));
+    const draggedVal = String(payload.value || '').trim();
+    if (!targetFileId || !targetField) return;
+
+    if (targetField === 'cover' && draggedVal && !/^(https?:\/\/|local:\/\/|data:)/i.test(draggedVal)) {
+      toast('Cover picture requires an image URL');
+      return;
+    }
+
+    if (inModal && META_MODAL.open && META_MODAL.item && META_MODAL.item.id === targetFileId) {
+      if (META_MODAL.item.fields && META_MODAL.item.fields[targetField]) {
+        META_MODAL.item.fields[targetField].choice = 'custom';
+        META_MODAL.item.fields[targetField].custom_value = draggedVal;
+      }
+      delete state.metaEditing['modal:' + targetFileId + ':' + targetField];
+      renderMetaModal();
+      api('/metadata/select', {
+        method: 'POST',
+        body: { ids: [targetFileId], field: targetField, choice: 'custom', custom_value: draggedVal },
+      }).catch(SAVE_ERR);
+      toast('Assigned to ' + (META_FIELD_MAP[targetField] || targetField));
+      return;
+    }
+
+    delete state.metaEditing[targetFileId + ':' + targetField];
+    const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === targetFileId);
+    if (item && item.fields && item.fields[targetField]) {
+      item.fields[targetField].choice = 'custom';
+      item.fields[targetField].custom_value = draggedVal;
+    }
+    render();
+    api('/metadata/select', {
+      method: 'POST',
+      body: { ids: [targetFileId], field: targetField, choice: 'custom', custom_value: draggedVal },
+    })
+      .then(() => loadKey('metadata'))
+      .then(() => render())
+      .catch(SAVE_ERR);
+    toast('Assigned "' + (draggedVal.length > 36 ? draggedVal.slice(0, 36) + '…' : draggedVal) + '" to ' + (META_FIELD_MAP[targetField] || targetField));
+  });
+
+  // Column resizing in 2 · Metadata differences & selection
+  let colResizeState = null;
+  document.addEventListener('pointerdown', (ev) => {
+    const grip = ev.target && ev.target.closest && ev.target.closest('.col-resizer[data-resize-col]');
+    if (!grip) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const colKey = grip.dataset.resizeCol;
+    const spec = META_COL_SPECS.find((s) => s[0] === colKey);
+    const minW = spec ? spec[2] : 60;
+    const startW = state.metaColWidths[colKey] || DEFAULT_META_COLS[colKey] || 150;
+    grip.classList.add('is-active');
+    document.body.classList.add('is-col-resizing');
+    colResizeState = { colKey, minW, startX: ev.clientX, startW, grip };
+  });
+
+  window.addEventListener('pointermove', (ev) => {
+    if (!colResizeState) return;
+    const dx = ev.clientX - colResizeState.startX;
+    const nextW = Math.max(colResizeState.minW, Math.min(960, Math.round(colResizeState.startW + dx)));
+    state.metaColWidths[colResizeState.colKey] = nextW;
+    const tbl = document.getElementById('meta-diff-table');
+    if (tbl) {
+      const colEl = tbl.querySelector('col[data-col-key="' + colResizeState.colKey + '"]');
+      if (colEl) colEl.style.width = nextW + 'px';
+      const total = META_COL_SPECS.reduce((acc, [ck]) => acc + (state.metaColWidths[ck] || DEFAULT_META_COLS[ck]), 0);
+      tbl.style.width = total + 'px';
+    }
+  });
+
+  window.addEventListener('pointerup', () => {
+    if (!colResizeState) return;
+    if (colResizeState.grip) colResizeState.grip.classList.remove('is-active');
+    document.body.classList.remove('is-col-resizing');
+    saveStoredMetaCols(state.metaColWidths);
+    colResizeState = null;
+  });
+
+  document.addEventListener('dblclick', (ev) => {
+    const grip = ev.target && ev.target.closest && ev.target.closest('.col-resizer[data-resize-col]');
+    if (!grip) return;
+    const colKey = grip.dataset.resizeCol;
+    state.metaColWidths[colKey] = DEFAULT_META_COLS[colKey] || 180;
+    saveStoredMetaCols(state.metaColWidths);
+    render();
+  });
+
+  function syncJumpTop() {
+    const btn = document.getElementById('jump-top-btn');
+    if (!btn) return;
+    btn.classList.toggle('is-scrolled', window.scrollY > 80);
+  }
+  window.addEventListener('scroll', syncJumpTop, { passive: true });
+
   /* ---------------------------------------------------------------- start */
   window.addEventListener('hashchange', () => {
     const route = currentRoute();
@@ -4236,11 +4949,17 @@
         }
       }).catch(() => { /* keep the last view */ });
     }
-  }, 3000);
+    if (currentRoute() === 'metadata' && (state.metaChecking || (state.dash && state.dash.meta_checking)) && !colResizeState) {
+      loadKey('metadata').then(() => {
+        if (currentRoute() === 'metadata' && !colResizeState) render();
+      }).catch(() => {});
+    }
+  }, 2500);
 
   applyMenu();
   initPlayer();
   initEditor();
+  syncJumpTop();
   if (currentRoute() === 'directories') openDirectories();   // also when the app opens on this page
   render();
 })();

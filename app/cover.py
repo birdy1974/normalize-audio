@@ -200,11 +200,22 @@ def inspect_audio(path: str) -> dict:
     return out
 
 
+def _audio_ext(path: str, ext_override: str | None = None) -> str:
+    if ext_override:
+        return ext_override.lower().lstrip(".")
+    base = os.path.basename(path)
+    if base.endswith(".nrm-tmp"):
+        # Strip ".<op>-<pid>-<ts>.nrm-tmp" suffix and leading dot to recover original extension
+        stem = re.sub(r"\.[a-z]+-\d+-\d+\.nrm-tmp$", "", base)
+        return stem.rsplit(".", 1)[-1].lower() if "." in stem.lstrip(".") else ""
+    return base.rsplit(".", 1)[-1].lower() if "." in base else ""
+
+
 def extract_cover(path: str) -> tuple[bytes, str] | None:
     """Return (image_bytes, mime_type) of the embedded front cover, or None."""
     if not os.path.isfile(path):
         return None
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    ext = _audio_ext(path)
     try:
         if ext in ("mp3", "aac"):
             id3 = ID3(path)
@@ -218,6 +229,11 @@ def extract_cover(path: str) -> tuple[bytes, str] | None:
             audio = FLAC(path)
             if audio.pictures:
                 pic = next((p for p in audio.pictures if p.type == 3), audio.pictures[0])
+                return bytes(pic.data), detect_mime(pic.data, pic.mime or "image/jpeg")
+            tags = audio.tags or {}
+            mbp = tags.get("metadata_block_picture")
+            if mbp:
+                pic = Picture(base64.b64decode(mbp[0]))
                 return bytes(pic.data), detect_mime(pic.data, pic.mime or "image/jpeg")
             return None
 
@@ -238,6 +254,10 @@ def extract_cover(path: str) -> tuple[bytes, str] | None:
             if mbp:
                 pic = Picture(base64.b64decode(mbp[0]))
                 return bytes(pic.data), detect_mime(pic.data, pic.mime or "image/jpeg")
+            ca = tags.get("coverart")
+            if ca:
+                raw = base64.b64decode(ca[0])
+                return raw, detect_mime(raw, (tags.get("coverartmime") or ["image/jpeg"])[0])
             return None
 
         if ext in ("wav", "aif", "aiff"):
@@ -294,18 +314,18 @@ def _unpack_asf_picture(raw: bytes) -> tuple[bytes, str] | None:
 
 
 def embed_cover(path: str, image_bytes: bytes, mime: str | None = None,
-                preserve_mtime: bool = True) -> None:
+                preserve_mtime: bool = True, ext_override: str | None = None) -> None:
     """Embed front cover art into an audio file safely via a temporary sibling file."""
     if not os.path.isfile(path):
         raise ValueError("audio file not found")
     if not image_bytes or len(image_bytes) < 16:
         raise ValueError("invalid cover image data")
     actual_mime = detect_mime(image_bytes, mime or "image/jpeg")
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    ext = _audio_ext(path, ext_override)
     stat_before = os.stat(path)
     folder = os.path.dirname(path) or "."
     base = os.path.basename(path)
-    tmp = os.path.join(folder, f".{base}.cover-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp")
+    tmp = os.path.join(folder, f".{base}.cover-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp.{ext}")
     shutil.copy2(path, tmp)
     try:
         if ext in ("mp3", "aac"):
@@ -314,11 +334,17 @@ def embed_cover(path: str, image_bytes: bytes, mime: str | None = None,
             except ID3NoHeaderError:
                 id3 = ID3()
             id3.delall("APIC")
+            id3.delall("PIC")
             id3.add(APIC(encoding=3, mime=actual_mime, type=3, desc="Cover", data=image_bytes))
-            id3.save(tmp, v2_version=3)
+            id3.update_to_v23()
+            id3.save(tmp, v1=1, v2_version=3)
         elif ext == "flac":
             audio = FLAC(tmp)
             audio.clear_pictures()
+            if audio.tags:
+                for legacy_key in ("metadata_block_picture", "coverart", "coverartmime"):
+                    if legacy_key in audio.tags:
+                        del audio.tags[legacy_key]
             pic = Picture()
             pic.type = 3
             pic.mime = actual_mime
@@ -339,6 +365,9 @@ def embed_cover(path: str, image_bytes: bytes, mime: str | None = None,
                 raise ValueError(f"unsupported Ogg/Opus file: {base}")
             if audio.tags is None:
                 audio.add_tags()
+            for legacy_key in ("coverart", "coverartmime"):
+                if legacy_key in audio.tags:
+                    del audio.tags[legacy_key]
             pic = Picture()
             pic.type = 3
             pic.mime = actual_mime
@@ -351,8 +380,10 @@ def embed_cover(path: str, image_bytes: bytes, mime: str | None = None,
             if audio.tags is None:
                 audio.add_tags()
             audio.tags.delall("APIC")
+            audio.tags.delall("PIC")
             audio.tags.add(APIC(encoding=3, mime=actual_mime, type=3, desc="Cover", data=image_bytes))
-            audio.save()
+            audio.tags.update_to_v23()
+            audio.save(v2_version=3)
         elif ext == "wma":
             audio = ASF(tmp)
             if audio.tags is None:
