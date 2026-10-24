@@ -98,6 +98,7 @@ class CoverSearchBody(BaseModel):
     album: str | None = None
     title: str | None = None
     source: Literal["both", "discogs", "open"] | None = None
+    query_mode: Literal["auto", "file", "metadata"] | None = None
     force: bool = False
 
 
@@ -133,6 +134,7 @@ class MetadataCheckBody(BaseModel):
 
 class FileMetadataCheckBody(BaseModel):
     force: bool = False
+    query_mode: Literal["auto", "file", "metadata"] | None = None
     query: dict | None = None
     artist: str | None = None
     album: str | None = None
@@ -265,6 +267,11 @@ def run_start(engine=Engine):
 def run_stop(engine=Engine):
     engine.stop()
     return {"status": engine.status()}
+
+
+@router.post("/actions/stop")
+def actions_stop(engine=Engine):
+    return engine.stop_all_actions()
 
 
 @router.post("/run/pause")
@@ -458,6 +465,7 @@ def file_cover_search(fid: int, body: CoverSearchBody | None = None, engine=Engi
             album=b.album,
             title=b.title,
             source_mode=b.source,
+            query_mode=b.query_mode,
             force_refresh=b.force,
         )
     except ValueError as exc:
@@ -633,6 +641,7 @@ def check_file_metadata(fid: int, body: FileMetadataCheckBody | None = None, eng
             row,
             force_refresh=b.force,
             custom_query=custom_q or None,
+            query_mode=b.query_mode,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc

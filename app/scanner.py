@@ -25,8 +25,10 @@ class Scanner:
     def __init__(self, cfg, db: Database):
         self.cfg = cfg
         self.db = db
+        self.cancel_fn = None
 
-    def scan(self, media: str) -> dict:
+    def scan(self, media: str, cancel=None) -> dict:
+        cancel = cancel or self.cancel_fn
         root = self.cfg.root(media)
         if not os.path.isdir(root):
             self.db.log("error", f"{root} is not available. Check the volume mount in docker-compose.yml.", media)
@@ -37,6 +39,10 @@ class Scanner:
         wanted = EXTENSIONS[media]
         skipped = 0
         for dirpath, dirnames, filenames in os.walk(root):
+            if cancel and cancel():
+                self.db.log("warn", f"Scan stopped for {media}", media)
+                return {"available": True, "stopped": True, "files": len(files), "new": 0, "changed": 0,
+                        "removed": 0, "folders": len(dirs), "skipped": skipped}
             good_dirnames = []
             for d in dirnames:
                 if d.startswith(SKIP_PREFIXES):
@@ -117,9 +123,13 @@ class Scanner:
         return {"available": True, "files": len(files), "new": new, "changed": 0,
                 "removed": removed, "folders": len(dirs), "skipped": skipped}
 
-    def scan_all(self) -> dict:
+    def scan_all(self, cancel=None) -> dict:
+        cancel = cancel or self.cancel_fn
         results = {}
         for m in MEDIA:
+            if cancel and cancel():
+                results[m] = {"available": True, "stopped": True, "files": 0, "new": 0, "changed": 0, "removed": 0, "folders": 0, "skipped": 0}
+                continue
             try:
                 results[m] = self.scan(m)
             except Exception as exc:

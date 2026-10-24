@@ -280,8 +280,18 @@ METADATA_SOURCES = ("discogs", "musicbrainz", "open")
 DEFAULT_METADATA_OPTIONS = {
     "fields": {f: True for f in METADATA_FIELDS},
     "checkPath": True,
+    "searchFrom": "auto",
     "sources": {s: True for s in METADATA_SOURCES},
 }
+
+
+def _norm_search_from(val) -> str:
+    s = str(val or "").strip().lower()
+    if s in ("file", "path", "filename", "folder"):
+        return "file"
+    if s in ("metadata", "meta", "tags", "tag", "current"):
+        return "metadata"
+    return "auto"
 
 
 def _normalize_meta_options(raw: dict) -> dict:
@@ -311,11 +321,15 @@ def _normalize_meta_options(raw: dict) -> dict:
         chosen_s = {str(x) for x in raw_sources if str(x) in METADATA_SOURCES}
         sources_map = {s: (s in chosen_s) for s in METADATA_SOURCES}
 
+    search_from = _norm_search_from(raw.get("search_from") if "search_from" in raw else raw.get("searchFrom"))
+
     return {
         "fields": [f for f in METADATA_FIELDS if fields_map.get(f, True)],
         "fields_map": fields_map,
         "check_path_vs_tags": check_path,
         "checkPath": check_path,
+        "search_from": search_from,
+        "searchFrom": search_from,
         "sources": [s for s in METADATA_SOURCES if sources_map.get(s, True)],
         "sources_map": sources_map,
         "visible_fields": _norm_vis_fields(raw.get("visible_fields")),
@@ -362,6 +376,7 @@ def put_metadata_options(db: Database, patch: dict) -> dict:
         {
             "fields": norm["fields_map"],
             "checkPath": norm["checkPath"],
+            "searchFrom": norm["search_from"],
             "sources": norm["sources_map"],
             "visible_fields": norm["visible_fields"],
             "only_diff_rows": norm["only_diff_rows"],

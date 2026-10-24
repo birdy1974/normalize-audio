@@ -173,6 +173,21 @@
     return { busy: false, title: 'Idle', sub: 'nothing to do right now' };
   }
 
+  let stoppingAction = false;
+  const activeApiControllers = new Set();
+
+  function isActionStoppable() {
+    if (stoppingAction) return false;
+    if (Object.keys(state.busy).length > 0) return true;
+    if (state.metaChecking || state.scanning.audio || state.scanning.video) return true;
+    const d = state.dash;
+    if (!d) return false;
+    if (d.approved_pending > 0 || d.meta_checking || d.scanning) return true;
+    if (d.status === 'running' || d.status === 'waiting_window') return true;
+    if (d.status === 'paused' && d.mode !== 'auto') return true;
+    return false;
+  }
+
   function showActivity() {
     const box = document.getElementById('activity');
     if (!box) return;
@@ -185,6 +200,21 @@
     box.classList.toggle('is-busy', now.busy);
     box.setAttribute('aria-busy', String(now.busy));
     box.title = now.title + (now.sub ? ' · ' + now.sub : '');
+
+    const stopBtn = document.getElementById('activity-stop');
+    if (stopBtn) {
+      const canStop = isActionStoppable();
+      stopBtn.disabled = !canStop;
+      stopBtn.classList.toggle('is-active', canStop);
+      const lblEl = stopBtn.querySelector('.activity-stop-label');
+      if (lblEl) {
+        const nextLbl = stoppingAction ? 'Stopping…' : 'Stop';
+        if (lblEl.textContent !== nextLbl) lblEl.textContent = nextLbl;
+      }
+      stopBtn.title = stoppingAction
+        ? 'Stopping current action…'
+        : (canStop ? 'Stop / kill current action (' + now.title + ')' : 'Nothing running right now');
+    }
   }
 
   /* ----------------------------------------------------------- preview player
@@ -1023,23 +1053,44 @@
   /* ------------------------------------------------------------------ API */
   async function api(path, options) {
     const opts = options || {};
-    const init = { method: opts.method || 'GET', headers: {} };
-    if (opts.signal) init.signal = opts.signal;
+    const method = (opts.method || 'GET').toUpperCase();
+    const init = { method: method, headers: {} };
+    const trackAbort = path !== '/actions/stop' && path !== '/metadata/stop' && path !== '/run/stop'
+      && (method !== 'GET' || path.startsWith('/files/waveform') || path.startsWith('/files/info'));
+    let ctrl = null;
+    if (trackAbort) {
+      ctrl = new AbortController();
+      activeApiControllers.add(ctrl);
+      if (opts.signal) {
+        if (opts.signal.aborted) ctrl.abort();
+        else opts.signal.addEventListener('abort', () => ctrl.abort(), { once: true });
+      }
+      init.signal = ctrl.signal;
+    } else if (opts.signal) {
+      init.signal = opts.signal;
+    }
     if (opts.body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(opts.body);
     }
-    const res = await fetch('/api' + path, init);
-    let data = null;
-    try { data = await res.json(); } catch (err) { data = null; }
-    if (!res.ok) {
-      const d = data && data.detail;
-      let msg = 'Request failed (HTTP ' + res.status + ')';
-      if (typeof d === 'string') msg = d;
-      else if (Array.isArray(d)) msg = d.map((x) => x.msg).join('; ');
-      throw new Error(msg);
+    try {
+      const res = await fetch('/api' + path, init);
+      let data = null;
+      try { data = await res.json(); } catch (err) { data = null; }
+      if (res.status === 499) {
+        throw Object.assign(new Error('Action stopped'), { name: 'AbortError', stopped: true });
+      }
+      if (!res.ok) {
+        const d = data && data.detail;
+        let msg = 'Request failed (HTTP ' + res.status + ')';
+        if (typeof d === 'string') msg = d;
+        else if (Array.isArray(d)) msg = d.map((x) => x.msg).join('; ');
+        throw new Error(msg);
+      }
+      return data;
+    } finally {
+      if (ctrl) activeApiControllers.delete(ctrl);
     }
-    return data;
   }
 
   const META_VIS_KEY = 'audio-normalizer-meta-vis-fields';
@@ -1469,7 +1520,7 @@
         return res;
       })
       .catch((err) => {
-        toast('Rescan failed: ' + err.message);
+        if (!err || err.name !== 'AbortError') toast('Rescan failed: ' + err.message);
         return null;
       })
       .finally(() => {
@@ -2896,6 +2947,7 @@
     const opts = m.options || { fields: META_FIELDS.map((x) => x[0]), check_path_vs_tags: true, sources: ['discogs', 'musicbrainz', 'open'] };
     const enabledFields = opts.fields || META_FIELDS.map((x) => x[0]);
     const enabledSources = opts.sources || ['discogs', 'musicbrainz', 'open'];
+    const searchFrom = opts.search_from || opts.searchFrom || 'auto';
     const isChecking = !!(state.metaChecking || m.meta_checking || (state.dash && state.dash.meta_checking));
     const mp = m.meta_progress || (state.dash && state.dash.meta_progress) || {};
     const mpDone = Number(mp.done || 0);
@@ -2965,6 +3017,14 @@
       + '<label class="inline"><input class="switch" type="checkbox" data-meta-opt-path' + (opts.check_path_vs_tags ? ' checked' : '') + '> '
       + 'Compare <strong>Artist</strong>, <strong>Title</strong> and <strong>Album</strong> in file tags against the folder / file name (flag differences and use folder/file name for online search when totally different)</label>'
       + '</div>'
+      + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Artist / Title from</span>'
+      + '<div class="seg" role="group" aria-label="Take Artist and Title from">'
+      + '<button type="button" class="' + (searchFrom === 'auto' ? 'on' : '') + '" data-action="meta-opt-search-from" data-mode="auto" aria-pressed="' + (searchFrom === 'auto') + '" title="Smart automatic: use metadata tags unless missing or totally different from folder/file name">Auto (smart)</button>'
+      + '<button type="button" class="' + (searchFrom === 'file' ? 'on' : '') + '" data-action="meta-opt-search-from" data-mode="file" aria-pressed="' + (searchFrom === 'file') + '" title="Always take Artist / Title (and Album) from the folder / file name when searching online">From file (folder / file name)</button>'
+      + '<button type="button" class="' + (searchFrom === 'metadata' ? 'on' : '') + '" data-action="meta-opt-search-from" data-mode="metadata" aria-pressed="' + (searchFrom === 'metadata') + '" title="Always take Artist / Title (and Album) from the file embedded metadata tags when searching online">From meta data (file tags)</button>'
+      + '</div>'
+      + '<span class="small muted">Controls where online lookups take <strong>Artist / Title</strong> from.</span>'
+      + '</div>'
       + '<div class="meta-options-row"><span class="muted small" style="min-width:120px">Internet sources</span>'
       + sourceChecks
       + '<span class="small muted">Configure your Discogs token in <a href="#/settings">Settings → General</a>.</span>'
@@ -3031,6 +3091,8 @@
       + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="open"' + bulkSrcDisabled + ' title="Select Open (iTunes) values on the ' + selCount + ' selected file(s)">Open (iTunes) (' + selCount + ')</button>'
       + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path"' + bulkSrcDisabled + ' title="Select Folder / File values on the ' + selCount + ' selected file(s)">Folder / File (' + selCount + ')</button>'
       + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current"' + bulkSrcDisabled + ' title="Select Current tag values on the ' + selCount + ' selected file(s)">Current tag (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-artist-title" data-choice="path"' + bulkSrcDisabled + ' title="Take Artist and Track Title from the folder / file name on the ' + selCount + ' selected file(s)">Artist/Title ← File (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-artist-title" data-choice="current"' + bulkSrcDisabled + ' title="Keep Artist and Track Title from the file meta data tags on the ' + selCount + ' selected file(s)">Artist/Title ← Meta data (' + selCount + ')</button>'
       + '<button class="btn btn-sm' + (state.metaBulkOpen ? ' btn-primary' : '') + '" data-action="meta-bulk-toggle" aria-expanded="' + state.metaBulkOpen + '">'
       + 'Bulk edit parameters (' + selCount + ')</button>'
       + '<button class="btn btn-sm btn-primary" data-action="meta-apply-selected"' + bulkSrcDisabled
@@ -3168,6 +3230,7 @@
     relpath: '',
     dir: '',
     albumFileCount: 1,
+    queryMode: 'auto',
     artist: '',
     album: '',
     title: '',
@@ -3189,7 +3252,23 @@
     titleEl.textContent = 'Meta data check — ' + (META_MODAL.name || 'File');
     subEl.textContent = MEDIA.audio.root + '/' + (META_MODAL.relpath || '');
 
-    const searchHtml = '<div class="cover-search-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr)) auto">'
+    const mf = (META_MODAL.item && META_MODAL.item.fields) || {};
+    const mPathPreview = [(mf.artist && mf.artist.path) || '', (mf.title && mf.title.path) || ''].filter(Boolean).join(' — ') || 'none';
+    const mTagPreview = [(mf.artist && mf.artist.current) || '', (mf.title && mf.title.current) || ''].filter(Boolean).join(' — ') || 'none';
+    const qm = META_MODAL.queryMode || 'auto';
+    const querySrcBar = '<div class="query-src-bar">'
+      + '<span class="muted small">Take Artist / Title from:</span>'
+      + '<div class="seg" role="group" aria-label="Take Artist and Title from">'
+      + '<button type="button" class="' + (qm === 'auto' ? 'on' : '') + '" data-action="meta-modal-query-mode" data-mode="auto"' + (META_MODAL.loading ? ' disabled' : '') + '>Auto</button>'
+      + '<button type="button" class="' + (qm === 'file' ? 'on' : '') + '" data-action="meta-modal-query-mode" data-mode="file"' + (META_MODAL.loading ? ' disabled' : '') + ' title="File: ' + esc(mPathPreview) + '">From file</button>'
+      + '<button type="button" class="' + (qm === 'metadata' ? 'on' : '') + '" data-action="meta-modal-query-mode" data-mode="metadata"' + (META_MODAL.loading ? ' disabled' : '') + ' title="Meta data: ' + esc(mTagPreview) + '">From meta data</button>'
+      + '</div>'
+      + (META_MODAL.item
+        ? '<span class="small muted query-src-preview"><span><strong>File:</strong> ' + esc(mPathPreview) + '</span><span>·</span><span><strong>Meta data:</strong> ' + esc(mTagPreview) + '</span></span>'
+        : '')
+      + '</div>';
+
+    const searchHtml = querySrcBar + '<div class="cover-search-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr)) auto">'
       + '<div class="field"><label class="lbl" for="meta-q-artist">Search Artist</label>'
       + '<input class="input" id="meta-q-artist" data-meta-modal-input="artist" value="' + esc(META_MODAL.artist) + '" placeholder="Artist"></div>'
       + '<div class="field"><label class="lbl" for="meta-q-album">Search Album</label>'
@@ -3262,6 +3341,7 @@
     META_MODAL.relpath = o.relpath || '';
     META_MODAL.dir = o.dir || '';
     META_MODAL.albumFileCount = 1;
+    META_MODAL.queryMode = (state.metadata && state.metadata.options && (state.metadata.options.search_from || state.metadata.options.searchFrom)) || 'auto';
     META_MODAL.artist = '';
     META_MODAL.album = '';
     META_MODAL.title = '';
@@ -3277,14 +3357,16 @@
     await runMetaModalCheck(false);
   }
 
-  async function runMetaModalCheck(force) {
+  async function runMetaModalCheck(force, explicitMode) {
     if (!META_MODAL.fileId) return;
+    if (explicitMode) META_MODAL.queryMode = explicitMode;
     META_MODAL.loading = true;
     META_MODAL.error = '';
     renderMetaModal();
     try {
-      const body = { force: !!force };
-      if (force) {
+      const qm = META_MODAL.queryMode || 'auto';
+      const body = { force: !!force, query_mode: qm };
+      if (force && !explicitMode) {
         body.artist = META_MODAL.artist;
         body.album = META_MODAL.album;
         body.title = META_MODAL.title;
@@ -3296,9 +3378,19 @@
       META_MODAL.dir = d.dir || META_MODAL.dir;
       META_MODAL.albumFileCount = d.album_file_count || 1;
       const f = d.fields || {};
-      META_MODAL.artist = (f.artist && (f.artist.online || f.artist.current || f.artist.path)) || '';
-      META_MODAL.album = (f.album && (f.album.online || f.album.current || f.album.path)) || '';
-      META_MODAL.title = (f.title && (f.title.online || f.title.current || f.title.path)) || '';
+      if (qm === 'file') {
+        META_MODAL.artist = (f.artist && f.artist.path) || '';
+        META_MODAL.album = (f.album && f.album.path) || '';
+        META_MODAL.title = (f.title && f.title.path) || '';
+      } else if (qm === 'metadata') {
+        META_MODAL.artist = (f.artist && f.artist.current) || '';
+        META_MODAL.album = (f.album && f.album.current) || '';
+        META_MODAL.title = (f.title && f.title.current) || '';
+      } else {
+        META_MODAL.artist = (f.artist && (f.artist.online || f.artist.current || f.artist.path)) || '';
+        META_MODAL.album = (f.album && (f.album.online || f.album.current || f.album.path)) || '';
+        META_MODAL.title = (f.title && (f.title.online || f.title.current || f.title.path)) || '';
+      }
       invalidate('metadata');
     } catch (err) {
       META_MODAL.error = err.message;
@@ -3472,6 +3564,7 @@
     album: '',
     title: '',
     source: 'both',
+    queryMode: 'auto',
     querySource: 'tags',
     tagArtist: '',
     tagAlbum: '',
@@ -3525,7 +3618,22 @@
       ['open', 'Open sources only'],
     ].map(([k, lbl]) => '<option value="' + k + '"' + (COVER.source === k ? ' selected' : '') + '>' + lbl + '</option>').join('');
 
-    const searchHtml = '<div class="cover-search-grid">'
+    const pathPreview = [COVER.pathArtist, COVER.pathTitle].filter(Boolean).join(' — ') || [COVER.pathArtist, COVER.pathAlbum].filter(Boolean).join(' — ') || 'none';
+    const tagPreview = [COVER.tagArtist, COVER.tagTitle].filter(Boolean).join(' — ') || [COVER.tagArtist, COVER.tagAlbum].filter(Boolean).join(' — ') || 'none';
+    const cqm = COVER.queryMode || 'auto';
+    const coverQuerySrcBar = '<div class="query-src-bar">'
+      + '<span class="muted small">Take Artist / Title from:</span>'
+      + '<div class="seg" role="group" aria-label="Take Artist and Title from">'
+      + '<button type="button" class="' + (cqm === 'auto' ? 'on' : '') + '" data-action="cover-query-mode" data-mode="auto"' + (COVER.loading ? ' disabled' : '') + ' title="Smart automatic: use metadata tags unless missing or totally different from folder/file name">Auto</button>'
+      + '<button type="button" class="' + (cqm === 'file' ? 'on' : '') + '" data-action="cover-query-mode" data-mode="file"' + (COVER.loading ? ' disabled' : '') + ' title="File: ' + esc(pathPreview) + '">From file</button>'
+      + '<button type="button" class="' + (cqm === 'metadata' ? 'on' : '') + '" data-action="cover-query-mode" data-mode="metadata"' + (COVER.loading ? ' disabled' : '') + ' title="Meta data: ' + esc(tagPreview) + '">From meta data</button>'
+      + '</div>'
+      + ((!COVER.loading || COVER.pathArtist || COVER.tagArtist || COVER.pathTitle || COVER.tagTitle)
+        ? '<span class="small muted query-src-preview"><span><strong>File:</strong> ' + esc(pathPreview) + '</span><span>·</span><span><strong>Meta data:</strong> ' + esc(tagPreview) + '</span></span>'
+        : '')
+      + '</div>';
+
+    const searchHtml = coverQuerySrcBar + '<div class="cover-search-grid">'
       + '<div class="field"><label class="lbl" for="cover-q-artist">Artist</label>'
       + '<input class="input" id="cover-q-artist" data-cover-input="artist" value="' + esc(COVER.artist) + '" placeholder="Artist"></div>'
       + '<div class="field"><label class="lbl" for="cover-q-album">Album</label>'
@@ -3584,6 +3692,7 @@
     COVER.album = '';
     COVER.title = '';
     COVER.source = (state.settings && state.settings.general && state.settings.general.coverSources) || 'both';
+    COVER.queryMode = (state.metadata && state.metadata.options && (state.metadata.options.search_from || state.metadata.options.searchFrom)) || COVER.queryMode || 'auto';
     COVER.querySource = 'tags';
     COVER.albumFileCount = 1;
     COVER.targetIds = o.targetIds || null;
@@ -3603,14 +3712,16 @@
     await runCoverModalSearch(false);
   }
 
-  async function runCoverModalSearch(force) {
+  async function runCoverModalSearch(force, explicitMode) {
     if (!COVER.open || !COVER.fileId) return;
+    if (explicitMode) COVER.queryMode = explicitMode;
     COVER.loading = true;
     COVER.error = '';
     renderCoverModal();
     try {
-      const body = { source: COVER.source, force: !!force };
-      if (force) {
+      const qm = COVER.queryMode || 'auto';
+      const body = { source: COVER.source, query_mode: qm, force: !!force };
+      if (force && !explicitMode) {
         body.artist = COVER.artist;
         body.album = COVER.album;
         body.title = COVER.title;
@@ -3623,6 +3734,7 @@
       COVER.artist = d.artist || '';
       COVER.album = d.album || '';
       COVER.title = d.title || '';
+      COVER.queryMode = d.query_mode || qm;
       COVER.querySource = d.query_source || 'tags';
       COVER.tagArtist = d.tag_artist || '';
       COVER.tagAlbum = d.tag_album || '';
@@ -3718,11 +3830,68 @@
   }
 
   /* --------------------------------------------------------- interaction */
-  const SAVE_ERR = (err) => toast(err.message);
+  const SAVE_ERR = (err) => {
+    if (err && err.name === 'AbortError') return;
+    toast(err.message);
+  };
 
   async function onAction(el) {
     const a = el.dataset.action;
     const t = state.media;
+
+    if (a === 'stop-current-action') {
+      if (stoppingAction) return;
+      stoppingAction = true;
+      showActivity();
+      try {
+        Array.from(activeApiControllers).forEach((c) => {
+          try { c.abort(); } catch (_err) { /* ignore */ }
+        });
+        activeApiControllers.clear();
+        if (metaCheckAbort) {
+          try { metaCheckAbort.abort(); } catch (_err) { /* ignore */ }
+          metaCheckAbort = null;
+        }
+        if (metaWatchTimer) {
+          clearInterval(metaWatchTimer);
+          metaWatchTimer = null;
+        }
+        const res = await api('/actions/stop', { method: 'POST' }).catch(() => ({ ok: true }));
+        state.busy = {};
+        state.metaChecking = false;
+        state.scanning = { audio: false, video: false };
+        if (state.metadata) state.metadata.meta_checking = false;
+        if (state.dash) {
+          state.dash.meta_checking = false;
+          state.dash.scanning = false;
+          state.dash.approved_pending = 0;
+        }
+        COVER.loading = false;
+        COVER.busy = false;
+        META_MODAL.loading = false;
+        META_MODAL.busy = false;
+        invalidate('metadata');
+        invalidate('dir:' + state.media);
+        invalidate('parked:' + state.media);
+        invalidate('coverParked');
+        state.browse.stale = true;
+        await refreshDash().catch(() => {});
+        if (currentRoute() === 'metadata') {
+          await loadKey('metadata').catch(() => {});
+        } else if (currentRoute() === 'directories' && state.browse && state.browse.rel) {
+          await loadBrowse(state.browse.rel, true).catch(() => {});
+        }
+        const stoppedList = (res && Array.isArray(res.stopped) && res.stopped.length)
+          ? ' (' + res.stopped.join(', ') + ')'
+          : '';
+        toast('Stopped current action' + stoppedList);
+      } finally {
+        stoppingAction = false;
+        showActivity();
+        render();
+      }
+      return;
+    }
 
     if (a === 'media') {
       state.media = el.dataset.media;
@@ -4110,6 +4279,19 @@
       await openCoverModal(fid, { scope: el.dataset.scope || 'file', targetIds: ids });
     } else if (a === 'cover-close') {
       closeCoverModal();
+    } else if (a === 'cover-query-mode') {
+      const mode = el.dataset.mode || 'auto';
+      COVER.queryMode = mode;
+      if (mode === 'file') {
+        COVER.artist = COVER.pathArtist || '';
+        COVER.album = COVER.pathAlbum || '';
+        COVER.title = COVER.pathTitle || '';
+      } else if (mode === 'metadata') {
+        COVER.artist = COVER.tagArtist || '';
+        COVER.album = COVER.tagAlbum || '';
+        COVER.title = COVER.tagTitle || '';
+      }
+      await runCoverModalSearch(false, mode);
     } else if (a === 'cover-search') {
       await runCoverModalSearch(true);
     } else if (a === 'cover-select-cand') {
@@ -4427,6 +4609,42 @@
       });
       await loadKey('metadata');
       render();
+    } else if (a === 'meta-opt-search-from') {
+      const mode = el.dataset.mode || 'auto';
+      const saved = await api('/metadata/options', { method: 'PUT', body: { searchFrom: mode } });
+      if (state.metadata) state.metadata.options = saved;
+      const modeLabels = { auto: 'Auto (smart)', file: 'From file (folder / file name)', metadata: 'From meta data (file tags)' };
+      toast('Artist / Title search source set to: ' + (modeLabels[mode] || mode));
+      renderPreservingMetaScroll();
+    } else if (a === 'meta-bulk-artist-title') {
+      const choice = el.dataset.choice || 'path';
+      const ids = state.metaSel.slice();
+      if (!ids.length) {
+        toast('Select one or more files in column 1 first');
+        return;
+      }
+      ensureMetaFieldsVisible(['artist', 'title']);
+      await api('/metadata/select', {
+        method: 'POST',
+        body: {
+          ids: ids,
+          values: {
+            artist: { choice: choice, value: '' },
+            title: { choice: choice, value: '' },
+          },
+        },
+      });
+      invalidate('metadata');
+      await loadKey('metadata');
+      const mNow = state.metadata || {};
+      const visAfter = filterAndSortMetaFiles(mNow.files || [], mNow.options || {});
+      const visSet = new Set(visAfter.map((f) => f.id));
+      if (!ids.some((id) => visSet.has(id)) && state.metaFilterStatus !== 'all') {
+        state.metaFilterStatus = 'all';
+      }
+      state.metaSel = ids.slice();
+      toast('Selected Artist & Title from ' + (choice === 'path' ? 'File (folder / file name)' : 'Meta data (current tags)') + ' on ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
+      render();
     } else if (a === 'meta-bulk-choice') {
       const choice = el.dataset.choice || 'online';
       const ids = state.metaSel.slice();
@@ -4510,6 +4728,20 @@
       await openMetaModal(fid, f ? { name: f.name, relpath: f.relpath, dir: f.dir } : {});
     } else if (a === 'meta-modal-close') {
       closeMetaModal();
+    } else if (a === 'meta-modal-query-mode') {
+      const mode = el.dataset.mode || 'auto';
+      META_MODAL.queryMode = mode;
+      const f = (META_MODAL.item && META_MODAL.item.fields) || {};
+      if (mode === 'file') {
+        META_MODAL.artist = (f.artist && f.artist.path) || '';
+        META_MODAL.album = (f.album && f.album.path) || '';
+        META_MODAL.title = (f.title && f.title.path) || '';
+      } else if (mode === 'metadata') {
+        META_MODAL.artist = (f.artist && f.artist.current) || '';
+        META_MODAL.album = (f.album && f.album.current) || '';
+        META_MODAL.title = (f.title && f.title.current) || '';
+      }
+      await runMetaModalCheck(false, mode);
     } else if (a === 'meta-modal-search') {
       await runMetaModalCheck(true);
     } else if (a === 'meta-modal-pick') {

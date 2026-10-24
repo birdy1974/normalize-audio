@@ -51,6 +51,8 @@ class Engine:
         self._scanning = 0                     # scans running (the periodic one and manual ones)
         self._inflight: dict[int, dict] = {}    # file id -> {future, relpath, media, approved}
         self._cancel: set[int] = set()
+        self._park_on_cancel: set[int] = set()  # approved files stopped by user -> return to 'parked'
+        self._action_gen = 0                    # bumped by stop_all_actions() to halt active batches/scans/tools
         self._had_work = False
         self._mode_seen: str | None = None     # the app mode (off / bulk / force / auto) last applied
         self._stop = threading.Event()
@@ -168,6 +170,11 @@ class Engine:
 
     def wake(self) -> None:
         self._wake.set()
+
+    def _new_cancel(self):
+        with self._lock:
+            gen = self._action_gen
+        return lambda: self._stop.is_set() or self._action_gen != gen
 
     def inflight_count(self) -> int:
         with self._lock:
@@ -290,6 +297,54 @@ class Engine:
         self.db.log("info", "Run stopped")
         self._wake.set()
 
+    def stop_all_actions(self) -> dict:
+        """Stop / kill any currently running action: normalization run, approved parked work,
+        metadata check, directory scan, batch checks/executions, and active ffmpeg/gain subprocesses."""
+        stopped_items: list[str] = []
+        with self._lock:
+            self._action_gen += 1
+            inflight_ids = list(self._inflight.keys())
+            for fid, item in self._inflight.items():
+                self._cancel.add(fid)
+                if item.get("approved"):
+                    self._park_on_cancel.add(fid)
+
+        if self.scanning():
+            stopped_items.append("folder scan")
+
+        with self._meta_lock:
+            meta_was_running = self._meta_checking
+        self._meta_stop.set()
+        if meta_was_running:
+            stopped_items.append("metadata check")
+
+        reverted_approved = self.db.execute("UPDATE files SET status = 'parked' WHERE status = 'approved'")
+        if reverted_approved:
+            stopped_items.append(f"{reverted_approved} queued parked file(s)")
+
+        run = state.get_run(self.db)
+        mode = self.mode()
+        if mode == "auto":
+            if run["mode"] == "active" and not run["paused"]:
+                state.set_run(self.db, paused=True)
+                stopped_items.append("automatic run (paused)")
+        else:
+            if run["mode"] == "active" or run["paused"]:
+                state.set_run(self.db, mode="stopped", paused=False)
+                stopped_items.append("normalization run")
+
+        if inflight_ids:
+            stopped_items.append(f"{len(inflight_ids)} active file task(s)")
+
+        killed = ff.kill_active_tools()
+        if killed and not inflight_ids:
+            stopped_items.append(f"{killed} audio tool process(es)")
+
+        self._wake.set()
+        summary = ", ".join(stopped_items) if stopped_items else "active request"
+        self.db.log("warn", f"Stopped current action ({summary})")
+        return {"ok": True, "stopped": stopped_items, "killed_processes": killed, "status": self.status()}
+
     def toggle_pause(self) -> None:
         run = state.get_run(self.db)
         if run["mode"] != "active":
@@ -373,17 +428,23 @@ class Engine:
             self._stop.wait(min(2.0, max(0.05, (due - self.now()).total_seconds())))
 
     def scan_now(self, media: str | None = None) -> dict:
+        cancel = self._new_cancel()
+        self.scanner.cancel_fn = cancel
         with self._scan_lock:
             self._scanning += 1
         try:
             if media:
-                return {media: self.scanner.scan(media)}
-            return self.scanner.scan_all()
+                res = {media: self.scanner.scan(media)}
+            else:
+                res = self.scanner.scan_all()
+            return res
         finally:
+            self.scanner.cancel_fn = None
             with self._scan_lock:
                 self._scanning -= 1
-            # a manual Rescan counts as a scan: the next automatic one starts a full interval later
-            state.set_run(self.db, lastScan=self.now().replace(microsecond=0).isoformat(timespec="seconds"))
+            if not cancel():
+                # a manual Rescan counts as a scan: the next automatic one starts a full interval later
+                state.set_run(self.db, lastScan=self.now().replace(microsecond=0).isoformat(timespec="seconds"))
 
     # ------------------------------------------------------------ scheduler
 
@@ -463,11 +524,12 @@ class Engine:
         with self._lock:
             self._inflight.pop(fid, None)
             self._cancel.discard(fid)
+            self._park_on_cancel.discard(fid)
         self._wake.set()
 
     # ------------------------------------------------------------ per-file work
 
-    def _process(self, fid: int) -> None:
+    def _process(self, fid: int, extra_cancel=None) -> None:
         row = self.db.one("SELECT * FROM files WHERE id = ?", (fid,))
         if row is None:
             return
@@ -476,7 +538,10 @@ class Engine:
         self.db.execute("UPDATE files SET status = 'processing', reason = NULL WHERE id = ?", (fid,))
 
         def cancel() -> bool:
-            return fid in self._cancel
+            if extra_cancel and extra_cancel():
+                return True
+            with self._lock:
+                return fid in self._cancel
 
         try:
             if prior == "approved":
@@ -484,9 +549,15 @@ class Engine:
             else:
                 self._check(row, cancel)
         except ff.Cancelled:
-            back = "approved" if prior == "approved" else "pending"
+            with self._lock:
+                park_back = fid in self._park_on_cancel or bool(extra_cancel and extra_cancel())
+                self._park_on_cancel.discard(fid)
+            if prior == "approved":
+                back = "parked" if park_back else "approved"
+            else:
+                back = "pending"
             self.db.execute("UPDATE files SET status = ? WHERE id = ?", (back, fid))
-            self.db.log("info", f"{name}: stopped at window end, back in the queue", media)
+            self.db.log("info", f"{name}: stopped, back in the queue" if back != "parked" else f"{name}: stopped, returned to parked", media)
         except Exception as exc:
             self.db.execute("UPDATE files SET status = 'error', reason = ? WHERE id = ?", (str(exc)[:300], fid))
             self.db.log("error", f"{name}: {exc}", media)
@@ -750,7 +821,8 @@ class Engine:
 
     def _edit_audio(self, src: str, media: str, rel: str, row: dict, fade_in: float, fade_out: float,
                     cut: tuple[float, float] | None, mode: str, preserve_mtime: bool) -> dict:
-        probe = ff.probe(self.cfg.ffmpeg, src)
+        cancel = self._new_cancel()
+        probe = ff.probe(self.cfg.ffmpeg, src, cancel)
         duration = probe.duration
         if not duration or duration <= 0.1:
             raise ValueError("this file is too short to edit")
@@ -778,8 +850,8 @@ class Engine:
         try:
             ff.edit(self.cfg.ffmpeg, src, tmp, probe_=probe, duration=duration,
                     cut=cut_range, fade_in=fade_in, fade_out=fade_out, new_duration=new_duration,
-                    kbps=probe.kbps)
-            ff.verify_edit(self.cfg.ffmpeg, tmp, probe, new_duration)
+                    kbps=probe.kbps, cancel=cancel)
+            ff.verify_edit(self.cfg.ffmpeg, tmp, probe, new_duration, cancel=cancel)
             self._commit(src, tmp, src, media, rel, mode, preserve_mtime)
         finally:
             if os.path.exists(tmp):
@@ -803,13 +875,14 @@ class Engine:
         return {"ok": True, "name": row["name"], "relpath": rel, "duration": round(new_duration, 3),
                 "size": st.st_size, "fade_in": fade_in, "fade_out": fade_out, "cut": list(cut_range or [])}
 
-    def measure(self, media: str, rel: str) -> dict:
+    def measure(self, media: str, rel: str, cancel=None) -> dict:
         """Level check for one file (baseline). The file is only read."""
         src = self.abs_path(media, rel)
         if not os.path.isfile(src):
             raise ValueError("file not found")
+        cancel = cancel or self._new_cancel()
         st = state.get_settings(self.db)
-        lufs, true_peak, probe, cuts = self._measure_and_detect(media, src, st["general"], None)
+        lufs, true_peak, probe, cuts = self._measure_and_detect(media, src, st["general"], cancel)
         name = os.path.basename(rel)
         cfg_m = st[media]
         family = audio_family(probe.codec)
@@ -858,27 +931,43 @@ class Engine:
 
     def check_files(self, media: str, ids: list[int] | None = None, dir_rel: str | None = None) -> dict:
         """Check level and empty sections for the selected files (or all files in dir_rel)."""
+        cancel = self._new_cancel()
         rows = self._target_rows(media, ids, dir_rel)
         checked = 0
         empty = 0
+        stopped = False
         for r in rows:
+            if cancel():
+                stopped = True
+                break
             if r["status"] == "processing":
                 continue
             try:
-                res = self.measure(media, r["relpath"])
+                res = self.measure(media, r["relpath"], cancel=cancel)
                 checked += 1
                 if res.get("silent_sections", 0) > 0:
                     empty += 1
+            except ff.Cancelled:
+                stopped = True
+                break
             except Exception as exc:
                 self.db.log("error", f"{r['name']}: {exc}", media)
-        return {"checked": checked, "empty_sections": empty}
+        out = {"checked": checked, "empty_sections": empty}
+        if stopped:
+            out["stopped"] = True
+        return out
 
     def execute_files(self, media: str, ids: list[int] | None = None, dir_rel: str | None = None) -> dict:
         """Execute normalization (and empty-section removal when enabled) on the selected files."""
+        cancel = self._new_cancel()
         rows = self._target_rows(media, ids, dir_rel)
         executed = 0
         changed = 0
+        stopped = False
         for r in rows:
+            if cancel():
+                stopped = True
+                break
             if r["status"] == "processing":
                 continue
             fid = r["id"]
@@ -886,12 +975,18 @@ class Engine:
                 self.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
             else:
                 self.db.execute("UPDATE files SET status = 'pending' WHERE id = ?", (fid,))
-            self._process(fid)
+            self._process(fid, extra_cancel=cancel)
+            if cancel():
+                stopped = True
+                break
             executed += 1
             after = self.db.one("SELECT status FROM files WHERE id = ?", (fid,))
             if after and after["status"] == "changed":
                 changed += 1
-        return {"executed": executed, "changed": changed}
+        out = {"executed": executed, "changed": changed}
+        if stopped:
+            out["stopped"] = True
+        return out
 
     # ------------------------------------------------------------ cover art
 
@@ -1026,22 +1121,44 @@ class Engine:
 
     def search_file_covers(self, fid: int, *, artist: str | None = None, album: str | None = None,
                            title: str | None = None, source_mode: str | None = None,
-                           force_refresh: bool = False) -> dict:
+                           query_mode: str | None = None, force_refresh: bool = False) -> dict:
         """Interactive cover search for a file or album (used by the Cover Picker modal)."""
         row = self.db.one("SELECT * FROM files WHERE id = ?", (fid,))
         if not row or row["media"] != "audio":
             raise ValueError("audio file not found")
+        src = self.abs_path("audio", row["relpath"])
         inspected = self.inspect_file_cover(row)
-        q_artist = inspected["artist"] if artist is None else artist.strip()
-        q_album = inspected["album"] if album is None else album.strip()
-        q_title = inspected["title"] if title is None else title.strip()
+        raw_info = cover.inspect_audio(src)
+        meta_artist = cover._clean_str(raw_info.get("artist") or raw_info.get("album_artist")) or inspected["tag_artist"]
+        meta_album = cover._clean_str(raw_info.get("album")) or inspected["tag_album"]
+        meta_title = cover._clean_str(raw_info.get("title")) or inspected["tag_title"]
+
+        eff_mode = query_mode if query_mode in ("auto", "file", "metadata") else "auto"
+        if eff_mode == "file":
+            base_artist = inspected["path_artist"]
+            base_album = inspected["path_album"]
+            base_title = inspected["path_title"]
+            eff_query_source = "file"
+        elif eff_mode == "metadata":
+            base_artist = meta_artist
+            base_album = meta_album
+            base_title = meta_title
+            eff_query_source = "metadata"
+        else:
+            base_artist = inspected["artist"]
+            base_album = inspected["album"]
+            base_title = inspected["title"]
+            eff_query_source = inspected["source"]
+
+        q_artist = base_artist if artist is None else artist.strip()
+        q_album = base_album if album is None else album.strip()
+        q_title = base_title if title is None else title.strip()
 
         st = state.get_settings(self.db)
         if source_mode in ("both", "discogs", "open"):
             st = {**st, "general": {**st["general"], "coverSources": source_mode}}
 
         candidates = []
-        src = self.abs_path("audio", row["relpath"])
         local = cover.find_local_cover(src)
         if local:
             candidates.append(local)
@@ -1055,8 +1172,8 @@ class Engine:
         if not inspected["has_cover"]:
             new_status = "choices" if len(candidates) > 1 else ("not_found" if not candidates else row.get("cover_status") or "missing")
             self.db.execute(
-                "UPDATE files SET cover_status = ?, cover_candidates = ?, tag_artist = ?, tag_album = ?, tag_title = ? WHERE id = ?",
-                (new_status, json.dumps(candidates) if candidates else "[]", q_artist, q_album, q_title, fid),
+                "UPDATE files SET cover_status = ?, cover_candidates = ?, tag_artist = ?, tag_album = ?, tag_title = ?, cover_query_source = ? WHERE id = ?",
+                (new_status, json.dumps(candidates) if candidates else "[]", q_artist, q_album, q_title, eff_query_source, fid),
             )
         # Count how many files belong to the same album/folder for the "Apply to album" button
         album_rows = self._album_rows_for(row, q_album)
@@ -1071,10 +1188,11 @@ class Engine:
             "artist": q_artist,
             "album": q_album,
             "title": q_title,
-            "query_source": inspected["source"],
-            "tag_artist": inspected["tag_artist"],
-            "tag_album": inspected["tag_album"],
-            "tag_title": inspected["tag_title"],
+            "query_mode": eff_mode,
+            "query_source": eff_query_source,
+            "tag_artist": meta_artist,
+            "tag_album": meta_album,
+            "tag_title": meta_title,
             "path_artist": inspected["path_artist"],
             "path_album": inspected["path_album"],
             "path_title": inspected["path_title"],
@@ -1166,7 +1284,12 @@ class Engine:
             rows = []
 
         checked = embedded = choices = not_found = present = 0
+        cancel = self._new_cancel()
+        stopped = False
         for r in rows:
+            if cancel():
+                stopped = True
+                break
             if r["status"] == "processing":
                 continue
             try:
@@ -1189,6 +1312,7 @@ class Engine:
             "embedded": embedded,
             "choices": choices,
             "not_found": not_found,
+            "stopped": stopped,
         }
 
     def apply_first_cover_all(self, ids: list[int] | None = None) -> dict:
@@ -1209,7 +1333,12 @@ class Engine:
             raise ValueError("Dry run is on: turn it off in Settings to write cover art")
         downloaded: dict[str, tuple[bytes, str]] = {}
         updated = 0
+        cancel = self._new_cancel()
+        stopped = False
         for r in rows:
+            if cancel():
+                stopped = True
+                break
             if r["status"] == "processing":
                 continue
             try:
@@ -1298,7 +1427,7 @@ class Engine:
 
     def check_file_metadata(self, row: dict, options: dict | None = None, st: dict | None = None, *,
                             force_refresh: bool = False, custom_query: dict | None = None,
-                            cancel=None) -> dict:
+                            query_mode: str | None = None, cancel=None) -> dict:
         """Check all enabled metadata fields for one audio file against folder/file name and internet sources."""
         if row.get("media", "audio") != "audio":
             raise ValueError("metadata checking is available for audio files only")
@@ -1316,9 +1445,26 @@ class Engine:
             path_meta["cover"] = local_cov["image_url"]
         resolved = cover.resolve_search_metadata(row["relpath"], current)
 
-        q_artist = (custom_query.get("artist") if custom_query and "artist" in custom_query else resolved["artist"]) or ""
-        q_album = (custom_query.get("album") if custom_query and "album" in custom_query else resolved["album"]) or ""
-        q_title = (custom_query.get("title") if custom_query and "title" in custom_query else resolved["title"]) or ""
+        eff_mode = query_mode if query_mode in ("auto", "file", "metadata") else (opts.get("search_from") or "auto")
+        if eff_mode == "file":
+            base_artist = path_meta.get("artist") or ""
+            base_album = path_meta.get("album") or ""
+            base_title = path_meta.get("title") or ""
+            q_src = "file"
+        elif eff_mode == "metadata":
+            base_artist = current.get("artist") or current.get("album_artist") or ""
+            base_album = current.get("album") or ""
+            base_title = current.get("title") or ""
+            q_src = "metadata"
+        else:
+            base_artist = resolved["artist"] or ""
+            base_album = resolved["album"] or ""
+            base_title = resolved["title"] or ""
+            q_src = resolved["source"]
+
+        q_artist = (custom_query.get("artist") if custom_query and "artist" in custom_query else base_artist) or ""
+        q_album = (custom_query.get("album") if custom_query and "album" in custom_query else base_album) or ""
+        q_title = (custom_query.get("title") if custom_query and "title" in custom_query else base_title) or ""
         q_track = path_meta.get("track") or current.get("track") or ""
 
         lookup_kwargs: dict = {"db": self.db, "force_refresh": force_refresh}
@@ -1356,7 +1502,7 @@ class Engine:
         has_cov = 1 if current.get("cover") == "present" else 0
         self.db.execute(
             "UPDATE files SET has_cover = ?, tag_artist = ?, tag_album = ?, tag_title = ?, cover_query_source = ? WHERE id = ?",
-            (has_cov, resolved["artist"], resolved["album"], resolved["title"], resolved["source"], row["id"]),
+            (has_cov, q_artist or resolved["artist"], q_album or resolved["album"], q_title or resolved["title"], q_src, row["id"]),
         )
         album_rows = self._album_rows_for(row, q_album)
         return {
@@ -1373,7 +1519,8 @@ class Engine:
             "path_diff": bool(cmp["path_diff"]),
             "path_diff_count": len(cmp["path_mismatches"]),
             "path_mismatches": cmp["path_mismatches"],
-            "query_source": resolved["source"],
+            "query_source": q_src,
+            "query_mode": eff_mode,
             "online_source": online_meta.get("source") or "",
             "online_score": online_meta.get("score") or 0,
             "current": current,
@@ -1429,7 +1576,13 @@ class Engine:
                 "WHERE d.media = 'audio' AND d.enabled = 1 ORDER BY f.dir, f.name"
             )
             if not force:
-                unchecked_rows = [r for r in all_rows if not r.get("_meta_status") or r.get("_meta_status") == "unchecked"]
+                sf = opts.get("search_from") or "auto"
+                unchecked_rows = [
+                    r for r in all_rows
+                    if not r.get("_meta_status")
+                    or r.get("_meta_status") == "unchecked"
+                    or (sf in ("file", "metadata") and r.get("cover_query_source") != sf)
+                ]
                 rows = unchecked_rows if unchecked_rows else all_rows
             else:
                 rows = all_rows
@@ -1692,8 +1845,11 @@ class Engine:
         updated = 0
         unchanged = 0
         errors: list[str] = []
+        cancel = self._new_cancel()
 
         for idx, r in enumerate(rows):
+            if cancel():
+                break
             if r["status"] == "processing":
                 continue
             src = self.abs_path("audio", r["relpath"])

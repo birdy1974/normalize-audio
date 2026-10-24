@@ -635,4 +635,73 @@ def test_ui_source_buttons_selected_count_and_invert_button_markup():
     assert 'VOLUME ["/config"]' in docker_txt
 
 
+def test_metadata_tab_and_popup_artist_title_from_file_or_metadata(client, cfg, monkeypatch):
+    """Meta data tab (options + batch check) and per-file popup can take Artist / Title from file or from metadata."""
+    from mutagen.id3 import ID3, TALB, TIT2, TPE1
+    from app import metadata
+
+    folder = os.path.join(cfg.audio_root, "PathBand", "PathRecord")
+    p = tone(os.path.join(folder, "02 - PathSong.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    tags = ID3()
+    tags.add(TPE1(encoding=3, text=["MetaBand"]))
+    tags.add(TALB(encoding=3, text=["MetaRecord"]))
+    tags.add(TIT2(encoding=3, text=["MetaSong"]))
+    tags.save(p)
+
+    seen = []
+
+    def fake_lookup(artist, album, title, track="", options=None, settings=None, **kwargs):
+        seen.append((artist, album, title))
+        return {
+            "source": "Discogs",
+            "score": 0.95,
+            "artist": artist,
+            "album": album,
+            "title": title,
+            "by_source": {"discogs": {"artist": artist, "album": album, "title": title, "score": 0.95}},
+        }
+
+    monkeypatch.setattr(metadata, "lookup_online_metadata", fake_lookup)
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    assert client.post("/api/folders/toggle", json={"media": "audio", "relpath": "PathBand/PathRecord", "enabled": True}).status_code == 200
+    fid = client.get("/api/files", params={"media": "audio", "dir": "PathBand/PathRecord"}).json()["files"][0]["id"]
+
+    # 1. Persistent Meta data tab option: searchFrom = "metadata"
+    opt_res = client.put("/api/metadata/options", json={"searchFrom": "metadata"}).json()
+    assert opt_res["search_from"] == "metadata"
+    assert client.post("/api/metadata/check", json={"force": False}).status_code == 200
+    assert seen[-1] == ("MetaBand", "MetaRecord", "MetaSong")
+
+    # 2. Switch persistent Meta data tab option to "file" and run check (without force) -> re-queries using folder/file name!
+    opt_res2 = client.put("/api/metadata/options", json={"searchFrom": "file"}).json()
+    assert opt_res2["search_from"] == "file"
+    assert client.post("/api/metadata/check", json={"force": False}).status_code == 200
+    assert seen[-1] == ("PathBand", "PathRecord", "PathSong")
+
+    # 3. Per-file Meta data popup explicit query_mode override ("metadata" vs "file")
+    pop_meta = client.post(f"/api/files/{fid}/metadata/check", json={"query_mode": "metadata"}).json()
+    assert pop_meta["query_mode"] == "metadata"
+    assert pop_meta["query_source"] == "metadata"
+    assert seen[-1] == ("MetaBand", "MetaRecord", "MetaSong")
+
+    pop_file = client.post(f"/api/files/{fid}/metadata/check", json={"query_mode": "file"}).json()
+    assert pop_file["query_mode"] == "file"
+    assert pop_file["query_source"] == "file"
+    assert seen[-1] == ("PathBand", "PathRecord", "PathSong")
+
+    # 4. Verify UI buttons exist in static/app.js for Cover popup, Meta data tab, and Meta data popup
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as fh:
+        js = fh.read()
+    for token in (
+        'data-action="cover-query-mode"',
+        'data-action="meta-opt-search-from"',
+        'data-action="meta-bulk-artist-title"',
+        'data-action="meta-modal-query-mode"',
+    ):
+        assert token in js
+
+
+
 

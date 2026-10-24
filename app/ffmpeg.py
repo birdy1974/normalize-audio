@@ -25,24 +25,70 @@ class Cancelled(RuntimeError):
     """The run was stopped or paused while the tool was working."""
 
 
+_procs_lock = threading.Lock()
+_active_procs: set[subprocess.Popen] = set()
+_killed_procs: set[int] = set()
+
+
+def register_proc(proc: subprocess.Popen) -> None:
+    with _procs_lock:
+        _active_procs.add(proc)
+
+
+def unregister_proc(proc: subprocess.Popen) -> None:
+    with _procs_lock:
+        _active_procs.discard(proc)
+        _killed_procs.discard(id(proc))
+
+
+def was_killed(proc: subprocess.Popen) -> bool:
+    with _procs_lock:
+        return id(proc) in _killed_procs
+
+
+def kill_active_tools() -> int:
+    """Immediately kill all currently running ffmpeg / mp3gain / aacgain subprocesses."""
+    with _procs_lock:
+        procs = list(_active_procs)
+        for proc in procs:
+            _killed_procs.add(id(proc))
+    killed = 0
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                killed += 1
+        except OSError:
+            pass
+    return killed
+
+
 def run_tool(cmd: list[str], cancel: Cancel = None, timeout: float = 4 * 3600) -> tuple[int, str]:
-    """Run a command, return (exit code, stderr). Kills it when cancel() becomes true."""
+    """Run a command, return (exit code, stderr). Kills it when cancel() becomes true or kill_active_tools() runs."""
+    if cancel and cancel():
+        raise Cancelled()
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE, text=True, errors="replace")
+    register_proc(proc)
     started = time.monotonic()
-    while True:
-        try:
-            _, err = proc.communicate(timeout=0.5)
-            return proc.returncode, err or ""
-        except subprocess.TimeoutExpired:
-            if cancel and cancel():
-                proc.kill()
-                proc.communicate()
-                raise Cancelled()
-            if time.monotonic() - started > timeout:
-                proc.kill()
-                proc.communicate()
-                raise ToolError("timed out")
+    try:
+        while True:
+            try:
+                _, err = proc.communicate(timeout=0.2)
+                if was_killed(proc) or (cancel and cancel()):
+                    raise Cancelled()
+                return proc.returncode, err or ""
+            except subprocess.TimeoutExpired:
+                if was_killed(proc) or (cancel and cancel()):
+                    proc.kill()
+                    proc.communicate()
+                    raise Cancelled()
+                if time.monotonic() - started > timeout:
+                    proc.kill()
+                    proc.communicate()
+                    raise ToolError("timed out")
+    finally:
+        unregister_proc(proc)
 
 
 def _tail(text: str, n: int = 3) -> str:
