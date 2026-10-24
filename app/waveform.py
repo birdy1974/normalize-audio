@@ -160,6 +160,7 @@ def _decode(ffmpeg_bin: str, path: str, start: float, window: float,
     hi = [0] * buckets
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
+    ff.register_proc(proc)
     killed = threading.Event()
 
     def stop() -> None:
@@ -174,10 +175,14 @@ def _decode(ffmpeg_bin: str, path: str, start: float, window: float,
     watchdog.start()
     index = 0
     rest = b""
+    user_killed = False
     try:
         while True:
             chunk = proc.stdout.read(65536)
             if not chunk:
+                break
+            if ff.was_killed(proc):
+                user_killed = True
                 break
             data = rest + chunk
             usable = len(data) - (len(data) % 2)
@@ -205,6 +210,8 @@ def _decode(ffmpeg_bin: str, path: str, start: float, window: float,
                 index += take
         rc = proc.wait()
         err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        if ff.was_killed(proc):
+            user_killed = True
     finally:
         watchdog.cancel()
         if proc.poll() is None:
@@ -213,6 +220,9 @@ def _decode(ffmpeg_bin: str, path: str, start: float, window: float,
         for stream in (proc.stdout, proc.stderr):
             if stream:
                 stream.close()
+        ff.unregister_proc(proc)
+    if user_killed:
+        raise ff.Cancelled()
     if killed.is_set():
         raise ff.ToolError("reading the levels took too long")
     if rc != 0:

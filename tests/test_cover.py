@@ -378,3 +378,44 @@ def test_cover_apply_syncs_file_metadata_table_and_local_cover_endpoint(client, 
     assert client.get(f"/api/files/{fid}/cover").content == FAKE_PNG
 
 
+def test_cover_search_query_mode_file_vs_metadata(client, cfg, monkeypatch):
+    """Cover Picker popup can explicitly take Artist / Title from file name or from embedded metadata tags."""
+    from mutagen.id3 import ID3, TALB, TIT2, TPE1
+
+    folder = os.path.join(cfg.audio_root, "FolderArtist", "FolderAlbum")
+    p = tone(os.path.join(folder, "01 - FolderTitle.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    tags = ID3()
+    tags.add(TPE1(encoding=3, text=["TagArtist"]))
+    tags.add(TALB(encoding=3, text=["TagAlbum"]))
+    tags.add(TIT2(encoding=3, text=["TagTitle"]))
+    tags.save(p)
+
+    seen_queries = []
+
+    def fake_search_covers(artist, album, title, st, db=None, force_refresh=False):
+        seen_queries.append((artist, album, title))
+        return [{"source": "Open", "title": f"{artist} - {title}", "year": "2024", "image_url": "https://img/1.jpg", "thumb_url": "https://img/1.jpg"}]
+
+    monkeypatch.setattr(cover, "search_covers", fake_search_covers)
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    fid = client.get("/api/files", params={"media": "audio", "dir": "FolderArtist/FolderAlbum"}).json()["files"][0]["id"]
+
+    # Explicit "file" mode takes artist/album/title from folder/file name
+    r_file = client.post(f"/api/files/{fid}/cover/search", json={"query_mode": "file"}).json()
+    assert r_file["query_mode"] == "file"
+    assert r_file["query_source"] == "file"
+    assert (r_file["artist"], r_file["album"], r_file["title"]) == ("FolderArtist", "FolderAlbum", "FolderTitle")
+    assert seen_queries[-1] == ("FolderArtist", "FolderAlbum", "FolderTitle")
+
+    # Explicit "metadata" mode takes artist/album/title from embedded ID3 tags even when totally different from path
+    r_meta = client.post(f"/api/files/{fid}/cover/search", json={"query_mode": "metadata"}).json()
+    assert r_meta["query_mode"] == "metadata"
+    assert r_meta["query_source"] == "metadata"
+    assert (r_meta["artist"], r_meta["album"], r_meta["title"]) == ("TagArtist", "TagAlbum", "TagTitle")
+    assert seen_queries[-1] == ("TagArtist", "TagAlbum", "TagTitle")
+    assert (r_meta["path_artist"], r_meta["path_title"]) == ("FolderArtist", "FolderTitle")
+    assert (r_meta["tag_artist"], r_meta["tag_title"]) == ("TagArtist", "TagTitle")
+
+
+

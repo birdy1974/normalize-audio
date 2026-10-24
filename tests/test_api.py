@@ -744,3 +744,66 @@ def test_internal_databases_persist_across_restarts(cfg):
         assert wf2.status_code == 200
         assert wf2.json() == peaks_first
 
+
+def test_stop_current_action_endpoint_and_sidebar_stop_button(client, cfg):
+    import sys
+    from app import ffmpeg as ff
+
+    _scan_library(cfg, client)
+    db = client.app_state.db
+
+    # Park a file and approve it, and start a bulk run
+    fid = _park(client, client.app_state, "a.flac", 8.0)
+    assert client.post(f"/api/parked/{fid}/approve").status_code == 200
+    assert client.post("/api/run/start").status_code == 200
+    assert db.one("SELECT status FROM files WHERE id = ?", (fid,))["status"] == "approved"
+
+    # Also launch a long-running tool subprocess via run_tool in a worker thread
+    tool_started = threading.Event()
+    tool_result: list[str] = []
+
+    def run_slow_tool():
+        proc_cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        tool_started.set()
+        try:
+            ff.run_tool(proc_cmd)
+            tool_result.append("finished")
+        except ff.Cancelled:
+            tool_result.append("cancelled")
+
+    worker = threading.Thread(target=run_slow_tool, daemon=True)
+    worker.start()
+    assert tool_started.wait(timeout=3.0)
+    # Wait briefly until subprocess is registered in ff._active_procs
+    for _ in range(40):
+        with ff._procs_lock:
+            if ff._active_procs:
+                break
+        time.sleep(0.02)
+
+    resp = client.post("/api/actions/stop")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["killed_processes"] >= 1
+    assert data["status"] == "stopped"
+
+    worker.join(timeout=3.0)
+    assert not worker.is_alive()
+    assert tool_result == ["cancelled"]
+
+    # Approved file was reverted cleanly back to parked so it won't auto-run again
+    assert db.one("SELECT status FROM files WHERE id = ?", (fid,))["status"] == "parked"
+
+    # Verify left-menu bottom Stop button markup & JS wiring
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "index.html"), "r", encoding="utf-8") as hf:
+        html_txt = hf.read()
+    assert 'id="activity-stop"' in html_txt
+    assert 'data-action="stop-current-action"' in html_txt
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as jf:
+        js_txt = jf.read()
+    assert "a === 'stop-current-action'" in js_txt
+    assert "'/actions/stop'" in js_txt
+
+

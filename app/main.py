@@ -49,6 +49,10 @@ def create_app(cfg: Config | None = None, start_threads: bool = True) -> FastAPI
     async def _file_busy(_req: Request, exc: FileBusy):
         return JSONResponse({"detail": str(exc)}, status_code=409)
 
+    @app.exception_handler(ff.Cancelled)
+    async def _cancelled(_req: Request, _exc: ff.Cancelled):
+        return JSONResponse({"detail": "Action stopped", "stopped": True}, status_code=499)
+
     app.mount("/static", StaticFiles(directory=cfg.static_dir), name="static")
 
     index = os.path.join(cfg.static_dir, "index.html")

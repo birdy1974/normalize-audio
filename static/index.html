@@ -10,7 +10,7 @@
   <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
   <link rel="manifest" href="/static/site.webmanifest">
   <meta name="theme-color" content="#2f3130">
-  <link rel="stylesheet" href="/static/styles.css?v=21">
+  <link rel="stylesheet" href="/static/styles.css?v=23">
 </head>
 <body>
   <div class="app">
@@ -38,6 +38,10 @@
       <div class="sidebar-activity" id="activity" title="What the app is doing now">
         <span class="dot activity-dot"></span>
         <span class="activity-text"><strong id="activity-main" role="status" aria-live="polite"></strong><span class="activity-sub" id="activity-sub" aria-live="off"></span></span>
+        <button type="button" class="activity-stop-btn" id="activity-stop" data-action="stop-current-action" disabled aria-label="Stop current action" title="Nothing running right now">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>
+          <span class="activity-stop-label">Stop</span>
+        </button>
       </div>
       <div class="sidebar-foot">Audio Normalizer · local network only</div>
     </aside>
@@ -155,6 +159,6 @@
   </button>
   <div id="toast" class="toast" role="status"></div>
   <script src="/static/audio-normalizer-card.js?v=7"></script>
-  <script src="/static/app.js?v=28"></script>
+  <script src="/static/app.js?v=30"></script>
 </body>
 </html>
