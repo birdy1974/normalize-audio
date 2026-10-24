@@ -807,3 +807,57 @@ def test_stop_current_action_endpoint_and_sidebar_stop_button(client, cfg):
     assert "'/actions/stop'" in js_txt
 
 
+def test_dashboard_duty_progress_bar_pct_and_counts_across_actions(client, cfg, monkeypatch):
+    """Duty indicator (#activity) and /api/dashboard expose done/total, percentage, and progress bar for actions."""
+    import threading
+    from app import ffmpeg as ff
+
+    _scan_library(cfg, client)
+    eng = client.app_state.engine
+
+    dash = client.get("/api/dashboard").json()
+    for key in ("progress_done", "progress_total", "approved_done", "approved_total", "action_progress", "search_from"):
+        assert key in dash
+
+    # Observe live action_progress mid-flight during check_files
+    mid_snapshots: list[dict] = []
+    orig_analyze = ff.analyze_audio
+
+    def hooked_analyze(*args, **kwargs):
+        snap = eng.get_action_progress()
+        if snap and snap.get("active"):
+            mid_snapshots.append(snap)
+        return orig_analyze(*args, **kwargs)
+
+    monkeypatch.setattr(ff, "analyze_audio", hooked_analyze)
+    files_in_old = client.get("/api/files", params={"media": "audio", "dir": "Old"}).json()["files"]
+    ids = [f["id"] for f in files_in_old]
+    res = client.post("/api/files/check-batch", json={"media": "audio", "ids": ids, "dir": "Old"})
+    assert res.status_code == 200
+    assert mid_snapshots, "Expected live action_progress during check-batch"
+    assert mid_snapshots[0]["total"] == len(ids)
+    assert eng.get_action_progress()["active"] is False  # cleared once finished
+
+    # Verify approved parked batch progress tracking
+    fid = _park(client, client.app_state, "a.flac", 8.0)
+    eng.note_approved(1)
+    ap_done, ap_total = eng.approved_progress(1)
+    assert (ap_done, ap_total) == (0, 1)
+    ap_done_after, ap_total_after = eng.approved_progress(0)
+    assert (ap_done_after, ap_total_after) == (0, 0)
+
+    # Verify UI markup for progress bar, percentage, and current/total count in #activity
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "index.html"), "r", encoding="utf-8") as hf:
+        html_txt = hf.read()
+    for elem_id in (
+        'id="activity-progress-wrap"',
+        'id="activity-progress-count"',
+        'id="activity-progress-pct"',
+        'id="activity-progress-bar"',
+        'id="activity-progress-fill"',
+    ):
+        assert elem_id in html_txt
+
+
+

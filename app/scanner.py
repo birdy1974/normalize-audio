@@ -26,9 +26,11 @@ class Scanner:
         self.cfg = cfg
         self.db = db
         self.cancel_fn = None
+        self.progress_fn = None
 
     def scan(self, media: str, cancel=None) -> dict:
         cancel = cancel or self.cancel_fn
+        progress_fn = self.progress_fn
         root = self.cfg.root(media)
         if not os.path.isdir(root):
             self.db.log("error", f"{root} is not available. Check the volume mount in docker-compose.yml.", media)
@@ -38,6 +40,14 @@ class Scanner:
         files: dict[str, tuple] = {}   # file relpath -> (dir, name, ext)
         wanted = EXTENSIONS[media]
         skipped = 0
+        try:
+            top_entries = [e for e in os.listdir(root) if not e.startswith(SKIP_PREFIXES)]
+        except OSError:
+            top_entries = []
+        est_total = max(1, len(top_entries) + 1)
+        walked_top = 0
+        if progress_fn:
+            progress_fn(0, est_total, "")
         for dirpath, dirnames, filenames in os.walk(root):
             if cancel and cancel():
                 self.db.log("warn", f"Scan stopped for {media}", media)
@@ -55,6 +65,10 @@ class Scanner:
             here = os.path.relpath(dirpath, root).replace(os.sep, "/")
             if here == ".":
                 here = "."
+            elif "/" not in here:
+                walked_top += 1
+                if progress_fn:
+                    progress_fn(min(walked_top, est_total - 1), est_total, here)
             for d in dirnames:
                 child = d if here == "." else f"{here}/{d}"
                 dirs[child] = here
@@ -69,6 +83,10 @@ class Scanner:
                     continue
                 rel = name if here == "." else f"{here}/{name}"
                 files[rel] = (here, name, ext)
+
+        total_sync = max(1, len(files))
+        if progress_fn:
+            progress_fn(0, total_sync, "")
 
         new = removed = 0
         with self.db.tx():
@@ -105,6 +123,9 @@ class Scanner:
             gone = [k for k in known if k != ROOT_KEY and k not in dirs]
             for k in gone:
                 self.db.execute("DELETE FROM dirs WHERE media = ? AND relpath = ?", (media, k))
+
+        if progress_fn:
+            progress_fn(total_sync, total_sync, "")
 
         if new or removed:
             parts = []

@@ -828,7 +828,7 @@ def compare_file_metadata(
     for f in METADATA_FIELDS:
         is_enabled = enabled_fields.get(f, True)
         c_val = (cur.get(f) or "").strip()
-        p_val = (p_meta.get(f) or "").strip() if check_path else ""
+        p_val = (p_meta.get(f) or "").strip()
         d_val = (by_src["discogs"].get(f) or "").strip() if enabled_sources.get("discogs", True) else ""
         m_val = (by_src["musicbrainz"].get(f) or "").strip() if enabled_sources.get("musicbrainz", True) else ""
         i_val = (by_src["open"].get(f) or "").strip() if enabled_sources.get("open", True) else ""
