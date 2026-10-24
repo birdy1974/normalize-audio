@@ -418,4 +418,79 @@ def test_cover_search_query_mode_file_vs_metadata(client, cfg, monkeypatch):
     assert (r_meta["tag_artist"], r_meta["tag_title"]) == ("TagArtist", "TagTitle")
 
 
+def test_cover_modal_buttons_hover_zoom_and_global_search_from(client, cfg, monkeypatch):
+    """Verify:
+    1) Cover modal 'Use for file' is green (btn-primary) and 'Use for album' is white (btn without btn-primary).
+    2) Cover hover zoom preview tooltip markup & JS handlers exist and modals ignore outside backdrop clicks.
+    3) Global 'Take Artist / Title from' setting (exposed in Directories files pane) drives cover search & batch cover check.
+    """
+    import re
+    from mutagen.id3 import ID3, TALB, TIT2, TPE1
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "index.html"), "r", encoding="utf-8") as hf:
+        html_txt = hf.read()
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as jf:
+        js_txt = jf.read()
+    with open(os.path.join(root, "static", "styles.css"), "r", encoding="utf-8") as cf:
+        css_txt = cf.read()
+
+    # 1. Button colors in cover-modal
+    m_file = re.search(r'<button[^>]*id="cover-apply-file"[^>]*>', html_txt)
+    m_album = re.search(r'<button[^>]*id="cover-apply-album"[^>]*>', html_txt)
+    assert m_file and "btn-primary" in m_file.group(0)
+    assert m_album and "btn-primary" not in m_album.group(0)
+
+    # 2. Cover hover zoom preview & no outside-click modal dismissal
+    assert 'id="cover-zoom-tip"' in html_txt
+    assert 'id="cover-zoom-img"' in html_txt
+    assert ".cover-zoom-tip" in css_txt
+    assert "findCoverZoomTarget" in js_txt
+    assert "data-cover-zoom=" in js_txt
+    assert "if (ev.target === modal) closeEditor()" not in js_txt
+    assert "if (ev.target === coverModalEl) closeCoverModal()" not in js_txt
+    assert "if (ev.target === metaModalEl) closeMetaModal()" not in js_txt
+
+    # 3. Directories files-pane header setting + global search_from honored by cover check & cover search
+    assert "renderFilesPaneSearchSourceBar" in js_txt
+    folder = os.path.join(cfg.audio_root, "DirBand", "DirAlbum")
+    p = tone(os.path.join(folder, "01 - DirTrack.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    tags = ID3()
+    tags.add(TPE1(encoding=3, text=["Id3Band"]))
+    tags.add(TALB(encoding=3, text=["Id3Album"]))
+    tags.add(TIT2(encoding=3, text=["Id3Track"]))
+    tags.save(p)
+
+    seen_queries = []
+
+    def fake_search_covers(artist, album, title, st, db=None, force_refresh=False):
+        seen_queries.append((artist, album, title))
+        return [
+            {"source": "Discogs", "title": "Opt 1", "year": "2020", "image_url": "https://img/a.jpg", "thumb_url": "https://img/a.jpg"},
+            {"source": "Open", "title": "Opt 2", "year": "2020", "image_url": "https://img/b.jpg", "thumb_url": "https://img/b.jpg"},
+        ]
+
+    monkeypatch.setattr(cover, "search_covers", fake_search_covers)
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    fid = client.get("/api/files", params={"media": "audio", "dir": "DirBand/DirAlbum"}).json()["files"][0]["id"]
+
+    # Set global searchFrom = "metadata" -> dashboard reports it, cover search & batch cover check honor it
+    assert client.put("/api/metadata/options", json={"searchFrom": "metadata"}).status_code == 200
+    assert client.get("/api/dashboard").json()["search_from"] == "metadata"
+
+    s_meta = client.post(f"/api/files/{fid}/cover/search", json={}).json()
+    assert s_meta["query_mode"] == "metadata"
+    assert seen_queries[-1] == ("Id3Band", "Id3Album", "Id3Track")
+
+    assert client.post("/api/covers/check", json={"ids": [fid]}).status_code == 200
+    assert seen_queries[-1] == ("Id3Band", "Id3Album", "Id3Track")
+
+    # Switch global searchFrom = "file" -> cover check & search use folder/file name
+    assert client.put("/api/metadata/options", json={"searchFrom": "file"}).status_code == 200
+    assert client.get("/api/dashboard").json()["search_from"] == "file"
+    assert client.post("/api/covers/check", json={"ids": [fid]}).status_code == 200
+    assert seen_queries[-1] == ("DirBand", "DirAlbum", "DirTrack")
+
+
+
 

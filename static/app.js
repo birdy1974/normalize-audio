@@ -89,10 +89,38 @@
      What the app is doing right now, shown on every page: work started from this
      browser (a level check, a rescan, a save) and work the server reports (a
      running normalization, the periodic scan). */
-  function startBusy(text) {
+  let fastBusyTimer = null;
+  let fastBusyInFlight = false;
+  function ensureFastBusyPoll() {
+    const d = state.dash;
+    const active = Object.keys(state.busy).length > 0
+      || state.metaChecking
+      || state.scanning.audio || state.scanning.video
+      || !!(d && (
+        d.status === 'running'
+        || d.scanning
+        || d.meta_checking
+        || d.approved_pending > 0
+        || (d.action_progress && d.action_progress.active)
+      ));
+    if (active && !fastBusyTimer) {
+      fastBusyTimer = setInterval(() => {
+        if (fastBusyInFlight) return;
+        fastBusyInFlight = true;
+        refreshDash().catch(() => {}).finally(() => { fastBusyInFlight = false; });
+      }, 600);
+    } else if (!active && fastBusyTimer) {
+      clearInterval(fastBusyTimer);
+      fastBusyTimer = null;
+    }
+  }
+
+  function startBusy(text, totalHint) {
     const id = 'b' + (++busySeq);
-    state.busy[id] = { text, secs: null, startedAt: Date.now() };
+    const tot = Math.max(1, Number(totalHint) || 1);
+    state.busy[id] = { text, secs: null, startedAt: Date.now(), done: 0, total: tot };
     showActivity();
+    ensureFastBusyPoll();
     return id;
   }
 
@@ -113,6 +141,8 @@
 
   function endBusy(id, minMs = 0) {
     if (state.busy[id] === undefined) return;
+    state.busy[id].done = state.busy[id].total;
+    showActivity();
     if (minMs > 0 && state.busy[id].startedAt) {
       const remain = minMs - (Date.now() - state.busy[id].startedAt);
       if (remain > 0) {
@@ -122,6 +152,7 @@
     }
     delete state.busy[id];
     showActivity();
+    ensureFastBusyPoll();
   }
 
   function serverWork() {
@@ -129,25 +160,53 @@
     if (!d) return [];
     const out = [];
     const auto = d.mode === 'auto';
+    const ap = d.action_progress || {};
     if (d.approved_pending > 0) {
       const fileSub = d.current_file ? folderTail(d.current_file) : 'applying parked file';
       const sub = d.approved_pending > 1 ? fileSub + ' · ' + d.approved_pending + ' left' : fileSub;
-      out.push({ busy: true, text: 'Applying parked changes', sub: sub });
+      const tot = Math.max(1, Number(d.approved_total || d.approved_pending) || 1);
+      const dn = Math.max(0, Math.min(tot, Number(d.approved_done || 0)));
+      out.push({ busy: true, text: 'Applying parked changes', sub: sub, done: dn, total: tot });
     }
     if (d.meta_checking) {
       const mp = d.meta_progress || (state.metadata && state.metadata.meta_progress) || {};
-      const progPart = mp.total > 0 ? mp.done + ' / ' + mp.total + ' files' : 'preparing files';
+      const tot = Math.max(1, Number(mp.total || 0) || 1);
+      const dn = Math.max(0, Math.min(tot, Number(mp.done || 0)));
+      const progPart = mp.total > 0 ? dn + ' / ' + tot + ' files' : 'preparing files';
       const curPart = mp.current_file ? ' · ' + folderTail(mp.current_file) : '';
-      out.push({ busy: true, text: 'Checking metadata', sub: progPart + curPart });
+      out.push({ busy: true, text: 'Checking metadata', sub: progPart + curPart, done: dn, total: tot });
+    }
+    if (ap && ap.active) {
+      const tot = Math.max(1, Number(ap.total || 1));
+      const dn = Math.max(0, Math.min(tot, Number(ap.done || 0)));
+      out.push({
+        busy: true,
+        text: ap.label || 'Working',
+        sub: ap.current_file ? folderTail(ap.current_file) : (dn + ' / ' + tot),
+        done: dn,
+        total: tot,
+      });
     }
     if (d.status === 'running') {
-      out.push({ busy: true, text: 'Normalizing', sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file' });
+      const tot = Math.max(1, Number(d.progress_total || 1));
+      const dn = Math.max(0, Math.min(tot, Number(d.progress_done || 0)));
+      out.push({
+        busy: true,
+        text: 'Normalizing',
+        sub: d.current_file ? folderTail(d.current_file) : 'waiting for the next file',
+        done: dn,
+        total: tot,
+      });
     } else if (d.status === 'paused') {
       out.push({ busy: false, text: 'Paused', sub: auto ? 'automatic mode is paused' : 'the run is paused' });
     } else if (d.status === 'waiting_window') {
-      out.push({ busy: true, text: 'Waiting for schedule', sub: 'the run continues in the next window' });
+      const tot = Math.max(1, Number(d.progress_total || 1));
+      const dn = Math.max(0, Math.min(tot, Number(d.progress_done || 0)));
+      out.push({ busy: true, text: 'Waiting for schedule', sub: 'the run continues in the next window', done: dn, total: tot });
     } else if (d.scanning) {
-      out.push({ busy: true, text: 'Scanning folders', sub: 'looking for new, changed and removed files' });
+      const tot = ap && ap.total ? Math.max(1, Number(ap.total)) : 1;
+      const dn = ap && ap.total ? Math.max(0, Math.min(tot, Number(ap.done || 0))) : 0;
+      out.push({ busy: true, text: 'Scanning folders', sub: 'looking for new, changed and removed files', done: dn, total: tot });
     } else if (d.status === 'off') {
       out.push({ busy: false, text: 'Off', sub: 'not scanning and not normalizing' });
     } else if (d.status === 'idle' && auto) {
@@ -159,18 +218,33 @@
   function activity() {
     const ids = Object.keys(state.busy);
     const server = serverWork();
+    const d = state.dash;
+    const ap = d && d.action_progress && d.action_progress.active ? d.action_progress : null;
     if (ids.length) {
       const first = state.busy[ids[0]];
       const more = ids.length > 1 ? '+' + (ids.length - 1) + ' more in this browser' : '';
+      const tot = ap ? Math.max(1, Number(ap.total || first.total || 1)) : Math.max(1, Number(first.total || 1));
+      const dn = ap ? Math.max(0, Math.min(tot, Number(ap.done || 0))) : Math.max(0, Math.min(tot, Number(first.done || 0)));
+      const pct = Math.min(100, Math.max(0, Math.round((dn / tot) * 100)));
+      const curFile = ap && ap.current_file ? folderTail(ap.current_file) : '';
       return {
         busy: true,
         title: first.text,
-        sub: [first.secs === null ? '' : first.secs + ' s', more].filter(Boolean).join(' · '),
+        sub: [curFile, first.secs === null ? '' : first.secs + ' s', more].filter(Boolean).join(' · '),
+        done: dn,
+        total: tot,
+        percent: pct,
       };
     }
-    if (server.length) return { busy: server[0].busy, title: server[0].text, sub: server[0].sub };
-    if (!state.dash) return { busy: true, title: 'Loading', sub: 'reading the status' };
-    return { busy: false, title: 'Idle', sub: 'nothing to do right now' };
+    if (server.length) {
+      const s0 = server[0];
+      const tot = Math.max(1, Number(s0.total || 1));
+      const dn = Math.max(0, Math.min(tot, Number(s0.done || 0)));
+      const pct = Math.min(100, Math.max(0, Math.round((dn / tot) * 100)));
+      return { busy: s0.busy, title: s0.text, sub: s0.sub, done: dn, total: tot, percent: pct };
+    }
+    if (!state.dash) return { busy: true, title: 'Loading', sub: 'reading the status', done: 0, total: 1, percent: 0 };
+    return { busy: false, title: 'Idle', sub: 'nothing to do right now', done: 0, total: 0, percent: 0 };
   }
 
   let stoppingAction = false;
@@ -183,6 +257,7 @@
     const d = state.dash;
     if (!d) return false;
     if (d.approved_pending > 0 || d.meta_checking || d.scanning) return true;
+    if (d.action_progress && d.action_progress.active) return true;
     if (d.status === 'running' || d.status === 'waiting_window') return true;
     if (d.status === 'paused' && d.mode !== 'auto') return true;
     return false;
@@ -199,7 +274,29 @@
     if (sub.textContent !== now.sub) sub.textContent = now.sub;
     box.classList.toggle('is-busy', now.busy);
     box.setAttribute('aria-busy', String(now.busy));
-    box.title = now.title + (now.sub ? ' · ' + now.sub : '');
+    box.title = now.busy
+      ? now.title + ' · ' + fmt(now.done) + ' / ' + fmt(now.total) + ' (' + now.percent + '%)' + (now.sub ? ' · ' + now.sub : '')
+      : now.title + (now.sub ? ' · ' + now.sub : '');
+
+    const progWrap = document.getElementById('activity-progress-wrap');
+    const progCount = document.getElementById('activity-progress-count');
+    const progPct = document.getElementById('activity-progress-pct');
+    const progBar = document.getElementById('activity-progress-bar');
+    const progFill = document.getElementById('activity-progress-fill');
+    if (progWrap) {
+      progWrap.hidden = !now.busy;
+      if (now.busy) {
+        const countTxt = fmt(now.done) + ' / ' + fmt(now.total);
+        const pctTxt = now.percent + '%';
+        if (progCount && progCount.textContent !== countTxt) progCount.textContent = countTxt;
+        if (progPct && progPct.textContent !== pctTxt) progPct.textContent = pctTxt;
+        if (progBar) progBar.setAttribute('aria-valuenow', String(now.percent));
+        if (progFill) {
+          const fillW = (now.done > 0 ? Math.max(3, now.percent) : Math.max(0, now.percent)) + '%';
+          if (progFill.style.width !== fillW) progFill.style.width = fillW;
+        }
+      }
+    }
 
     const stopBtn = document.getElementById('activity-stop');
     if (stopBtn) {
@@ -885,7 +982,7 @@
     }
     const modal = document.getElementById('editor');
     if (modal) modal.hidden = true;
-    document.body.classList.remove('has-modal');
+    if (!COVER.open && !META_MODAL.open) document.body.classList.remove('has-modal');
     if (EDIT.lastFocus && EDIT.lastFocus.focus) EDIT.lastFocus.focus();
     EDIT.lastFocus = null;
   }
@@ -1029,9 +1126,6 @@
       drawEditor();
     });
 
-    modal.addEventListener('click', (ev) => {
-      if (ev.target === modal) closeEditor();
-    });
     document.addEventListener('keydown', (ev) => {
       if (!EDIT.open) return;
       if (ev.key === 'Escape') {
@@ -1094,17 +1188,17 @@
   }
 
   const META_VIS_KEY = 'audio-normalizer-meta-vis-fields';
-  const META_COLS_KEY = 'audio-normalizer-meta-cols';
+  const META_COLS_KEY = 'audio-normalizer-meta-cols-v2';
   const DEFAULT_META_COLS = {
     pick: 38,
-    file: 230,
-    path: 190,
-    field: 120,
-    current: 200,
-    discogs: 185,
-    musicbrainz: 185,
-    open: 185,
-    custom: 265,
+    file: 225,
+    custom: 245,
+    field: 118,
+    path: 180,
+    current: 190,
+    discogs: 205,
+    musicbrainz: 220,
+    open: 220,
   };
   const ALL_META_FIELD_KEYS = ['artist', 'title', 'album', 'album_artist', 'year', 'track', 'genre', 'cover'];
   let metaCheckAbort = null;
@@ -1199,6 +1293,7 @@
     metaBulkOpen: false,            // whether the Bulk specific-parameter editor is expanded
     metaBulkFields: {},             // { [fieldKey]: { enabled: bool, mode: string, value: string, dirty: bool } }
     metaEditing: {},                // { "fileId:field": true } for inline custom input
+    metaTouchedFiles: new Set(),    // file ids edited in this view so they never vanish or jump mid-selection
     parkSel: [],                    // selected parked file ids
     parkSort: 'order',
     measure: null,                  // last file level check (baseline)
@@ -1291,7 +1386,18 @@
     } else if (key === 'coverParked') {
       state.coverParked = await api('/covers/parked');
     } else if (key === 'metadata') {
-      state.metadata = await api('/metadata');
+      const snapSeq = metaMutationSeq;
+      const incoming = await api('/metadata');
+      if (snapSeq !== metaMutationSeq && state.metadata && Array.isArray(state.metadata.files) && Array.isArray(incoming.files)) {
+        const localById = new Map(state.metadata.files.map((x) => [x.id, x]));
+        incoming.files = incoming.files.map((f) => {
+          if (state.metaTouchedFiles.has(f.id) && localById.has(f.id)) {
+            return localById.get(f.id);
+          }
+          return f;
+        });
+      }
+      state.metadata = incoming;
       const opts = (state.metadata && state.metadata.options) || {};
       if (!state.metaPrefsHydrated) {
         state.metaPrefsHydrated = true;
@@ -1358,7 +1464,72 @@
       state.metaChecking = true;
       watchMetaCheck();
     }
+    ensureFastBusyPoll();
     showActivity();                 // the run state lives in the dashboard data
+  }
+
+  let metaMutationSeq = 0;
+  let metaPendingMutations = 0;
+  let metaSelectChain = Promise.resolve();
+
+  function applyServerMetaUpdates(filesUpdated) {
+    if (!filesUpdated || !state.metadata || !Array.isArray(state.metadata.files)) return;
+    let diffCount = 0;
+    let pathDiffCount = 0;
+    state.metadata.files.forEach((f) => {
+      const u = filesUpdated[String(f.id)];
+      if (u) {
+        f.status = u.status;
+        f.diffs = u.diffs;
+        f.diff_count = u.diff_count;
+        f.path_diff = u.path_diff;
+        f.path_diff_count = u.path_diff_count;
+        f.path_mismatches = u.path_mismatches;
+        f.selected = u.selected;
+        f.fields = u.fields;
+      }
+      if (f.status === 'diff' || f.diff_count > 0) diffCount += 1;
+      if (f.path_diff || f.path_diff_count > 0) pathDiffCount += 1;
+    });
+    state.metadata.diff_count = diffCount;
+    state.metadata.path_diff_count = pathDiffCount;
+    if (state.metadata.counts) {
+      state.metadata.counts.diff = diffCount;
+      state.metadata.counts.path_diff = pathDiffCount;
+    }
+    updateNavBadge();
+  }
+
+  function queueMetaSelect(body, opts) {
+    const o = opts || {};
+    const mySeq = ++metaMutationSeq;
+    metaPendingMutations += 1;
+    if (Array.isArray(body.ids)) {
+      body.ids.forEach((id) => state.metaTouchedFiles.add(Number(id)));
+    }
+    const run = metaSelectChain.then(async () => {
+      const res = await api('/metadata/select', { method: 'POST', body: body });
+      if (res && res.files_updated && mySeq === metaMutationSeq) {
+        applyServerMetaUpdates(res.files_updated);
+        if (!o.skipRender && currentRoute() === 'metadata') {
+          renderPreservingMetaScroll();
+        }
+      }
+      return res;
+    });
+    metaSelectChain = run.catch(() => {});
+    return run.finally(() => {
+      metaPendingMutations = Math.max(0, metaPendingMutations - 1);
+    });
+  }
+
+  function currentSearchFrom() {
+    if (state.metadata && state.metadata.options) {
+      const v = state.metadata.options.search_from || state.metadata.options.searchFrom;
+      if (v) return v;
+    }
+    if (state.dash && state.dash.search_from) return state.dash.search_from;
+    return 'auto';
   }
 
   let metaWatchTimer = null;
@@ -1410,7 +1581,13 @@
       if (metaWatchInFlight) return;
       metaWatchInFlight = true;
       try {
+        const snapSeq = metaMutationSeq;
         const data = await api('/metadata');
+        if ((snapSeq !== metaMutationSeq || metaPendingMutations > 0)
+            && state.metadata && Array.isArray(state.metadata.files) && Array.isArray(data.files)) {
+          const localById = new Map(state.metadata.files.map((x) => [x.id, x]));
+          data.files = data.files.map((f) => (state.metaTouchedFiles.has(f.id) && localById.has(f.id) ? localById.get(f.id) : f));
+        }
         state.metadata = data;
         state.loaded.metadata = true;
         const mp = data.meta_progress || {};
@@ -1838,8 +2015,10 @@
   function coverLabel(f, i) {
     if (f.has_cover) {
       const emb = f.cover_status === 'embedded';
-      return '<button type="button" class="cover-chip-btn' + (emb ? ' is-embedded' : '') + '" data-action="open-cover-modal" data-idx="' + i + '" title="Click to view or change cover art">'
-        + '<img class="cover-mini-thumb" src="' + esc(fileCoverUrl(f.id, f.cover_updated_at || f.changed_at || f.measured_at || 1)) + '" alt="" loading="lazy">'
+      const covUrl = fileCoverUrl(f.id, f.cover_updated_at || f.changed_at || f.measured_at || 1);
+      return '<button type="button" class="cover-chip-btn' + (emb ? ' is-embedded' : '') + '" data-action="open-cover-modal" data-idx="' + i + '"'
+        + ' data-cover-zoom="' + esc(covUrl) + '" data-cover-caption="' + esc(f.name + ' · Embedded cover') + '" title="Click to view or change cover art">'
+        + '<img class="cover-mini-thumb" src="' + esc(covUrl) + '" alt="" loading="lazy">'
         + '<span>' + (emb ? 'embedded' : 'present') + '</span></button>';
     }
     if (f.cover_status === 'choices') {
@@ -1857,6 +2036,19 @@
       return '<button type="button" class="cover-chip-btn dim" data-action="open-cover-modal" data-idx="' + i + '" title="No embedded cover picture — click to search Discogs / open sources">missing</button>';
     }
     return '<button type="button" class="cover-chip-btn dim" data-action="open-cover-modal" data-idx="' + i + '">check</button>';
+  }
+
+  function renderFilesPaneSearchSourceBar() {
+    const sf = currentSearchFrom();
+    return '<div class="files-pane-src-row">'
+      + '<span class="muted">Take Artist / Title from:</span>'
+      + '<div class="seg seg-sm" role="group" aria-label="Take Artist and Title from">'
+      + '<button type="button" class="' + (sf === 'auto' ? 'on' : '') + '" data-action="meta-opt-search-from" data-mode="auto" aria-pressed="' + (sf === 'auto') + '" title="Smart automatic: use metadata tags unless missing or totally different from folder/file name">Auto</button>'
+      + '<button type="button" class="' + (sf === 'file' ? 'on' : '') + '" data-action="meta-opt-search-from" data-mode="file" aria-pressed="' + (sf === 'file') + '" title="Take Artist / Title from folder / file name">From file</button>'
+      + '<button type="button" class="' + (sf === 'metadata' ? 'on' : '') + '" data-action="meta-opt-search-from" data-mode="metadata" aria-pressed="' + (sf === 'metadata') + '" title="Take Artist / Title from embedded file metadata tags">From meta data</button>'
+      + '</div>'
+      + '<span class="small muted">General setting for cover &amp; metadata lookups</span>'
+      + '</div>';
   }
 
   function renderBrowse(node) {
@@ -1877,11 +2069,13 @@
         + '<button class="btn btn-sm" data-action="check-all-files" title="Check level and empty sections for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check all' + selSuffix + '</button>'
         + '<button class="btn btn-sm btn-primary" data-action="execute-files" title="Execute normalization for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Execute' + selSuffix + '</button>'
       : '';
+    const srcBar = t === 'audio' ? renderFilesPaneSearchSourceBar() : '';
     const head = '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
       + '<div class="sub">' + node.directFiles + ' files directly in this folder · ' + (subtree(node).length - 1) + ' sub-folders'
       + ' · Play listens to the original · Edit fades or cuts a part</div></div>'
       + '<div class="btns">' + batchBtns
-      + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div></div>';
+      + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div></div>'
+      + srcBar;
     if (b.loading || b.media !== t || b.rel !== node.rel || !b.rows) {
       return head + '<p class="muted">Loading files…</p>';
     }
@@ -2010,7 +2204,7 @@
       + '<div class="split-dirs">'
       + '<section class="card tree" data-media="' + t + '" aria-label="Folder tree"><ul>' + renderTree(tr.roots) + '</ul></section>'
       + '<section class="card files-pane" data-media="' + t + '" data-rel="' + esc(selRel || '') + '">'
-      + (sel ? renderBrowse(sel) : '<p class="muted">Select a folder in the tree.</p>') + '</section>'
+      + (sel ? renderBrowse(sel) : (t === 'audio' ? renderFilesPaneSearchSourceBar() : '') + '<p class="muted">Select a folder in the tree.</p>') + '</section>'
       + '</div>';
     app().querySelectorAll('input[data-check]').forEach((cb) => {
       const n = tr.map.get(cb.dataset.check);
@@ -2092,8 +2286,10 @@
             const idsStr = g.file_ids.join(',');
             const candsHtml = g.candidates.map((c) => {
               const thumb = candThumbUrl(g.primary_file_id, c.thumb_url || c.image_url || '');
+              const fullImg = candThumbUrl(g.primary_file_id, c.image_url || c.thumb_url || '');
+              const cap = [c.title, c.source, c.year].filter(Boolean).join(' · ');
               return '<div class="cover-cand">'
-                + '<div class="cover-cand-img-wrap">'
+                + '<div class="cover-cand-img-wrap"' + (fullImg ? ' data-cover-zoom="' + esc(fullImg) + '" data-cover-caption="' + esc(cap) + '"' : '') + '>'
                 + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
                 + '</div>'
                 + '<div class="cover-cand-title">' + esc(c.title || 'Cover') + '</div>'
@@ -2127,8 +2323,10 @@
               : '';
             const candsHtml = f.candidates.map((c) => {
               const thumb = candThumbUrl(f.id, c.thumb_url || c.image_url || '');
+              const fullImg = candThumbUrl(f.id, c.image_url || c.thumb_url || '');
+              const cap = [c.title, c.source, c.year].filter(Boolean).join(' · ');
               return '<div class="cover-cand">'
-                + '<div class="cover-cand-img-wrap">'
+                + '<div class="cover-cand-img-wrap"' + (fullImg ? ' data-cover-zoom="' + esc(fullImg) + '" data-cover-caption="' + esc(cap) + '"' : '') + '>'
                 + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
                 + '</div>'
                 + '<div class="cover-cand-title">' + esc(c.title || 'Cover') + '</div>'
@@ -2607,14 +2805,14 @@
 
   const META_COL_SPECS = [
     ['pick', '', 34, false],
-    ['file', 'File & folder', 90, true],
-    ['path', 'Folder / file name', 80, true],
+    ['file', 'File & folder', 95, true],
+    ['custom', 'Selected / Custom (✎)', 150, true],
     ['field', 'Field', 75, true],
+    ['path', 'Folder / file name', 80, true],
     ['current', 'Current tag (file)', 85, true],
-    ['discogs', 'Discogs', 85, true],
-    ['musicbrainz', 'MusicBrainz', 85, true],
-    ['open', 'Open (iTunes)', 85, true],
-    ['custom', 'Custom (✎)', 140, true],
+    ['discogs', 'Discogs', 135, true],
+    ['musicbrainz', 'MusicBrainz', 145, true],
+    ['open', 'Open (iTunes)', 145, true],
   ];
 
   function makeDragAttr(fileId, fieldKey, source, val, isModal) {
@@ -2642,6 +2840,7 @@
       return '<td class="meta-choice-cell"' + dropAttrs + '>'
         + '<button type="button" class="meta-pill' + (chosen ? ' is-chosen' : '') + '"'
         + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="' + srcKey + '"'
+        + ' data-cover-zoom="' + esc(thumb) + '" data-cover-caption="' + esc(srcLabel + ' cover') + '"'
         + dragAttr + ' title="Use ' + esc(srcLabel) + ' cover (' + esc(val) + ') · drag to copy">'
         + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
         + '<span class="meta-radio-dot"></span>'
@@ -2657,8 +2856,25 @@
       + '<span class="meta-pill-text">' + esc(val) + '</span></button></td>';
   }
 
-  function renderMetaFieldCells(fileItem, fieldKey, fieldObj, isModal, rowOpts) {
-    const ro = rowOpts || {};
+  function resolveFinalMetaValue(fieldKey, fieldObj, isDiscogsChosen, isMbChosen, isOpenChosen) {
+    const choice = (fieldObj && fieldObj.choice) || 'current';
+    const curVal = (fieldObj && fieldObj.current) || '';
+    const pathVal = (fieldObj && fieldObj.path) || '';
+    const discogsVal = (fieldObj && fieldObj.discogs) || '';
+    const mbVal = (fieldObj && fieldObj.musicbrainz) || '';
+    const openVal = (fieldObj && fieldObj.open) || '';
+    const onlineVal = (fieldObj && fieldObj.online) || discogsVal || mbVal || openVal || '';
+    const customVal = (fieldObj && fieldObj.custom_value) || '';
+    if (choice === 'custom') return { val: customVal, srcLabel: 'Custom', isOverride: true };
+    if (isDiscogsChosen) return { val: discogsVal, srcLabel: 'Discogs', isOverride: false };
+    if (isMbChosen) return { val: mbVal, srcLabel: 'MusicBrainz', isOverride: false };
+    if (isOpenChosen) return { val: openVal, srcLabel: 'Open', isOverride: false };
+    if (choice === 'online') return { val: onlineVal, srcLabel: 'Online', isOverride: false };
+    if (choice === 'path') return { val: pathVal, srcLabel: 'File', isOverride: false };
+    return { val: curVal, srcLabel: 'Tag', isOverride: false };
+  }
+
+  function renderMetaFieldCells(fileItem, fieldKey, fieldObj, isModal) {
     const choice = (fieldObj && fieldObj.choice) || 'current';
     const curVal = (fieldObj && fieldObj.current) || '';
     const pathVal = (fieldObj && fieldObj.path) || '';
@@ -2682,7 +2898,70 @@
     const isMbChosen = choice === 'musicbrainz' || (choice === 'online' && !isDiscogsChosen && !!mbVal && mbVal === onlineVal);
     const isOpenChosen = choice === 'open' || (choice === 'online' && !isDiscogsChosen && !isMbChosen && !!openVal);
 
-    // Col 3: Folder / file name
+    // Col 2 (second place, right after File & folder): Selected / Custom (✎) — shows FINAL selected value & allows override
+    const finalInfo = resolveFinalMetaValue(fieldKey, fieldObj, isDiscogsChosen, isMbChosen, isOpenChosen);
+    const finalVal = finalInfo.val || '';
+    const willChange = choice !== 'current' && (fieldKey === 'cover' ? !!finalVal : finalVal !== curVal);
+    const editSeed = choice === 'custom'
+      ? customVal
+      : (fieldKey === 'cover' && choice === 'current' ? (onlineVal || pathVal || '') : finalVal);
+
+    let customInner = '';
+    if (isEditing) {
+      customInner = '<span class="meta-edit-wrap">'
+        + '<input type="text" class="meta-custom-input" data-meta-custom-input="' + editKey + '" value="' + esc(editSeed) + '" placeholder="' + esc(fieldKey === 'cover' ? 'Cover image URL…' : 'Override ' + fieldLabel) + '">'
+        + '<button type="button" class="btn btn-sm btn-primary" data-action="' + saveCustomAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '">Set</button>'
+        + '<button type="button" class="meta-edit-btn is-active" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Cancel override edit">✕</button>'
+        + '</span>';
+    } else if (fieldKey === 'cover') {
+      let covUrl = '';
+      let covText = '';
+      if (choice === 'current') {
+        const hasCov = curVal === 'present' || !!fileItem.has_cover;
+        covUrl = hasCov ? fileCoverUrl(fileItem.id, fileItem.cover_updated_at || fileItem.checked_at || 1) : '';
+        covText = hasCov ? 'Present' : 'Missing';
+      } else if (finalVal) {
+        covUrl = candThumbUrl(fileItem.id, finalVal, fileItem.cover_updated_at || fileItem.checked_at);
+        covText = choice === 'custom' ? 'Custom cover' : (finalInfo.srcLabel + ' cover');
+      } else {
+        covText = choice === 'custom' ? '(clear)' : 'Missing';
+      }
+      const cDrag = (choice !== 'current' && finalVal) ? makeDragAttr(fileItem.id, fieldKey, choice, finalVal, isModal) : '';
+      const zoomAttrs = covUrl ? ' data-cover-zoom="' + esc(covUrl) + '" data-cover-caption="' + esc(fileItem.name + ' · Final cover (' + finalInfo.srcLabel + ')') + '"' : '';
+      customInner = '<span class="meta-edit-wrap">'
+        + '<button type="button" class="meta-pill' + (willChange || choice === 'custom' ? ' is-chosen' : '') + '"'
+        + ' data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '"'
+        + zoomAttrs + cDrag + ' title="Final selected cover (' + esc(finalInfo.srcLabel) + ') · click to override">'
+        + (covUrl ? '<img class="meta-cover-mini" src="' + esc(covUrl) + '" alt="" loading="lazy">' : '')
+        + '<span class="meta-pill-text">' + esc(covText) + '</span>'
+        + '<span class="meta-final-src">' + esc(finalInfo.srcLabel) + '</span>'
+        + '</button>'
+        + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Override ' + esc(fieldLabel) + ' value">✎</button>'
+        + '</span>';
+    } else {
+      const fDrag = finalVal ? makeDragAttr(fileItem.id, fieldKey, choice, finalVal, isModal) : '';
+      const dispHtml = finalVal
+        ? esc(finalVal)
+        : (choice === 'custom' ? '<em class="muted">(clear)</em>' : '<em class="muted">(empty)</em>');
+      customInner = '<span class="meta-edit-wrap">'
+        + '<button type="button" class="meta-pill' + (willChange || choice === 'custom' ? ' is-chosen' : '') + '"'
+        + ' data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '"'
+        + fDrag + ' title="' + esc('Final ' + fieldLabel + ' (' + finalInfo.srcLabel + '): ' + (finalVal || '(empty)') + ' · click or press ✎ to override') + '">'
+        + (finalVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
+        + '<span class="meta-pill-text">' + dispHtml + '</span>'
+        + '<span class="meta-final-src">' + esc(finalInfo.srcLabel) + '</span>'
+        + '</button>'
+        + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Override ' + esc(fieldLabel) + ' value (or drop a dragged value here)">✎</button>'
+        + '</span>';
+    }
+    const customCell = '<td class="meta-choice-cell"' + dropAttrs + '><div class="meta-custom-cell-row">' + customInner + '</div></td>';
+
+    // Col 3: Field (also a drop target!)
+    const fieldCell = '<td class="meta-field-name"' + dropAttrs
+      + ' title="' + esc(fieldLabel + ' — drop any dragged value onto this row to set ' + fieldLabel) + '">'
+      + esc(fieldLabel) + '</td>';
+
+    // Col 4: Folder / file name
     let pathInner = '<span class="muted small">—</span>';
     if (fieldKey === 'cover') {
       if (pathVal) {
@@ -2690,6 +2969,7 @@
         const lThumb = candThumbUrl(fileItem.id, pathVal, fileItem.cover_updated_at || fileItem.checked_at);
         pathInner = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
           + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path"'
+          + ' data-cover-zoom="' + esc(lThumb) + '" data-cover-caption="' + esc(fileItem.name + ' · Local folder cover') + '"'
           + dragAttr + ' title="Use local folder cover image · drag to copy">'
           + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
           + '<span class="meta-radio-dot"></span>'
@@ -2707,20 +2987,17 @@
     }
     const pathCell = '<td class="meta-choice-cell"' + dropAttrs + '>' + pathInner + '</td>';
 
-    // Col 4: Field (also a drop target!)
-    const fieldCell = '<td class="meta-field-name"' + dropAttrs
-      + ' title="' + esc(fieldLabel + ' — drop any dragged value onto this row to set ' + fieldLabel) + '">'
-      + esc(fieldLabel) + '</td>';
-
     // Col 5: Current tag (file)
     let curInner = '';
     if (fieldKey === 'cover') {
       const hasCov = curVal === 'present' || !!fileItem.has_cover;
+      const cUrl = hasCov ? fileCoverUrl(fileItem.id, fileItem.cover_updated_at || fileItem.checked_at || 1) : '';
       const thumb = hasCov
-        ? '<img class="meta-cover-mini" src="' + esc(fileCoverUrl(fileItem.id, fileItem.cover_updated_at || fileItem.checked_at || 1)) + '" alt="">'
+        ? '<img class="meta-cover-mini" src="' + esc(cUrl) + '" alt="">'
         : '';
       curInner = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + '"'
         + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current"'
+        + (cUrl ? ' data-cover-zoom="' + esc(cUrl) + '" data-cover-caption="' + esc(fileItem.name + ' · Current embedded cover') + '"' : '')
         + ' title="' + (hasCov ? 'Keep embedded cover art currently in file' : 'No cover currently embedded in file') + '">'
         + '<span class="meta-radio-dot"></span>' + thumb
         + '<span class="meta-pill-text">' + (hasCov ? 'Present' : 'Missing') + '</span></button>';
@@ -2745,45 +3022,7 @@
     const mbCell = renderOnlineSourceCell(fileItem, fieldKey, 'musicbrainz', 'MusicBrainz', mbVal, isMbChosen, pickAct, isModal);
     const openCell = renderOnlineSourceCell(fileItem, fieldKey, 'open', 'Open (iTunes)', openVal, isOpenChosen, pickAct, isModal);
 
-    // Col 9: Custom (✎) + Update & Popup buttons under Custom (✎)
-    let customInner = '';
-    const defaultCustom = customVal !== '' ? customVal : (onlineVal || pathVal || (fieldKey === 'cover' ? '' : curVal) || '');
-    if (isEditing) {
-      customInner = '<span class="meta-edit-wrap">'
-        + '<input type="text" class="meta-custom-input" data-meta-custom-input="' + editKey + '" value="' + esc(defaultCustom) + '" placeholder="' + esc(fieldKey === 'cover' ? 'Cover image URL…' : 'Custom ' + fieldLabel) + '">'
-        + '<button type="button" class="btn btn-sm btn-primary" data-action="' + saveCustomAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '">Set</button>'
-        + '<button type="button" class="meta-edit-btn is-active" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Cancel custom edit">✕</button>'
-        + '</span>';
-    } else {
-      let chosenCustom = '';
-      if (choice === 'custom') {
-        const cDrag = customVal ? makeDragAttr(fileItem.id, fieldKey, 'custom', customVal, isModal) : '';
-        const covThumb = (fieldKey === 'cover' && customVal)
-          ? '<img class="meta-cover-mini" src="' + esc(candThumbUrl(fileItem.id, customVal, fileItem.cover_updated_at)) + '" alt="" loading="lazy">'
-          : '';
-        chosenCustom = '<button type="button" class="meta-pill is-chosen" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '"'
-          + cDrag + ' title="' + esc('Custom value: ' + (customVal || '(empty)') + ' · click to edit or drag to another parameter') + '">'
-          + (customVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
-          + '<span class="meta-radio-dot"></span>' + covThumb
-          + '<span class="meta-pill-text">' + (customVal ? esc(customVal) : '<em class="muted">(clear)</em>') + '</span></button>';
-      }
-      customInner = '<span class="meta-edit-wrap">'
-        + chosenCustom
-        + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Enter a custom ' + esc(fieldLabel) + ' value (or drop a dragged value here)">✎</button>'
-        + '</span>';
-    }
-
-    const rowActions = (!isModal && ro.showActions)
-      ? '<span class="meta-row-actions">'
-        + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + fileItem.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
-        + '<button type="button" class="btn btn-sm" data-action="open-meta-by-id" data-file="' + fileItem.id + '" title="Open full metadata popup for this file">Popup</button>'
-        + '</span>'
-      : '';
-
-    const customCell = '<td class="meta-choice-cell"' + dropAttrs + '><div class="meta-custom-cell-row">'
-      + customInner + rowActions + '</div></td>';
-
-    return pathCell + fieldCell + curCell + discogsCell + mbCell + openCell + customCell;
+    return customCell + fieldCell + pathCell + curCell + discogsCell + mbCell + openCell;
   }
 
   function filterAndSortMetaFiles(files, opts) {
@@ -2795,15 +3034,16 @@
 
     const filtered = (files || []).filter((f) => {
       if (dirFilter !== 'all' && f.dir !== dirFilter) return false;
-      if (stFilter === 'diff' && !f.diff_count && f.status !== 'diff') return false;
-      if (stFilter === 'path_diff' && !f.path_diff_count) return false;
+      const touched = state.metaTouchedFiles && state.metaTouchedFiles.has(f.id);
+      if (stFilter === 'diff' && !f.diff_count && f.status !== 'diff' && !touched) return false;
+      if (stFilter === 'path_diff' && !f.path_diff_count && !touched) return false;
       if (stFilter === 'missing') {
         const hasMissing = enabledFields.some((k) => f.fields && f.fields[k] && f.fields[k].missing);
-        if (!hasMissing) return false;
+        if (!hasMissing && !touched) return false;
       }
       if (fldFilter !== 'all') {
         const fo = f.fields && f.fields[fldFilter];
-        if (!fo || (!fo.diff && stFilter !== 'all')) return false;
+        if (!fo || (!fo.diff && stFilter !== 'all' && !touched)) return false;
       }
       if (q) {
         const hay = [
@@ -2832,6 +3072,18 @@
       state.metaBulkFields[k] = { enabled: false, mode: 'custom', value: '', dirty: false };
     }
     return state.metaBulkFields[k];
+  }
+
+  function getEnabledVisibleMetaFields() {
+    const opts = (state.metadata && state.metadata.options) || {};
+    const enabled = Array.isArray(opts.fields) && opts.fields.length ? opts.fields : ALL_META_FIELD_KEYS;
+    let keys = ALL_META_FIELD_KEYS.filter((k) => enabled.includes(k) && state.metaVisibleFields.includes(k));
+    if (!keys.length) keys = ALL_META_FIELD_KEYS.filter((k) => state.metaVisibleFields.includes(k));
+    if (!keys.length) keys = ALL_META_FIELD_KEYS.slice();
+    if (state.metaFilterField && state.metaFilterField !== 'all') {
+      keys = keys.filter((k) => k === state.metaFilterField);
+    }
+    return keys;
   }
 
   function ensureMetaFieldsVisible(fieldKeys) {
@@ -3084,13 +3336,10 @@
     const bulkSrcDisabled = !selCount ? ' disabled' : '';
     const bulkBar = '<div class="park-bar" style="margin-bottom:12px">'
       + '<span><strong>' + selCount + ' of ' + visibleFiles.length + ' selected</strong>'
-      + ' · Select source for selected files:</span>'
+      + ' · Select source for enabled (visible) parameters on selected files:</span>'
       + '<div class="btns">'
-      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="discogs"' + bulkSrcDisabled + ' title="Select Discogs values on the ' + selCount + ' selected file(s)">Discogs (' + selCount + ')</button>'
-      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="musicbrainz"' + bulkSrcDisabled + ' title="Select MusicBrainz values on the ' + selCount + ' selected file(s)">MusicBrainz (' + selCount + ')</button>'
-      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="open"' + bulkSrcDisabled + ' title="Select Open (iTunes) values on the ' + selCount + ' selected file(s)">Open (iTunes) (' + selCount + ')</button>'
-      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path"' + bulkSrcDisabled + ' title="Select Folder / File values on the ' + selCount + ' selected file(s)">Folder / File (' + selCount + ')</button>'
-      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current"' + bulkSrcDisabled + ' title="Select Current tag values on the ' + selCount + ' selected file(s)">Current tag (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="path"' + bulkSrcDisabled + ' title="Use Folder / File values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">Folder / File (' + selCount + ')</button>'
+      + '<button class="btn btn-sm" data-action="meta-bulk-choice" data-choice="current"' + bulkSrcDisabled + ' title="Use Current tag values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">Current tag (' + selCount + ')</button>'
       + '<button class="btn btn-sm" data-action="meta-bulk-artist-title" data-choice="path"' + bulkSrcDisabled + ' title="Take Artist and Track Title from the folder / file name on the ' + selCount + ' selected file(s)">Artist/Title ← File (' + selCount + ')</button>'
       + '<button class="btn btn-sm" data-action="meta-bulk-artist-title" data-choice="current"' + bulkSrcDisabled + ' title="Keep Artist and Track Title from the file meta data tags on the ' + selCount + ' selected file(s)">Artist/Title ← Meta data (' + selCount + ')</button>'
       + '<button class="btn btn-sm' + (state.metaBulkOpen ? ' btn-primary' : '') + '" data-action="meta-bulk-toggle" aria-expanded="' + state.metaBulkOpen + '">'
@@ -3162,13 +3411,17 @@
               + '<strong class="meta-one-line" title="' + esc(f.relpath) + '">' + esc(f.name) + '</strong>'
               + '<span class="small muted mono meta-one-line" title="' + esc(f.dir) + '">' + esc(folderStr) + '</span>'
               + '<div class="meta-badges-line">' + srcTag + overrideBadge + '</div>'
+              + '<div class="meta-row-actions">'
+              + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + f.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
+              + '<button type="button" class="btn btn-sm" data-action="open-meta-by-id" data-file="' + f.id + '" title="Open full metadata popup for this file">Popup</button>'
+              + '</div>'
               + '</div>'
               + '</td>'
             : '';
           bodyRows.push(
             '<tr' + (trCls ? ' class="' + trCls + '"' : '') + ' data-meta-row-file="' + f.id + '" data-meta-row-field="' + k + '">'
             + fileCols
-            + renderMetaFieldCells(f, k, fo, false, { showActions: firstRow })
+            + renderMetaFieldCells(f, k, fo, false)
             + '</tr>'
           );
         });
@@ -3187,13 +3440,13 @@
         + '<thead><tr>'
         + '<th class="pick"><input type="checkbox" data-meta-all aria-label="Select all visible files"' + (allOn ? ' checked' : '') + '></th>'
         + '<th class="is-resizable" title="File &amp; folder">File &amp; folder' + resizer('file') + '</th>'
-        + '<th class="is-resizable" title="Folder / file name">Folder / file name' + tip('Value parsed from the folder and file name on disk. Click to select, or drag onto another parameter.') + resizer('path') + '</th>'
+        + '<th class="is-resizable" title="Selected / Custom (✎)">Selected / Custom (✎)' + tip('Shows the final selected value for each parameter. Click the value or ✎ to override it, or drop a dragged value here.') + resizer('custom') + '</th>'
         + '<th class="is-resizable" title="Field">Field' + tip('Metadata parameter name. Drop any dragged value pill onto a row to assign it to that parameter.') + resizer('field') + '</th>'
+        + '<th class="is-resizable" title="Folder / file name">Folder / file name' + tip('Value parsed from the folder and file name on disk. Click to select, or drag onto another parameter.') + resizer('path') + '</th>'
         + '<th class="is-resizable" title="Current tag (file)">Current tag (file)' + tip('Value currently stored in the audio file metadata. Click to keep, or drag onto another parameter.') + resizer('current') + '</th>'
-        + '<th class="is-resizable" title="Discogs">Discogs' + tip('Match found on Discogs. Click to select or drag to another parameter.') + resizer('discogs') + '</th>'
-        + '<th class="is-resizable" title="MusicBrainz">MusicBrainz' + tip('Match found on MusicBrainz / Cover Art Archive. Click to select or drag to another parameter.') + resizer('musicbrainz') + '</th>'
-        + '<th class="is-resizable" title="Open (iTunes)">Open (iTunes)' + tip('Match found on Open (iTunes). Click to select or drag to another parameter.') + resizer('open') + '</th>'
-        + '<th class="is-resizable" title="Custom (✎)">Custom (✎)' + tip('Click ✎ to enter a custom value, drop a dragged value here, or use Update / Popup to apply or inspect.') + resizer('custom') + '</th>'
+        + '<th class="is-resizable" title="Discogs"><div class="meta-th-source"><span class="meta-th-title">Discogs' + tip('Match found on Discogs. Click the button to use Discogs values for enabled (visible) parameters on selected files.') + '</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="discogs"' + bulkSrcDisabled + ' title="Use Discogs column values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">Discogs (' + selCount + ')</button></div>' + resizer('discogs') + '</th>'
+        + '<th class="is-resizable" title="MusicBrainz"><div class="meta-th-source"><span class="meta-th-title">MusicBrainz' + tip('Match found on MusicBrainz / Cover Art Archive. Click the button to use MusicBrainz values for enabled (visible) parameters on selected files.') + '</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="musicbrainz"' + bulkSrcDisabled + ' title="Use MusicBrainz column values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">MusicBrainz (' + selCount + ')</button></div>' + resizer('musicbrainz') + '</th>'
+        + '<th class="is-resizable" title="Open (iTunes)"><div class="meta-th-source"><span class="meta-th-title">Open (iTunes)' + tip('Match found on Open (iTunes). Click the button to use Open (iTunes) values for enabled (visible) parameters on selected files.') + '</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="open"' + bulkSrcDisabled + ' title="Use Open (iTunes) column values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">Open (iTunes) (' + selCount + ')</button></div>' + resizer('open') + '</th>'
         + '</tr></thead><tbody>' + bodyRows.join('') + '</tbody></table></div>';
     }
 
@@ -3298,9 +3551,6 @@
         + ' <span class="small muted">· Tip: drag ⋮⋮ pills onto another row to copy values across parameters</span>'
         + '</div>'
         + '<div class="btns">'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="discogs">Discogs (1)</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="musicbrainz">MusicBrainz (1)</button>'
-        + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="open">Open (iTunes) (1)</button>'
         + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="path">Folder / File (1)</button>'
         + '<button type="button" class="btn btn-sm" data-action="meta-modal-bulk" data-choice="current">Current tag (1)</button>'
         + '</div></div>';
@@ -3308,19 +3558,19 @@
       const rows = META_FIELDS.map(([k]) => {
         const fo = fields[k] || { current: '', path: '', discogs: '', musicbrainz: '', open: '', online: '', choice: 'current', custom_value: '' };
         return '<tr data-meta-row-file="' + it.id + '" data-meta-row-field="' + k + '" data-drop-modal="1">'
-          + renderMetaFieldCells(it, k, fo, true, { showActions: false })
+          + renderMetaFieldCells(it, k, fo, true)
           + '</tr>';
       }).join('');
 
       contentHtml = overrideBanner + srcLine
         + '<div class="table-wrap"><table class="meta-table"><thead><tr>'
-        + '<th>Folder / file name</th>'
+        + '<th>Selected / Custom (✎)</th>'
         + '<th>Field</th>'
+        + '<th>Folder / file name</th>'
         + '<th>Current tag (file)</th>'
-        + '<th>Discogs</th>'
-        + '<th>MusicBrainz</th>'
-        + '<th>Open (iTunes)</th>'
-        + '<th>Custom (✎)</th>'
+        + '<th><div class="meta-th-source"><span class="meta-th-title">Discogs</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-modal-bulk" data-choice="discogs">Discogs (1)</button></div></th>'
+        + '<th><div class="meta-th-source"><span class="meta-th-title">MusicBrainz</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-modal-bulk" data-choice="musicbrainz">MusicBrainz (1)</button></div></th>'
+        + '<th><div class="meta-th-source"><span class="meta-th-title">Open (iTunes)</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-modal-bulk" data-choice="open">Open (iTunes) (1)</button></div></th>'
         + '</tr></thead><tbody>' + rows + '</tbody></table></div>';
     }
 
@@ -3341,7 +3591,7 @@
     META_MODAL.relpath = o.relpath || '';
     META_MODAL.dir = o.dir || '';
     META_MODAL.albumFileCount = 1;
-    META_MODAL.queryMode = (state.metadata && state.metadata.options && (state.metadata.options.search_from || state.metadata.options.searchFrom)) || 'auto';
+    META_MODAL.queryMode = currentSearchFrom();
     META_MODAL.artist = '';
     META_MODAL.album = '';
     META_MODAL.title = '';
@@ -3363,6 +3613,8 @@
     META_MODAL.loading = true;
     META_MODAL.error = '';
     renderMetaModal();
+    const busy = startBusy('Checking file metadata · ' + (META_MODAL.name || 'file'), 1);
+    const elapsed = tickBusy(busy);
     try {
       const qm = META_MODAL.queryMode || 'auto';
       const body = { force: !!force, query_mode: qm };
@@ -3395,6 +3647,8 @@
     } catch (err) {
       META_MODAL.error = err.message;
     } finally {
+      elapsed.stop();
+      endBusy(busy);
       META_MODAL.loading = false;
       renderMetaModal();
     }
@@ -3413,7 +3667,8 @@
     META_MODAL.busy = true;
     renderMetaModal();
     const label = scope === 'album' ? 'album' : META_MODAL.name;
-    const busy = startBusy('Updating metadata (preserving timestamp) · ' + label);
+    const totalHint = scope === 'album' ? (META_MODAL.albumFileCount || 1) : 1;
+    const busy = startBusy('Updating metadata (preserving timestamp) · ' + label, totalHint);
     const elapsed = tickBusy(busy);
     try {
       const f = META_MODAL.item.fields || {};
@@ -3597,9 +3852,10 @@
       : 'Cover art — ' + COVER.name;
     subEl.textContent = MEDIA.audio.root + '/' + COVER.relpath;
 
+    const curCovUrl = COVER.hasCover ? fileCoverUrl(COVER.fileId, Date.now()) : '';
     const currentHtml = COVER.hasCover
       ? '<div class="cover-current-row">'
-        + '<img class="cover-current-img" src="' + esc(fileCoverUrl(COVER.fileId, Date.now())) + '" alt="Current cover">'
+        + '<img class="cover-current-img" src="' + esc(curCovUrl) + '" data-cover-zoom="' + esc(curCovUrl) + '" data-cover-caption="' + esc(COVER.name + ' · Current embedded cover') + '" alt="Current cover">'
         + '<div><strong>Embedded cover art is present</strong><div class="small muted">Select a new picture below to replace it for this file or the whole album.</div></div>'
         + '</div>'
       : '';
@@ -3657,8 +3913,10 @@
       gridHtml = '<div class="cover-grid">' + COVER.candidates.map((c, idx) => {
         const sel = COVER.selectedUrl === c.image_url;
         const thumb = candThumbUrl(COVER.fileId, c.thumb_url || c.image_url || '');
+        const fullImg = candThumbUrl(COVER.fileId, c.image_url || c.thumb_url || '');
+        const cap = [c.title, c.source, c.year].filter(Boolean).join(' · ');
         return '<div class="cover-cand' + (sel ? ' is-selected' : '') + '" data-action="cover-select-cand" data-idx="' + idx + '" tabindex="0" role="button" aria-pressed="' + sel + '">'
-          + '<div class="cover-cand-img-wrap">'
+          + '<div class="cover-cand-img-wrap"' + (fullImg ? ' data-cover-zoom="' + esc(fullImg) + '" data-cover-caption="' + esc(cap) + '"' : '') + '>'
           + (thumb ? '<img class="cover-cand-img" src="' + esc(thumb) + '" alt="' + esc(c.title) + '" loading="lazy">' : '<span class="muted small">No preview</span>')
           + '</div>'
           + '<div class="cover-cand-title">' + esc(c.title || 'Cover') + '</div>'
@@ -3692,7 +3950,7 @@
     COVER.album = '';
     COVER.title = '';
     COVER.source = (state.settings && state.settings.general && state.settings.general.coverSources) || 'both';
-    COVER.queryMode = (state.metadata && state.metadata.options && (state.metadata.options.search_from || state.metadata.options.searchFrom)) || COVER.queryMode || 'auto';
+    COVER.queryMode = currentSearchFrom();
     COVER.querySource = 'tags';
     COVER.albumFileCount = 1;
     COVER.targetIds = o.targetIds || null;
@@ -3718,6 +3976,8 @@
     COVER.loading = true;
     COVER.error = '';
     renderCoverModal();
+    const busy = startBusy('Searching cover art · ' + (COVER.name || 'file'), 1);
+    const elapsed = tickBusy(busy);
     try {
       const qm = COVER.queryMode || 'auto';
       const body = { source: COVER.source, query_mode: qm, force: !!force };
@@ -3748,6 +4008,8 @@
     } catch (err) {
       COVER.error = err.message;
     } finally {
+      elapsed.stop();
+      endBusy(busy);
       COVER.loading = false;
       renderCoverModal();
     }
@@ -3758,7 +4020,7 @@
     COVER.open = false;
     const modal = document.getElementById('cover-modal');
     if (modal) modal.hidden = true;
-    if (!EDIT.open) document.body.classList.remove('has-modal');
+    if (!EDIT.open && !META_MODAL.open) document.body.classList.remove('has-modal');
   }
 
   async function applyCoverFromModal(scope) {
@@ -3766,7 +4028,10 @@
     COVER.busy = true;
     renderCoverModal();
     const label = scope === 'album' ? 'album' : COVER.name;
-    const busy = startBusy('Embedding cover art · ' + label);
+    const totalHint = scope === 'album'
+      ? ((COVER.targetIds && COVER.targetIds.length) || COVER.albumFileCount || 1)
+      : 1;
+    const busy = startBusy('Embedding cover art · ' + label, totalHint);
     const elapsed = tickBusy(busy);
     try {
       const body = { image_url: COVER.selectedUrl, scope: scope };
@@ -4078,7 +4343,7 @@
       render();
     } else if (a === 'bulk-adjust') {
       const count = state.parkSel.length;
-      const busy = startBusy('Adjusting ' + count + ' selected parked file' + (count === 1 ? '' : 's'));
+      const busy = startBusy('Adjusting ' + count + ' selected parked file' + (count === 1 ? '' : 's'), count);
       try {
         await api('/parked/bulk', { method: 'POST', body: { ids: state.parkSel, action: 'adjust', delta: Number(el.dataset.step) } });
         invalidate('parked:' + t);
@@ -4089,7 +4354,7 @@
       render();
     } else if (a === 'apply-selected') {
       const count = state.parkSel.length;
-      const busy = startBusy('Applying ' + count + ' selected parked file' + (count === 1 ? '' : 's'));
+      const busy = startBusy('Applying ' + count + ' selected parked file' + (count === 1 ? '' : 's'), count);
       const elapsed = tickBusy(busy);
       try {
         const r = await api('/parked/bulk', { method: 'POST', body: { ids: state.parkSel, action: 'approve' } });
@@ -4115,7 +4380,7 @@
       const f = state.browse.rows[Number(el.dataset.idx)];
       if (!f) return;
       state.measure = { media: t, relpath: f.relpath, name: f.name, state: 'measuring' };
-      const busy = startBusy('Checking the level of ' + f.name);
+      const busy = startBusy('Checking the level of ' + f.name, 1);
       const elapsed = tickBusy(busy);
       render();
       try {
@@ -4139,7 +4404,7 @@
       const b = state.browse;
       if (!b || !b.rows || !b.rows.length) return;
       const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
-      const busy = startBusy('Checking ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const busy = startBusy('Checking ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'), ids.length);
       const elapsed = tickBusy(busy);
       render();
       try {
@@ -4159,7 +4424,7 @@
       const b = state.browse;
       if (!b || !b.rows || !b.rows.length) return;
       const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
-      const busy = startBusy('Executing ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const busy = startBusy('Executing ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'), ids.length);
       const elapsed = tickBusy(busy);
       render();
       try {
@@ -4307,7 +4572,7 @@
       const scope = el.dataset.scope || 'file';
       const url = el.dataset.url;
       const ids = el.dataset.ids ? el.dataset.ids.split(',').map(Number).filter(Boolean) : [];
-      const busy = startBusy('Embedding cover picture (' + scope + ')');
+      const busy = startBusy('Embedding cover picture (' + scope + ')', ids.length || 1);
       const elapsed = tickBusy(busy);
       try {
         const r = await api('/files/' + fid + '/cover/apply', {
@@ -4328,7 +4593,7 @@
     } else if (a === 'cover-skip') {
       const ids = (el.dataset.ids || '').split(',').map(Number).filter(Boolean);
       if (!ids.length) return;
-      const busy = startBusy('Skipping cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const busy = startBusy('Skipping cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'), ids.length);
       try {
         await api('/covers/skip', { method: 'POST', body: { ids: ids } });
         invalidate('coverParked');
@@ -4342,7 +4607,7 @@
       const b = state.browse;
       if (!b || !b.rows || !b.rows.length) return;
       const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
-      const busy = startBusy('Checking cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'));
+      const busy = startBusy('Checking cover art for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's'), ids.length);
       const elapsed = tickBusy(busy);
       render();
       try {
@@ -4429,12 +4694,14 @@
     } else if (a === 'meta-check-run' || a === 'meta-check-force') {
       const force = a === 'meta-check-force';
       if (state.metaChecking) return;
+      state.metaTouchedFiles.clear();
       state.metaChecking = true;
       if (state.metadata) {
         state.metadata.meta_checking = true;
         state.metadata.meta_progress = { running: true, force: force, total: 0, done: 0, diff: 0, ok: 0, current_file: '' };
       }
       if (state.dash) state.dash.meta_checking = true;
+      ensureFastBusyPoll();
       renderPreservingMetaScroll();
       try {
         const r = await api('/metadata/check', {
@@ -4475,7 +4742,11 @@
       if (!b || !b.rows || !b.rows.length) return;
       const ids = state.fileSel.length ? state.fileSel.slice() : b.rows.map((f) => f.id);
       state.metaChecking = true;
-      if (state.dash) state.dash.meta_checking = true;
+      if (state.dash) {
+        state.dash.meta_checking = true;
+        state.dash.meta_progress = { running: true, total: ids.length, done: 0, diff: 0, ok: 0, current_file: '' };
+      }
+      ensureFastBusyPoll();
       render();
       try {
         await api('/metadata/check', {
@@ -4519,14 +4790,9 @@
       ensureMetaFieldsVisible(enabledKeys);
       const valuesMap = buildBulkValuesMap(enabledKeys);
       if (a === 'meta-bulk-stage') {
-        await api('/metadata/select', {
-          method: 'POST',
-          body: { ids: ids, values: valuesMap },
-        });
+        ids.forEach((id) => state.metaTouchedFiles.add(id));
+        await queueMetaSelect({ ids: ids, values: valuesMap });
         enabledKeys.forEach((k) => { getBulkFieldDraft(k).dirty = false; });
-        invalidate('metadata');
-        await loadKey('metadata');
-        // Ensure edited files stay visible & selected so the updated parameters are shown selected in the list
         const mNow = state.metadata || {};
         const visAfter = filterAndSortMetaFiles(mNow.files || [], mNow.options || {});
         const visSet = new Set(visAfter.map((f) => f.id));
@@ -4536,20 +4802,18 @@
         state.metaSel = ids.slice();
         const paramLabels = enabledKeys.map((k) => META_FIELD_MAP[k] || k).join(', ');
         toast('Selected updated ' + paramLabels + ' in list for ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
-        render();
+        renderPreservingMetaScroll();
       } else {
-        const busy = startBusy('Writing ' + enabledKeys.length + ' parameter(s) to ' + ids.length + ' selected file(s)');
+        const busy = startBusy('Writing ' + enabledKeys.length + ' parameter(s) to ' + ids.length + ' selected file(s)', ids.length);
         const elapsed = tickBusy(busy);
         try {
-          await api('/metadata/select', {
-            method: 'POST',
-            body: { ids: ids, values: valuesMap },
-          });
+          await queueMetaSelect({ ids: ids, values: valuesMap });
           enabledKeys.forEach((k) => { getBulkFieldDraft(k).dirty = false; });
           const r = await api('/metadata/apply', {
             method: 'POST',
             body: { ids: ids, scope: 'file', overrides: valuesMap, fields: enabledKeys },
           });
+          ids.forEach((id) => state.metaTouchedFiles.delete(id));
           bumpCoverCache();
           invalidate('metadata');
           invalidate('coverParked');
@@ -4565,7 +4829,7 @@
           elapsed.stop();
           endBusy(busy);
         }
-        render();
+        renderPreservingMetaScroll();
       }
     } else if (a === 'meta-pick') {
       const fid = Number(el.dataset.file);
@@ -4573,21 +4837,26 @@
       const choice = el.dataset.choice;
       const editKey = fid + ':' + field;
       delete state.metaEditing[editKey];
+      state.metaTouchedFiles.add(fid);
       const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === fid);
-      if (item && item.fields && item.fields[field]) {
-        item.fields[field].choice = choice;
+      const fo = item && item.fields && item.fields[field];
+      if (fo) {
+        if (choice === 'discogs' && !fo.discogs) return;
+        if (choice === 'musicbrainz' && !fo.musicbrainz) return;
+        if (choice === 'open' && !fo.open) return;
+        if (choice === 'path' && !fo.path) return;
+        fo.choice = choice;
       }
-      render();
-      await api('/metadata/select', { method: 'POST', body: { ids: [fid], field: field, choice: choice } });
-      await loadKey('metadata');
-      render();
+      renderPreservingMetaScroll();
+      await queueMetaSelect({ ids: [fid], field: field, choice: choice });
+      renderPreservingMetaScroll();
     } else if (a === 'meta-edit-toggle') {
       const fid = Number(el.dataset.file);
       const field = el.dataset.field;
       const editKey = fid + ':' + field;
       if (state.metaEditing[editKey]) delete state.metaEditing[editKey];
       else state.metaEditing[editKey] = true;
-      render();
+      renderPreservingMetaScroll();
       const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
       if (inp) { inp.focus(); inp.select(); }
     } else if (a === 'meta-save-custom') {
@@ -4597,25 +4866,24 @@
       const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
       const val = inp ? inp.value.trim() : '';
       delete state.metaEditing[editKey];
+      state.metaTouchedFiles.add(fid);
       const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === fid);
       if (item && item.fields && item.fields[field]) {
         item.fields[field].choice = 'custom';
         item.fields[field].custom_value = val;
       }
-      render();
-      await api('/metadata/select', {
-        method: 'POST',
-        body: { ids: [fid], field: field, choice: 'custom', custom_value: val },
-      });
-      await loadKey('metadata');
-      render();
+      renderPreservingMetaScroll();
+      await queueMetaSelect({ ids: [fid], field: field, choice: 'custom', custom_value: val });
+      renderPreservingMetaScroll();
     } else if (a === 'meta-opt-search-from') {
       const mode = el.dataset.mode || 'auto';
       const saved = await api('/metadata/options', { method: 'PUT', body: { searchFrom: mode } });
       if (state.metadata) state.metadata.options = saved;
+      if (state.dash) state.dash.search_from = (saved && saved.search_from) || mode;
       const modeLabels = { auto: 'Auto (smart)', file: 'From file (folder / file name)', metadata: 'From meta data (file tags)' };
       toast('Artist / Title search source set to: ' + (modeLabels[mode] || mode));
-      renderPreservingMetaScroll();
+      if (currentRoute() === 'metadata') renderPreservingMetaScroll();
+      else render();
     } else if (a === 'meta-bulk-artist-title') {
       const choice = el.dataset.choice || 'path';
       const ids = state.metaSel.slice();
@@ -4624,18 +4892,14 @@
         return;
       }
       ensureMetaFieldsVisible(['artist', 'title']);
-      await api('/metadata/select', {
-        method: 'POST',
-        body: {
-          ids: ids,
-          values: {
-            artist: { choice: choice, value: '' },
-            title: { choice: choice, value: '' },
-          },
+      ids.forEach((id) => state.metaTouchedFiles.add(id));
+      await queueMetaSelect({
+        ids: ids,
+        values: {
+          artist: { choice: choice, value: '' },
+          title: { choice: choice, value: '' },
         },
       });
-      invalidate('metadata');
-      await loadKey('metadata');
       const mNow = state.metadata || {};
       const visAfter = filterAndSortMetaFiles(mNow.files || [], mNow.options || {});
       const visSet = new Set(visAfter.map((f) => f.id));
@@ -4644,7 +4908,7 @@
       }
       state.metaSel = ids.slice();
       toast('Selected Artist & Title from ' + (choice === 'path' ? 'File (folder / file name)' : 'Meta data (current tags)') + ' on ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
-      render();
+      renderPreservingMetaScroll();
     } else if (a === 'meta-bulk-choice') {
       const choice = el.dataset.choice || 'online';
       const ids = state.metaSel.slice();
@@ -4652,10 +4916,30 @@
         toast('Select one or more files in column 1 first');
         return;
       }
-      const fieldFilter = state.metaFilterField !== 'all' ? state.metaFilterField : 'all';
-      await api('/metadata/select', { method: 'POST', body: { ids: ids, field: fieldFilter, choice: choice } });
-      invalidate('metadata');
-      await loadKey('metadata');
+      const activeFields = getEnabledVisibleMetaFields();
+      const valuesPayload = {};
+      activeFields.forEach((k) => {
+        valuesPayload[k] = { choice: choice, value: '' };
+      });
+      ids.forEach((id) => state.metaTouchedFiles.add(id));
+      if (state.metadata && Array.isArray(state.metadata.files)) {
+        const idSet = new Set(ids);
+        state.metadata.files.forEach((item) => {
+          if (!idSet.has(item.id) || !item.fields) return;
+          activeFields.forEach((k) => {
+            const fo = item.fields[k];
+            if (!fo) return;
+            if (choice === 'discogs' && fo.discogs) fo.choice = 'discogs';
+            else if (choice === 'musicbrainz' && fo.musicbrainz) fo.choice = 'musicbrainz';
+            else if (choice === 'open' && fo.open) fo.choice = 'open';
+            else if (choice === 'online' && fo.online) fo.choice = 'online';
+            else if (choice === 'path' && fo.path) fo.choice = 'path';
+            else if (choice === 'current') fo.choice = 'current';
+          });
+        });
+      }
+      renderPreservingMetaScroll();
+      await queueMetaSelect({ ids: ids, values: valuesPayload });
       const mNow = state.metadata || {};
       const visAfter = filterAndSortMetaFiles(mNow.files || [], mNow.options || {});
       const visSet = new Set(visAfter.map((f) => f.id));
@@ -4664,11 +4948,11 @@
       }
       state.metaSel = ids.slice();
       const srcNames = { discogs: 'Discogs', musicbrainz: 'MusicBrainz', open: 'Open (iTunes)', path: 'Folder / File', current: 'Current tag' };
-      toast('Selected ' + (srcNames[choice] || choice) + ' on ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
-      render();
+      toast('Selected ' + (srcNames[choice] || choice) + ' for ' + activeFields.length + ' enabled parameter(s) on ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' · press "Update Selected (' + ids.length + ')" to write ID3 tags');
+      renderPreservingMetaScroll();
     } else if (a === 'meta-clear-sel') {
       state.metaSel = [];
-      render();
+      renderPreservingMetaScroll();
     } else if (a === 'meta-apply-one' || a === 'meta-apply-selected' || a === 'meta-apply-visible') {
       let ids = [];
       if (a === 'meta-apply-one') {
@@ -4680,7 +4964,7 @@
         ids = filterAndSortMetaFiles(m.files || [], m.options || {}).map((f) => f.id);
       }
       if (!ids.length) return;
-      const busy = startBusy('Writing ID3 tags to ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' (preserving file date/time stamp)');
+      const busy = startBusy('Writing ID3 tags to ' + ids.length + ' file' + (ids.length === 1 ? '' : 's') + ' (preserving file date/time stamp)', ids.length);
       const elapsed = tickBusy(busy);
       try {
         // If user edited fields in Bulk edit parameters and directly clicked "Update Selected ()", apply those bulk edits too
@@ -4692,11 +4976,12 @@
           if (dirtyBulkKeys.length) {
             ensureMetaFieldsVisible(dirtyBulkKeys);
             const valuesMap = buildBulkValuesMap(dirtyBulkKeys);
-            await api('/metadata/select', { method: 'POST', body: { ids: ids, values: valuesMap } });
+            await queueMetaSelect({ ids: ids, values: valuesMap });
             dirtyBulkKeys.forEach((k) => { getBulkFieldDraft(k).dirty = false; });
           }
         }
         const r = await api('/metadata/apply', { method: 'POST', body: { ids: ids, scope: 'file' } });
+        ids.forEach((id) => state.metaTouchedFiles.delete(id));
         bumpCoverCache();
         invalidate('metadata');
         invalidate('coverParked');
@@ -4716,7 +5001,7 @@
         elapsed.stop();
         endBusy(busy);
       }
-      render();
+      renderPreservingMetaScroll();
     } else if (a === 'open-meta-modal') {
       const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
       if (f) {
@@ -4750,11 +5035,19 @@
       const choice = el.dataset.choice;
       const editKey = 'modal:' + fid + ':' + field;
       delete state.metaEditing[editKey];
-      if (META_MODAL.item && META_MODAL.item.fields && META_MODAL.item.fields[field]) {
-        META_MODAL.item.fields[field].choice = choice;
+      state.metaTouchedFiles.add(fid);
+      const fo = META_MODAL.item && META_MODAL.item.fields && META_MODAL.item.fields[field];
+      if (fo) {
+        if (choice === 'discogs' && !fo.discogs) return;
+        if (choice === 'musicbrainz' && !fo.musicbrainz) return;
+        if (choice === 'open' && !fo.open) return;
+        if (choice === 'path' && !fo.path) return;
+        fo.choice = choice;
       }
       renderMetaModal();
-      await api('/metadata/select', { method: 'POST', body: { ids: [fid], field: field, choice: choice } });
+      await queueMetaSelect({ ids: [fid], field: field, choice: choice }, { updateModal: true });
+      renderMetaModal();
+      if (currentRoute() === 'metadata') renderPreservingMetaScroll();
     } else if (a === 'meta-modal-edit-toggle') {
       const fid = Number(el.dataset.file);
       const field = el.dataset.field;
@@ -4771,19 +5064,24 @@
       const inp = document.querySelector('[data-meta-custom-input="' + editKey + '"]');
       const val = inp ? inp.value.trim() : '';
       delete state.metaEditing[editKey];
+      state.metaTouchedFiles.add(fid);
       if (META_MODAL.item && META_MODAL.item.fields && META_MODAL.item.fields[field]) {
         META_MODAL.item.fields[field].choice = 'custom';
         META_MODAL.item.fields[field].custom_value = val;
       }
       renderMetaModal();
-      await api('/metadata/select', {
-        method: 'POST',
-        body: { ids: [fid], field: field, choice: 'custom', custom_value: val },
-      });
+      await queueMetaSelect({ ids: [fid], field: field, choice: 'custom', custom_value: val }, { updateModal: true });
+      renderMetaModal();
+      if (currentRoute() === 'metadata') renderPreservingMetaScroll();
     } else if (a === 'meta-modal-bulk') {
       const choice = el.dataset.choice || 'online';
       if (META_MODAL.item && META_MODAL.item.fields) {
-        META_FIELDS.forEach(([k]) => {
+        state.metaTouchedFiles.add(META_MODAL.fileId);
+        const opts = (state.metadata && state.metadata.options) || {};
+        const enabledKeys = Array.isArray(opts.fields) && opts.fields.length ? opts.fields : ALL_META_FIELD_KEYS;
+        const valuesPayload = {};
+        enabledKeys.forEach((k) => {
+          valuesPayload[k] = { choice: choice, value: '' };
           const fo = META_MODAL.item.fields[k];
           if (!fo) return;
           if (choice === 'discogs' && fo.discogs) fo.choice = 'discogs';
@@ -4794,7 +5092,9 @@
           else if (choice === 'current') fo.choice = 'current';
         });
         renderMetaModal();
-        await api('/metadata/select', { method: 'POST', body: { ids: [META_MODAL.fileId], field: 'all', choice: choice } });
+        await queueMetaSelect({ ids: [META_MODAL.fileId], values: valuesPayload }, { updateModal: true });
+        renderMetaModal();
+        if (currentRoute() === 'metadata') renderPreservingMetaScroll();
       }
     } else if (a === 'meta-modal-apply') {
       await applyMetaFromModal(el.dataset.scope || 'file');
@@ -4989,10 +5289,16 @@
         return;
       }
       if (!committed) return;
-      if (k === 'status') state.metaFilterStatus = el.value;
-      else if (k === 'field') state.metaFilterField = el.value;
-      else if (k === 'folder') state.metaFilterFolder = el.value;
-      else if (k === 'sort') state.metaSort = el.value;
+      if (k === 'status') {
+        state.metaFilterStatus = el.value;
+        state.metaTouchedFiles.clear();
+      } else if (k === 'field') {
+        state.metaFilterField = el.value;
+        state.metaTouchedFiles.clear();
+      } else if (k === 'folder') {
+        state.metaFilterFolder = el.value;
+        state.metaTouchedFiles.clear();
+      } else if (k === 'sort') state.metaSort = el.value;
       render();
       return;
     }
@@ -5201,18 +5507,84 @@
     applyMenu();
   });
 
-  const coverModalEl = document.getElementById('cover-modal');
-  if (coverModalEl) {
-    coverModalEl.addEventListener('click', (ev) => {
-      if (ev.target === coverModalEl) closeCoverModal();
-    });
+  // Popup modals (#cover-modal, #metadata-modal, #editor) intentionally stay open on backdrop click.
+
+  /* ------------------------------------------------ cover hover zoom preview */
+  const coverZoomTip = document.getElementById('cover-zoom-tip');
+  const coverZoomImg = document.getElementById('cover-zoom-img');
+  const coverZoomCaption = document.getElementById('cover-zoom-caption');
+  let activeCoverZoomEl = null;
+
+  function findCoverZoomTarget(target) {
+    if (!target || !target.closest) return null;
+    const explicit = target.closest('[data-cover-zoom]');
+    if (explicit && explicit.dataset.coverZoom) return explicit;
+    const img = target.closest('img.cover-mini-thumb, img.meta-cover-mini, img.cover-cand-img, img.cover-current-img');
+    if (img && img.getAttribute('src')) return img;
+    return null;
   }
-  const metaModalEl = document.getElementById('metadata-modal');
-  if (metaModalEl) {
-    metaModalEl.addEventListener('click', (ev) => {
-      if (ev.target === metaModalEl) closeMetaModal();
-    });
+
+  function positionCoverZoom(clientX, clientY) {
+    if (!coverZoomTip || coverZoomTip.hidden) return;
+    const pad = 16;
+    const boxW = coverZoomTip.offsetWidth || 308;
+    const boxH = coverZoomTip.offsetHeight || 320;
+    let left = clientX + 18;
+    let top = clientY - Math.round(boxH / 2);
+    if (left + boxW + pad > window.innerWidth) {
+      left = Math.max(pad, clientX - boxW - 18);
+    }
+    top = Math.max(pad, Math.min(window.innerHeight - boxH - pad, top));
+    coverZoomTip.style.left = Math.round(left) + 'px';
+    coverZoomTip.style.top = Math.round(top) + 'px';
   }
+
+  function hideCoverZoom() {
+    activeCoverZoomEl = null;
+    if (coverZoomTip) coverZoomTip.hidden = true;
+  }
+
+  document.addEventListener('mouseover', (ev) => {
+    const el = findCoverZoomTarget(ev.target);
+    if (!el || !coverZoomTip || !coverZoomImg) {
+      if (activeCoverZoomEl && (!ev.target || !activeCoverZoomEl.contains(ev.target))) hideCoverZoom();
+      return;
+    }
+    if (el === activeCoverZoomEl && !coverZoomTip.hidden) return;
+    const src = el.dataset.coverZoom || el.getAttribute('src') || '';
+    if (!src) { hideCoverZoom(); return; }
+    activeCoverZoomEl = el;
+    if (coverZoomImg.getAttribute('src') !== src) coverZoomImg.setAttribute('src', src);
+    const cap = el.dataset.coverCaption || el.getAttribute('alt') || '';
+    if (coverZoomCaption) {
+      coverZoomCaption.textContent = cap;
+      coverZoomCaption.hidden = !cap;
+    }
+    coverZoomTip.hidden = false;
+    positionCoverZoom(ev.clientX, ev.clientY);
+  });
+
+  document.addEventListener('mousemove', (ev) => {
+    if (!activeCoverZoomEl || !coverZoomTip || coverZoomTip.hidden) return;
+    if (!document.body.contains(activeCoverZoomEl)) {
+      hideCoverZoom();
+      return;
+    }
+    positionCoverZoom(ev.clientX, ev.clientY);
+  });
+
+  document.addEventListener('mouseout', (ev) => {
+    if (!activeCoverZoomEl) return;
+    const rel = ev.relatedTarget;
+    if (!rel || !activeCoverZoomEl.contains(rel)) {
+      const next = findCoverZoomTarget(rel);
+      if (!next) hideCoverZoom();
+    }
+  });
+
+  window.addEventListener('scroll', hideCoverZoom, true);
+  document.addEventListener('pointerdown', hideCoverZoom);
+
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.metaBulkVal) {
       ev.preventDefault();
@@ -5365,33 +5737,41 @@
     }
 
     if (inModal && META_MODAL.open && META_MODAL.item && META_MODAL.item.id === targetFileId) {
+      state.metaTouchedFiles.add(targetFileId);
       if (META_MODAL.item.fields && META_MODAL.item.fields[targetField]) {
         META_MODAL.item.fields[targetField].choice = 'custom';
         META_MODAL.item.fields[targetField].custom_value = draggedVal;
       }
       delete state.metaEditing['modal:' + targetFileId + ':' + targetField];
       renderMetaModal();
-      api('/metadata/select', {
-        method: 'POST',
-        body: { ids: [targetFileId], field: targetField, choice: 'custom', custom_value: draggedVal },
-      }).catch(SAVE_ERR);
+      queueMetaSelect(
+        { ids: [targetFileId], field: targetField, choice: 'custom', custom_value: draggedVal },
+        { updateModal: true }
+      )
+        .then(() => {
+          renderMetaModal();
+          if (currentRoute() === 'metadata') renderPreservingMetaScroll();
+        })
+        .catch(SAVE_ERR);
       toast('Assigned to ' + (META_FIELD_MAP[targetField] || targetField));
       return;
     }
 
     delete state.metaEditing[targetFileId + ':' + targetField];
+    state.metaTouchedFiles.add(targetFileId);
     const item = state.metadata && state.metadata.files && state.metadata.files.find((x) => x.id === targetFileId);
     if (item && item.fields && item.fields[targetField]) {
       item.fields[targetField].choice = 'custom';
       item.fields[targetField].custom_value = draggedVal;
     }
-    render();
-    api('/metadata/select', {
-      method: 'POST',
-      body: { ids: [targetFileId], field: targetField, choice: 'custom', custom_value: draggedVal },
+    renderPreservingMetaScroll();
+    queueMetaSelect({
+      ids: [targetFileId],
+      field: targetField,
+      choice: 'custom',
+      custom_value: draggedVal,
     })
-      .then(() => loadKey('metadata'))
-      .then(() => render())
+      .then(() => renderPreservingMetaScroll())
       .catch(SAVE_ERR);
     toast('Assigned "' + (draggedVal.length > 36 ? draggedVal.slice(0, 36) + '…' : draggedVal) + '" to ' + (META_FIELD_MAP[targetField] || targetField));
   });

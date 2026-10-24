@@ -59,6 +59,18 @@ class Engine:
         self._wake = threading.Event()
         self._meta_stop = threading.Event()
         self._meta_lock = threading.Lock()
+        self._meta_select_lock = threading.Lock()
+        self._action_prog_lock = threading.Lock()
+        self._action_progress: dict = {
+            "active": False,
+            "kind": "",
+            "label": "",
+            "done": 0,
+            "total": 0,
+            "percent": 0,
+            "current_file": "",
+        }
+        self._approved_batch_total = 0
         self._meta_checking = False
         self._meta_thread: threading.Thread | None = None
         self._meta_progress: dict = {
@@ -218,6 +230,53 @@ class Engine:
         current = next(iter(inflight.values()), None) or (waiting[0] if waiting else None)
         return count, current
 
+    def note_approved(self, added: int) -> None:
+        if added <= 0:
+            return
+        with self._action_prog_lock:
+            self._approved_batch_total = max(self._approved_batch_total + added, added)
+
+    def approved_progress(self, pending: int) -> tuple[int, int]:
+        with self._action_prog_lock:
+            if pending <= 0:
+                self._approved_batch_total = 0
+                return 0, 0
+            tot = max(self._approved_batch_total, pending)
+            self._approved_batch_total = tot
+            return max(0, tot - pending), tot
+
+    def _set_action_progress(self, kind: str, label: str, done: int, total: int, current_file: str = "") -> None:
+        tot = max(1, int(total or 0))
+        dn = max(0, min(tot, int(done or 0)))
+        pct = int(round((dn / tot) * 100))
+        with self._action_prog_lock:
+            self._action_progress = {
+                "active": True,
+                "kind": kind,
+                "label": label,
+                "done": dn,
+                "total": tot,
+                "percent": pct,
+                "current_file": current_file or "",
+            }
+
+    def _clear_action_progress(self, kind: str | None = None) -> None:
+        with self._action_prog_lock:
+            if kind is None or self._action_progress.get("kind") == kind:
+                self._action_progress = {
+                    "active": False,
+                    "kind": "",
+                    "label": "",
+                    "done": 0,
+                    "total": 0,
+                    "percent": 0,
+                    "current_file": "",
+                }
+
+    def get_action_progress(self) -> dict:
+        with self._action_prog_lock:
+            return dict(self._action_progress)
+
     def status(self, media_stats: dict | None = None) -> str:
         mode = self.mode()
         if mode == "off":
@@ -340,6 +399,10 @@ class Engine:
         if killed and not inflight_ids:
             stopped_items.append(f"{killed} audio tool process(es)")
 
+        self._clear_action_progress()
+        with self._action_prog_lock:
+            self._approved_batch_total = 0
+
         self._wake.set()
         summary = ", ".join(stopped_items) if stopped_items else "active request"
         self.db.log("warn", f"Stopped current action ({summary})")
@@ -430,6 +493,14 @@ class Engine:
     def scan_now(self, media: str | None = None) -> dict:
         cancel = self._new_cancel()
         self.scanner.cancel_fn = cancel
+        targets = [media] if media else list(MEDIA)
+        total_targets = max(1, len(targets))
+
+        def _on_scan_prog(done: int, total: int, cur: str = "") -> None:
+            self._set_action_progress("scan", "Scanning folders", done, total, cur)
+
+        self.scanner.progress_fn = _on_scan_prog
+        self._set_action_progress("scan", "Scanning folders", 0, total_targets, "")
         with self._scan_lock:
             self._scanning += 1
         try:
@@ -440,6 +511,8 @@ class Engine:
             return res
         finally:
             self.scanner.cancel_fn = None
+            self.scanner.progress_fn = None
+            self._clear_action_progress("scan")
             with self._scan_lock:
                 self._scanning -= 1
             if not cancel():
@@ -812,12 +885,17 @@ class Engine:
             "UPDATE files SET status = 'processing' WHERE id = ? AND status != 'processing'", (row["id"],))
         if not claimed:
             raise FileBusy("this file is being processed right now; try again when it is done")
+        self._set_action_progress("edit_audio", "Editing audio", 0, 1, rel)
         try:
-            return self._edit_audio(src, media, rel, row, fade_in, fade_out, cut, mode,
-                                    settings["general"]["preserveMtime"])
+            out = self._edit_audio(src, media, rel, row, fade_in, fade_out, cut, mode,
+                                   settings["general"]["preserveMtime"])
+            self._set_action_progress("edit_audio", "Editing audio", 1, 1, rel)
+            return out
         except BaseException:
             self.db.execute("UPDATE files SET status = ? WHERE id = ?", (row["status"], row["id"]))
             raise
+        finally:
+            self._clear_action_progress("edit_audio")
 
     def _edit_audio(self, src: str, media: str, rel: str, row: dict, fade_in: float, fade_out: float,
                     cut: tuple[float, float] | None, mode: str, preserve_mtime: bool) -> dict:
@@ -880,40 +958,49 @@ class Engine:
         src = self.abs_path(media, rel)
         if not os.path.isfile(src):
             raise ValueError("file not found")
+        standalone = not self.get_action_progress().get("active")
+        if standalone:
+            self._set_action_progress("measure_one", "Checking level", 0, 1, rel)
         cancel = cancel or self._new_cancel()
-        st = state.get_settings(self.db)
-        lufs, true_peak, probe, cuts = self._measure_and_detect(media, src, st["general"], cancel)
-        name = os.path.basename(rel)
-        cfg_m = st[media]
-        family = audio_family(probe.codec)
-        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        strategy = cfg_m.get("lossy", "reencode") if media == "audio" else "reencode"
-        d = decide(media=media, ext=ext, family=family, measured=lufs, true_peak=true_peak,
-                   target=cfg_m["target"], ceiling=cfg_m["truePeak"], threshold=cfg_m["threshold"],
-                   override=cfg_m["override"], strategy=strategy, tools=self.tools,
-                   hysteresis=cfg_m.get("hysteresis", 0.5))
-        gain_db = 0.0 if d.action == "ok" else d.gain
-        sil_count = len(cuts)
-        sil_dur = round(sum(ce - cs for cs, ce in cuts), 2)
-        self.db.execute(
-            "UPDATE files SET lufs = ?, true_peak = ?, gain_db = ?, method = ?, "
-            "silent_sections = ?, silent_duration = ?, measured_at = ?, codec = ?, family = ? "
-            "WHERE media = ? AND relpath = ? AND status != 'processing'",
-            (lufs, true_peak, gain_db, d.method, sil_count, sil_dur, time.time(),
-             probe.codec, family, media, rel),
-        )
-        if media == "audio":
-            row = self.db.one("SELECT * FROM files WHERE media = ? AND relpath = ?", (media, rel))
-            if row:
-                if st["general"].get("coverAuto") and not st["general"].get("dryRun"):
-                    self.check_file_cover(row, st, online=True)
-                else:
-                    self.inspect_file_cover(row)
-        self.db.log("info", f"Level checked: {name} {lufs:.1f} LUFS, true peak {true_peak:.1f} dBTP"
-                            + (f", {sil_count} empty section(s) ({sil_dur:.1f} s)" if sil_count else ""), media)
-        return {"name": name, "relpath": rel, "lufs": lufs, "true_peak": true_peak,
-                "gain_db": gain_db, "silent_sections": sil_count, "silent_duration": sil_dur,
-                "codec": probe.codec}
+        try:
+            st = state.get_settings(self.db)
+            lufs, true_peak, probe, cuts = self._measure_and_detect(media, src, st["general"], cancel)
+            name = os.path.basename(rel)
+            cfg_m = st[media]
+            family = audio_family(probe.codec)
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            strategy = cfg_m.get("lossy", "reencode") if media == "audio" else "reencode"
+            d = decide(media=media, ext=ext, family=family, measured=lufs, true_peak=true_peak,
+                       target=cfg_m["target"], ceiling=cfg_m["truePeak"], threshold=cfg_m["threshold"],
+                       override=cfg_m["override"], strategy=strategy, tools=self.tools,
+                       hysteresis=cfg_m.get("hysteresis", 0.5))
+            gain_db = 0.0 if d.action == "ok" else d.gain
+            sil_count = len(cuts)
+            sil_dur = round(sum(ce - cs for cs, ce in cuts), 2)
+            self.db.execute(
+                "UPDATE files SET lufs = ?, true_peak = ?, gain_db = ?, method = ?, "
+                "silent_sections = ?, silent_duration = ?, measured_at = ?, codec = ?, family = ? "
+                "WHERE media = ? AND relpath = ? AND status != 'processing'",
+                (lufs, true_peak, gain_db, d.method, sil_count, sil_dur, time.time(),
+                 probe.codec, family, media, rel),
+            )
+            if media == "audio":
+                row = self.db.one("SELECT * FROM files WHERE media = ? AND relpath = ?", (media, rel))
+                if row:
+                    if st["general"].get("coverAuto") and not st["general"].get("dryRun"):
+                        self.check_file_cover(row, st, online=True)
+                    else:
+                        self.inspect_file_cover(row)
+            self.db.log("info", f"Level checked: {name} {lufs:.1f} LUFS, true peak {true_peak:.1f} dBTP"
+                                + (f", {sil_count} empty section(s) ({sil_dur:.1f} s)" if sil_count else ""), media)
+            if standalone:
+                self._set_action_progress("measure_one", "Checking level", 1, 1, rel)
+            return {"name": name, "relpath": rel, "lufs": lufs, "true_peak": true_peak,
+                    "gain_db": gain_db, "silent_sections": sil_count, "silent_duration": sil_dur,
+                    "codec": probe.codec}
+        finally:
+            if standalone:
+                self._clear_action_progress("measure_one")
 
     def _target_rows(self, media: str, ids: list[int] | None, dir_rel: str | None) -> list[dict]:
         if ids:
@@ -933,25 +1020,32 @@ class Engine:
         """Check level and empty sections for the selected files (or all files in dir_rel)."""
         cancel = self._new_cancel()
         rows = self._target_rows(media, ids, dir_rel)
+        total = max(1, len(rows))
+        self._set_action_progress("check_files", "Checking levels", 0, total, "")
         checked = 0
         empty = 0
         stopped = False
-        for r in rows:
-            if cancel():
-                stopped = True
-                break
-            if r["status"] == "processing":
-                continue
-            try:
-                res = self.measure(media, r["relpath"], cancel=cancel)
-                checked += 1
-                if res.get("silent_sections", 0) > 0:
-                    empty += 1
-            except ff.Cancelled:
-                stopped = True
-                break
-            except Exception as exc:
-                self.db.log("error", f"{r['name']}: {exc}", media)
+        try:
+            for idx, r in enumerate(rows):
+                if cancel():
+                    stopped = True
+                    break
+                self._set_action_progress("check_files", "Checking levels", idx, total, r["relpath"])
+                if r["status"] == "processing":
+                    continue
+                try:
+                    res = self.measure(media, r["relpath"], cancel=cancel)
+                    checked += 1
+                    if res.get("silent_sections", 0) > 0:
+                        empty += 1
+                except ff.Cancelled:
+                    stopped = True
+                    break
+                except Exception as exc:
+                    self.db.log("error", f"{r['name']}: {exc}", media)
+                self._set_action_progress("check_files", "Checking levels", idx + 1, total, r["relpath"])
+        finally:
+            self._clear_action_progress("check_files")
         out = {"checked": checked, "empty_sections": empty}
         if stopped:
             out["stopped"] = True
@@ -961,28 +1055,35 @@ class Engine:
         """Execute normalization (and empty-section removal when enabled) on the selected files."""
         cancel = self._new_cancel()
         rows = self._target_rows(media, ids, dir_rel)
+        total = max(1, len(rows))
+        self._set_action_progress("execute_files", "Executing normalization", 0, total, "")
         executed = 0
         changed = 0
         stopped = False
-        for r in rows:
-            if cancel():
-                stopped = True
-                break
-            if r["status"] == "processing":
-                continue
-            fid = r["id"]
-            if r["status"] == "parked" and r["gain_db"] is not None:
-                self.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
-            else:
-                self.db.execute("UPDATE files SET status = 'pending' WHERE id = ?", (fid,))
-            self._process(fid, extra_cancel=cancel)
-            if cancel():
-                stopped = True
-                break
-            executed += 1
-            after = self.db.one("SELECT status FROM files WHERE id = ?", (fid,))
-            if after and after["status"] == "changed":
-                changed += 1
+        try:
+            for idx, r in enumerate(rows):
+                if cancel():
+                    stopped = True
+                    break
+                self._set_action_progress("execute_files", "Executing normalization", idx, total, r["relpath"])
+                if r["status"] == "processing":
+                    continue
+                fid = r["id"]
+                if r["status"] == "parked" and r["gain_db"] is not None:
+                    self.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
+                else:
+                    self.db.execute("UPDATE files SET status = 'pending' WHERE id = ?", (fid,))
+                self._process(fid, extra_cancel=cancel)
+                if cancel():
+                    stopped = True
+                    break
+                executed += 1
+                after = self.db.one("SELECT status FROM files WHERE id = ?", (fid,))
+                if after and after["status"] == "changed":
+                    changed += 1
+                self._set_action_progress("execute_files", "Executing normalization", idx + 1, total, r["relpath"])
+        finally:
+            self._clear_action_progress("execute_files")
         out = {"executed": executed, "changed": changed}
         if stopped:
             out["stopped"] = True
@@ -1083,8 +1184,19 @@ class Engine:
                     self.db.log("ok", f"{row['name']}: embedded cover art from {local['title']}", "audio")
                     return {"status": "embedded", "has_cover": 1, "candidates": [local], **inspected}
 
+        sf = state.get_metadata_options(self.db).get("search_from") or "auto"
+        if sf == "file":
+            q_art, q_alb, q_tit = inspected["path_artist"], inspected["path_album"], inspected["path_title"]
+        elif sf == "metadata":
+            raw_info = cover.inspect_audio(src)
+            q_art = cover._clean_str(raw_info.get("artist") or raw_info.get("album_artist")) or inspected["tag_artist"]
+            q_alb = cover._clean_str(raw_info.get("album")) or inspected["tag_album"]
+            q_tit = cover._clean_str(raw_info.get("title")) or inspected["tag_title"]
+        else:
+            q_art, q_alb, q_tit = inspected["artist"], inspected["album"], inspected["title"]
+
         candidates = cover.search_covers(
-            inspected["artist"], inspected["album"], inspected["title"],
+            q_art, q_alb, q_tit,
             st, db=self.db, force_refresh=force_refresh,
         )
         if len(candidates) == 1:
@@ -1133,7 +1245,7 @@ class Engine:
         meta_album = cover._clean_str(raw_info.get("album")) or inspected["tag_album"]
         meta_title = cover._clean_str(raw_info.get("title")) or inspected["tag_title"]
 
-        eff_mode = query_mode if query_mode in ("auto", "file", "metadata") else "auto"
+        eff_mode = query_mode if query_mode in ("auto", "file", "metadata") else (state.get_metadata_options(self.db).get("search_from") or "auto")
         if eff_mode == "file":
             base_artist = inspected["path_artist"]
             base_album = inspected["path_album"]
@@ -1241,15 +1353,22 @@ class Engine:
         if only_missing and len(targets) > 1:
             targets = [r for r in targets if not r.get("has_cover")]
 
+        total = max(1, len(targets))
+        self._set_action_progress("apply_cover", "Embedding cover art", 0, total, "")
         updated = 0
-        for r in targets:
-            if r["status"] == "processing":
-                continue
-            try:
-                self._embed_into_row(r, data, mime, st)
-                updated += 1
-            except Exception as exc:
-                self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
+        try:
+            for idx, r in enumerate(targets):
+                self._set_action_progress("apply_cover", "Embedding cover art", idx, total, r["relpath"])
+                if r["status"] == "processing":
+                    continue
+                try:
+                    self._embed_into_row(r, data, mime, st)
+                    updated += 1
+                except Exception as exc:
+                    self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
+                self._set_action_progress("apply_cover", "Embedding cover art", idx + 1, total, r["relpath"])
+        finally:
+            self._clear_action_progress("apply_cover")
 
         label = row["name"] if len(targets) == 1 else f"{row['dir']} ({updated} files)"
         if updated:
@@ -1286,26 +1405,33 @@ class Engine:
         checked = embedded = choices = not_found = present = 0
         cancel = self._new_cancel()
         stopped = False
-        for r in rows:
-            if cancel():
-                stopped = True
-                break
-            if r["status"] == "processing":
-                continue
-            try:
-                res = self.check_file_cover(r, st, online=True)
-                checked += 1
-                st_code = res.get("status")
-                if st_code == "ok":
-                    present += 1
-                elif st_code == "embedded":
-                    embedded += 1
-                elif st_code == "choices":
-                    choices += 1
-                elif st_code == "not_found":
-                    not_found += 1
-            except Exception as exc:
-                self.db.log("error", f"{r['name']}: cover check failed ({exc})", "audio")
+        total = max(1, len(rows))
+        self._set_action_progress("check_covers", "Checking cover art", 0, total, "")
+        try:
+            for idx, r in enumerate(rows):
+                if cancel():
+                    stopped = True
+                    break
+                self._set_action_progress("check_covers", "Checking cover art", idx, total, r["relpath"])
+                if r["status"] == "processing":
+                    continue
+                try:
+                    res = self.check_file_cover(r, st, online=True)
+                    checked += 1
+                    st_code = res.get("status")
+                    if st_code == "ok":
+                        present += 1
+                    elif st_code == "embedded":
+                        embedded += 1
+                    elif st_code == "choices":
+                        choices += 1
+                    elif st_code == "not_found":
+                        not_found += 1
+                except Exception as exc:
+                    self.db.log("error", f"{r['name']}: cover check failed ({exc})", "audio")
+                self._set_action_progress("check_covers", "Checking cover art", idx + 1, total, r["relpath"])
+        finally:
+            self._clear_action_progress("check_covers")
         return {
             "checked": checked,
             "present": present,
@@ -1335,29 +1461,36 @@ class Engine:
         updated = 0
         cancel = self._new_cancel()
         stopped = False
-        for r in rows:
-            if cancel():
-                stopped = True
-                break
-            if r["status"] == "processing":
-                continue
-            try:
-                cands = json.loads(r.get("cover_candidates") or "[]")
-            except Exception:
-                cands = []
-            if not cands:
-                continue
-            url = cands[0].get("image_url")
-            if not url:
-                continue
-            try:
-                if url not in downloaded:
-                    downloaded[url] = cover.download_cover(url, token=st["general"].get("discogsToken", ""))
-                data, mime = downloaded[url]
-                self._embed_into_row(r, data, mime, st)
-                updated += 1
-            except Exception as exc:
-                self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
+        total = max(1, len(rows))
+        self._set_action_progress("apply_first_cover", "Embedding cover art", 0, total, "")
+        try:
+            for idx, r in enumerate(rows):
+                if cancel():
+                    stopped = True
+                    break
+                self._set_action_progress("apply_first_cover", "Embedding cover art", idx, total, r["relpath"])
+                if r["status"] == "processing":
+                    continue
+                try:
+                    cands = json.loads(r.get("cover_candidates") or "[]")
+                except Exception:
+                    cands = []
+                if not cands:
+                    continue
+                url = cands[0].get("image_url")
+                if not url:
+                    continue
+                try:
+                    if url not in downloaded:
+                        downloaded[url] = cover.download_cover(url, token=st["general"].get("discogsToken", ""))
+                    data, mime = downloaded[url]
+                    self._embed_into_row(r, data, mime, st)
+                    updated += 1
+                except Exception as exc:
+                    self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
+                self._set_action_progress("apply_first_cover", "Embedding cover art", idx + 1, total, r["relpath"])
+        finally:
+            self._clear_action_progress("apply_first_cover")
         if updated:
             self.db.log("ok", f"Bulk embedded cover art into {updated} file(s)", "audio")
         return {"updated": updated}
@@ -1478,27 +1611,43 @@ class Engine:
         if cancel and cancel():
             raise ff.Cancelled("metadata check stopped")
 
-        cmp = metadata.compare_file_metadata(row["relpath"], current, path_meta, online_meta, opts)
         now_ts = time.time()
-
-        self.db.execute(
-            "INSERT INTO file_metadata (file_id, status, current_json, path_json, online_json, selected_json, diffs_json, path_diff, checked_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(file_id) DO UPDATE SET status = excluded.status, current_json = excluded.current_json, "
-            "path_json = excluded.path_json, online_json = excluded.online_json, selected_json = excluded.selected_json, "
-            "diffs_json = excluded.diffs_json, path_diff = excluded.path_diff, checked_at = excluded.checked_at",
-            (
-                row["id"],
-                cmp["status"],
-                json.dumps(current),
-                json.dumps(path_meta),
-                json.dumps(online_meta),
-                json.dumps(cmp["selected"]),
-                json.dumps(cmp["diffs"]),
-                cmp["path_diff"],
-                now_ts,
-            ),
-        )
+        with self._meta_select_lock:
+            existing_sel: dict | None = None
+            if not force_refresh and not custom_query:
+                prev = self.db.one(
+                    "SELECT m.selected_json, f.cover_query_source "
+                    "FROM file_metadata m JOIN files f ON f.id = m.file_id WHERE m.file_id = ?",
+                    (row["id"],),
+                )
+                if prev and prev.get("selected_json"):
+                    prev_q_src = prev.get("cover_query_source") or ""
+                    if not query_mode or not prev_q_src or prev_q_src == q_src:
+                        try:
+                            existing_sel = json.loads(prev["selected_json"] or "{}")
+                        except Exception:
+                            existing_sel = None
+            cmp = metadata.compare_file_metadata(
+                row["relpath"], current, path_meta, online_meta, opts, existing_sel
+            )
+            self.db.execute(
+                "INSERT INTO file_metadata (file_id, status, current_json, path_json, online_json, selected_json, diffs_json, path_diff, checked_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(file_id) DO UPDATE SET status = excluded.status, current_json = excluded.current_json, "
+                "path_json = excluded.path_json, online_json = excluded.online_json, selected_json = excluded.selected_json, "
+                "diffs_json = excluded.diffs_json, path_diff = excluded.path_diff, checked_at = excluded.checked_at",
+                (
+                    row["id"],
+                    cmp["status"],
+                    json.dumps(current),
+                    json.dumps(path_meta),
+                    json.dumps(online_meta),
+                    json.dumps(cmp["selected"]),
+                    json.dumps(cmp["diffs"]),
+                    cmp["path_diff"],
+                    now_ts,
+                ),
+            )
         has_cov = 1 if current.get("cover") == "present" else 0
         self.db.execute(
             "UPDATE files SET has_cover = ?, tag_artist = ?, tag_album = ?, tag_title = ?, cover_query_source = ? WHERE id = ?",
@@ -1741,78 +1890,90 @@ class Engine:
         """Update the chosen source ('current', 'path', 'discogs', 'musicbrainz', 'open', 'online', 'custom')
         for one field, multiple fields (custom or source-mode), or all fields, keeping file_metadata in sync."""
         if not ids:
-            return {"updated": 0}
+            return {"updated": 0, "files_updated": {}}
         if field == "all":
             field = None
-        opts = state.get_metadata_options(self.db)
-        placeholders = ",".join("?" for _ in ids)
-        rows = self.db.query(
-            f"SELECT f.id AS file_id, f.relpath, m.current_json, m.path_json, m.online_json, m.selected_json, m.diffs_json "
-            f"FROM files f JOIN file_metadata m ON m.file_id = f.id "
-            f"WHERE f.id IN ({placeholders})",
-            ids,
-        )
-
-        def _apply_one_field(selected_dict: dict, f_key: str, f_choice: str, f_custom: str | None,
-                             cur_d: dict, path_d: dict, online_d: dict, by_src_d: dict) -> None:
-            if f_key not in state.METADATA_FIELDS:
-                return
-            if f_choice == "custom":
-                val = str(f_custom if f_custom is not None else "").strip()
-                selected_dict[f_key] = {"choice": "custom", "value": val}
-            elif f_choice == "current":
-                selected_dict[f_key] = {"choice": "current", "value": str(cur_d.get(f_key) or "").strip()}
-            elif f_choice == "path":
-                p_val = str(path_d.get(f_key) or "").strip()
-                if p_val:
-                    selected_dict[f_key] = {"choice": "path", "value": p_val}
-            elif f_choice in ("discogs", "musicbrainz", "open"):
-                s_val = str(by_src_d[f_choice].get(f_key) or "").strip()
-                if s_val:
-                    selected_dict[f_key] = {"choice": f_choice, "value": s_val}
-            elif f_choice == "online":
-                d_val = str(by_src_d["discogs"].get(f_key) or "").strip()
-                m_val = str(by_src_d["musicbrainz"].get(f_key) or "").strip()
-                i_val = str(by_src_d["open"].get(f_key) or "").strip()
-                o_val = d_val or m_val or i_val or str(online_d.get(f_key) or "").strip()
-                picked_src = (
-                    "discogs" if d_val else ("musicbrainz" if m_val else ("open" if i_val else "online"))
-                )
-                if o_val:
-                    selected_dict[f_key] = {"choice": picked_src, "value": o_val}
-
-        updated = 0
-        for r in rows:
-            try:
-                current = json.loads(r["current_json"] or "{}")
-                path_meta = json.loads(r["path_json"] or "{}")
-                online_meta = json.loads(r["online_json"] or "{}")
-                selected = json.loads(r["selected_json"] or "{}")
-            except Exception:
-                continue
-
-            by_src = metadata.extract_online_by_source(online_meta)
-
-            if updates_map and isinstance(updates_map, dict):
-                for fk, fspec in updates_map.items():
-                    if isinstance(fspec, dict):
-                        m_choice = str(fspec.get("choice") or "custom").strip()
-                        m_val = fspec.get("value")
-                        _apply_one_field(selected, fk, m_choice, m_val, current, path_meta, online_meta, by_src)
-                    else:
-                        _apply_one_field(selected, fk, "custom", str(fspec if fspec is not None else ""), current, path_meta, online_meta, by_src)
-            else:
-                target_fields = [field] if field else list(state.METADATA_FIELDS)
-                for f in target_fields:
-                    _apply_one_field(selected, f, choice, custom_value, current, path_meta, online_meta, by_src)
-
-            cmp = metadata.compare_file_metadata(r["relpath"], current, path_meta, online_meta, opts, selected)
-            self.db.execute(
-                "UPDATE file_metadata SET status = ?, selected_json = ?, diffs_json = ?, path_diff = ? WHERE file_id = ?",
-                (cmp["status"], json.dumps(cmp["selected"]), json.dumps(cmp["diffs"]), cmp["path_diff"], r["file_id"]),
+        with self._meta_select_lock:
+            opts = state.get_metadata_options(self.db)
+            placeholders = ",".join("?" for _ in ids)
+            rows = self.db.query(
+                f"SELECT f.id AS file_id, f.relpath, m.current_json, m.path_json, m.online_json, m.selected_json, m.diffs_json "
+                f"FROM files f JOIN file_metadata m ON m.file_id = f.id "
+                f"WHERE f.id IN ({placeholders})",
+                ids,
             )
-            updated += 1
-        return {"updated": updated}
+
+            def _apply_one_field(selected_dict: dict, f_key: str, f_choice: str, f_custom: str | None,
+                                 cur_d: dict, path_d: dict, online_d: dict, by_src_d: dict) -> None:
+                if f_key not in state.METADATA_FIELDS:
+                    return
+                if f_choice == "custom":
+                    val = str(f_custom if f_custom is not None else "").strip()
+                    selected_dict[f_key] = {"choice": "custom", "value": val}
+                elif f_choice == "current":
+                    selected_dict[f_key] = {"choice": "current", "value": str(cur_d.get(f_key) or "").strip()}
+                elif f_choice == "path":
+                    p_val = str(path_d.get(f_key) or "").strip()
+                    if p_val:
+                        selected_dict[f_key] = {"choice": "path", "value": p_val}
+                elif f_choice in ("discogs", "musicbrainz", "open"):
+                    s_val = str(by_src_d[f_choice].get(f_key) or "").strip()
+                    if s_val:
+                        selected_dict[f_key] = {"choice": f_choice, "value": s_val}
+                elif f_choice == "online":
+                    d_val = str(by_src_d["discogs"].get(f_key) or "").strip()
+                    m_val = str(by_src_d["musicbrainz"].get(f_key) or "").strip()
+                    i_val = str(by_src_d["open"].get(f_key) or "").strip()
+                    o_val = d_val or m_val or i_val or str(online_d.get(f_key) or "").strip()
+                    picked_src = (
+                        "discogs" if d_val else ("musicbrainz" if m_val else ("open" if i_val else "online"))
+                    )
+                    if o_val:
+                        selected_dict[f_key] = {"choice": picked_src, "value": o_val}
+
+            updated = 0
+            files_updated: dict[str, dict[str, Any]] = {}
+            for r in rows:
+                try:
+                    current = json.loads(r["current_json"] or "{}")
+                    path_meta = json.loads(r["path_json"] or "{}")
+                    online_meta = json.loads(r["online_json"] or "{}")
+                    selected = json.loads(r["selected_json"] or "{}")
+                except Exception:
+                    continue
+
+                by_src = metadata.extract_online_by_source(online_meta)
+
+                if updates_map and isinstance(updates_map, dict):
+                    for fk, fspec in updates_map.items():
+                        if isinstance(fspec, dict):
+                            m_choice = str(fspec.get("choice") or "custom").strip()
+                            m_val = fspec.get("value")
+                            _apply_one_field(selected, fk, m_choice, m_val, current, path_meta, online_meta, by_src)
+                        else:
+                            _apply_one_field(selected, fk, "custom", str(fspec if fspec is not None else ""), current, path_meta, online_meta, by_src)
+                else:
+                    target_fields = [field] if field else list(opts.get("fields") or state.METADATA_FIELDS)
+                    for f in target_fields:
+                        _apply_one_field(selected, f, choice, custom_value, current, path_meta, online_meta, by_src)
+
+                cmp = metadata.compare_file_metadata(r["relpath"], current, path_meta, online_meta, opts, selected)
+                self.db.execute(
+                    "UPDATE file_metadata SET status = ?, selected_json = ?, diffs_json = ?, path_diff = ? WHERE file_id = ?",
+                    (cmp["status"], json.dumps(cmp["selected"]), json.dumps(cmp["diffs"]), cmp["path_diff"], r["file_id"]),
+                )
+                files_updated[str(r["file_id"])] = {
+                    "status": cmp["status"],
+                    "diffs": cmp["diffs"],
+                    "diff_count": len(cmp["diffs"]),
+                    "path_diff": bool(cmp["path_diff"]),
+                    "path_diff_count": len(cmp["path_mismatches"]),
+                    "path_mismatches": cmp["path_mismatches"],
+                    "selected": cmp["selected"],
+                    "fields": cmp["fields"],
+                }
+                updated += 1
+            return {"updated": updated, "files_updated": files_updated}
 
     def apply_metadata(self, ids: list[int], field_overrides: dict | None = None,
                        scope: str = "file", only_fields: list[str] | None = None) -> dict:
@@ -1846,10 +2007,23 @@ class Engine:
         unchanged = 0
         errors: list[str] = []
         cancel = self._new_cancel()
+        total = max(1, len(rows))
+        self._set_action_progress("apply_metadata", "Updating metadata", 0, total, "")
+        try:
+            return self._apply_metadata_rows(rows, total, scope, field_overrides, allowed_fields, token, st, opts, cancel)
+        finally:
+            self._clear_action_progress("apply_metadata")
 
+    def _apply_metadata_rows(self, rows: list[dict], total: int, scope: str, field_overrides: dict | None,
+                             allowed_fields: set[str] | None, token: str, st: dict, opts: dict, cancel) -> dict:
+        ALBUM_SHARED_FIELDS = ("artist", "album", "album_artist", "year", "genre", "cover")
+        updated = 0
+        unchanged = 0
+        errors: list[str] = []
         for idx, r in enumerate(rows):
             if cancel():
                 break
+            self._set_action_progress("apply_metadata", "Updating metadata", idx, total, r["relpath"])
             if r["status"] == "processing":
                 continue
             src = self.abs_path("audio", r["relpath"])
@@ -2028,6 +2202,7 @@ class Engine:
                     ),
                 )
                 updated += 1
+            self._set_action_progress("apply_metadata", "Updating metadata", idx + 1, total, r["relpath"])
 
         if updated:
             self.db.log("ok", f"Updated ID3/metadata tags in {updated} file(s) (timestamps preserved)", "audio")

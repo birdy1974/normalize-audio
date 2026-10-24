@@ -231,6 +231,7 @@ def dashboard(engine=Engine):
             total += s["files_total"]
             checked += s["files_checked"]
     approved_pending, approved_file = engine.approved_status()
+    approved_done, approved_total = engine.approved_progress(approved_pending)
     st_now = engine.status(media)
     current = engine.current_file() or approved_file
     if not current and st_now == "running":
@@ -246,11 +247,17 @@ def dashboard(engine=Engine):
         "last_scan": run.get("lastScan"),
         "next_scan": engine.next_scan(),          # None unless Automatic mode is selected
         "progress_percent": int(round(100 * checked / total)) if total else 0,
+        "progress_done": checked,
+        "progress_total": total,
         "current_file": current,
         "approved_pending": approved_pending,
+        "approved_done": approved_done,
+        "approved_total": approved_total,
         "scanning": engine.scanning(),
         "meta_checking": engine.is_metadata_checking(),
         "meta_progress": engine.get_metadata_progress(),
+        "action_progress": engine.get_action_progress(),
+        "search_from": state.get_metadata_options(db)["search_from"],
         "dry_run": settings["general"]["dryRun"],
         "media": media,
         "log": db.log_list(60),
@@ -779,6 +786,7 @@ def approve(fid: int, engine=Engine):
     if row["status"] != "parked":
         raise HTTPException(409, "file is not parked")
     engine.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
+    engine.note_approved(1)
     engine.db.log("info", f"{row['name']}: change approved", row["media"])
     engine.wake()
     return {"ok": True}
@@ -833,6 +841,7 @@ def bulk(body: BulkBody, engine=Engine):
             _set_adjust(engine, row, AdjustBody(delta=body.delta or 0.0))
         done += 1
     if body.action == "approve" and done:
+        engine.note_approved(done)
         engine.wake()
     return {"done": done}
 
@@ -846,6 +855,7 @@ def approve_all(body: ApproveAllBody, engine=Engine):
     for fid in ids:
         engine.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
     if ids:
+        engine.note_approved(len(ids))
         engine.db.log("info", f"{len(ids)} parked file(s) approved", body.media)
         engine.wake()
     return {"done": len(ids)}

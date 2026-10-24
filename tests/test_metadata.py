@@ -703,5 +703,145 @@ def test_metadata_tab_and_popup_artist_title_from_file_or_metadata(client, cfg, 
         assert token in js
 
 
+def test_metadata_column_order_header_buttons_enabled_fields_and_selection_stability(client, cfg, monkeypatch):
+    """Verify:
+    - Custom/final column is in 2nd place (after File & folder) and renders final selected value + override.
+    - Discogs (x), MusicBrainz (x), Open (iTunes) (x) buttons live inside their column headers in static/app.js.
+    - Selecting a source for enabled parameters updates only enabled parameters (leaving disabled ones untouched).
+    - Rapid/concurrent /api/metadata/select mutations serialize without jumping back, path values stay selectable
+      even when check_path_vs_tags is off, and non-forced per-file popup check preserves user selections.
+    """
+    import concurrent.futures
+    import re
+    from mutagen.id3 import ID3, TALB, TCON, TIT2, TPE1, TYER
+    from app import metadata as meta_mod
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as fh:
+        js = fh.read()
+
+    # 1. Column order: 'file' is 1st data col (after checkbox 'pick'), 'custom' is 2nd data col!
+    spec_block = re.search(r"const META_COL_SPECS = \[(.*?)\];", js, re.S)
+    assert spec_block
+    col_keys = re.findall(r"\['([a-z]+)'", spec_block.group(1))
+    assert col_keys[:3] == ["pick", "file", "custom"]
+    assert "resolveFinalMetaValue" in js
+
+    # 2. Source buttons moved inside <th> headers next to Discogs, MusicBrainz, Open (iTunes)
+    for hdr_src in ("discogs", "musicbrainz", "open"):
+        assert f'class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="{hdr_src}"' in js
+
+    # 3. End-to-end selection behavior: enabled-only bulk source apply + concurrent single-field selections + popup preservation
+    folder = os.path.join(cfg.audio_root, "FolderArtist", "FolderAlbum")
+    p = tone(os.path.join(folder, "03 - FolderTrack.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    tags = ID3()
+    tags.add(TPE1(encoding=3, text=["OldArtist"]))
+    tags.add(TALB(encoding=3, text=["OldAlbum"]))
+    tags.add(TIT2(encoding=3, text=["OldTrack"]))
+    tags.add(TYER(encoding=3, text=["1999"]))
+    tags.add(TCON(encoding=3, text=["OldGenre"]))
+    tags.save(p)
+
+    def fake_lookup(artist, album, title, track="", options=None, settings=None, **kwargs):
+        return {
+            "source": "Discogs",
+            "score": 0.95,
+            "artist": "DiscogsArtist",
+            "album": "DiscogsAlbum",
+            "title": "DiscogsTrack",
+            "year": "2022",
+            "genre": "DiscogsGenre",
+            "by_source": {
+                "discogs": {
+                    "artist": "DiscogsArtist",
+                    "album": "DiscogsAlbum",
+                    "title": "DiscogsTrack",
+                    "year": "2022",
+                    "genre": "DiscogsGenre",
+                    "score": 0.95,
+                },
+                "musicbrainz": {
+                    "artist": "MBArtist",
+                    "album": "MBAlbum",
+                    "title": "MBTrack",
+                    "year": "2021",
+                    "genre": "MBGenre",
+                    "score": 0.91,
+                },
+                "open": {
+                    "artist": "OpenArtist",
+                    "album": "OpenAlbum",
+                    "title": "OpenTrack",
+                    "year": "2020",
+                    "genre": "OpenGenre",
+                    "score": 0.88,
+                },
+            },
+        }
+
+    monkeypatch.setattr(meta_mod, "lookup_online_metadata", fake_lookup)
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    assert client.post("/api/folders/toggle", json={"media": "audio", "relpath": "FolderArtist/FolderAlbum", "enabled": True}).status_code == 200
+
+    # Enable ONLY artist, title, album (leave year & genre disabled!) and turn check_path_vs_tags False
+    assert client.put(
+        "/api/metadata/options",
+        json={
+            "fields": ["artist", "title", "album"],
+            "check_path_vs_tags": False,
+            "sources": ["discogs", "musicbrainz", "open"],
+        },
+    ).status_code == 200
+    assert client.post("/api/metadata/check", json={"enabled_only": True}).status_code == 200
+
+    f_item = client.get("/api/metadata").json()["files"][0]
+    fid = f_item["id"]
+    # Even with check_path_vs_tags=False, path value is populated so selecting 'path' never blanks or jumps back!
+    assert f_item["fields"]["artist"]["path"] == "FolderArtist"
+    assert f_item["fields"]["genre"]["choice"] == "current"  # disabled field stays current
+
+    # Apply MusicBrainz column values for enabled parameters
+    sel_mb = client.post("/api/metadata/select", json={"ids": [fid], "field": "all", "choice": "musicbrainz"}).json()
+    assert sel_mb["updated"] == 1
+    upd_fields = sel_mb["files_updated"][str(fid)]["fields"]
+    assert upd_fields["artist"]["choice"] == "musicbrainz"
+    assert upd_fields["title"]["choice"] == "musicbrainz"
+    assert upd_fields["album"]["choice"] == "musicbrainz"
+    assert upd_fields["genre"]["choice"] == "current"  # disabled parameter untouched!
+    assert upd_fields["year"]["choice"] == "current"   # disabled parameter untouched!
+
+    # Concurrent selections on different fields of the same file must serialize cleanly without losing any pick
+    eng = client.app_state.engine
+    mutations = [
+        ("artist", "path", None),
+        ("title", "open", None),
+        ("album", "custom", "My Override Album"),
+        ("genre", "discogs", None),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [
+            pool.submit(eng.select_metadata_choice, [fid], fld, ch, cval)
+            for (fld, ch, cval) in mutations
+        ]
+        for fut in futs:
+            assert fut.result()["updated"] == 1
+
+    after = client.get("/api/metadata").json()["files"][0]["fields"]
+    assert after["artist"]["choice"] == "path"
+    assert after["title"]["choice"] == "open"
+    assert after["album"]["choice"] == "custom"
+    assert after["album"]["custom_value"] == "My Override Album"
+    assert after["genre"]["choice"] == "discogs"
+
+    # Opening per-file metadata popup (force=False) must NOT wipe or jump back user selections!
+    popup_data = client.post(f"/api/files/{fid}/metadata/check", json={"force": False}).json()
+    assert popup_data["fields"]["artist"]["choice"] == "path"
+    assert popup_data["fields"]["title"]["choice"] == "open"
+    assert popup_data["fields"]["album"]["choice"] == "custom"
+    assert popup_data["fields"]["album"]["custom_value"] == "My Override Album"
+    assert popup_data["fields"]["genre"]["choice"] == "discogs"
+
+
+
 
 
