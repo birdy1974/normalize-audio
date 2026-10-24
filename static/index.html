@@ -9,8 +9,21 @@
   <link rel="icon" type="image/png" sizes="16x16" href="/static/brand/favicon-16.png">
   <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
   <link rel="manifest" href="/static/site.webmanifest">
-  <meta name="theme-color" content="#2f3130">
-  <link rel="stylesheet" href="/static/styles.css?v=24">
+  <meta name="theme-color" content="#ebebe9" id="meta-theme-color">
+  <script>
+    (function () {
+      try {
+        var pref = localStorage.getItem('audio-normalizer-theme') || 'light';
+        var dark = pref === 'dark' || (pref === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        var resolved = dark ? 'dark' : 'light';
+        document.documentElement.setAttribute('data-theme', resolved);
+        document.documentElement.setAttribute('data-theme-pref', pref);
+        var m = document.getElementById('meta-theme-color');
+        if (m) m.setAttribute('content', dark ? '#141615' : '#ebebe9');
+      } catch (_e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/styles.css?v=25">
 </head>
 <body>
   <div class="app">
@@ -18,6 +31,10 @@
       <div class="sidebar-top">
         <div class="brand"><img class="logo" src="/static/brand/icon-192.png" alt="" aria-hidden="true"><span class="brand-text">Audio Normalizer</span></div>
         <div class="menu-tools">
+          <button type="button" class="icon-btn" id="theme-toggle" data-action="theme-toggle" aria-label="Switch to dark mode" title="Switch to dark mode">
+            <svg class="theme-ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+            <svg class="theme-ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+          </button>
           <button type="button" class="icon-btn" id="menu-collapse" aria-label="Collapse menu" title="Collapse menu">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
           </button>
@@ -35,6 +52,11 @@
         <a href="#/settings" data-route="settings" title="Settings"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h10M18 18h2"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></svg><span class="nav-text">Settings</span></span></a>
         <a href="#/homeassistant" data-route="homeassistant" title="Home Assistant"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11l9-7 9 7"/><path d="M5 10v10h14V10"/></svg><span class="nav-text">Home Assistant</span></span></a>
       </nav>
+      <div class="sidebar-theme" id="sidebar-theme" role="group" aria-label="Appearance theme">
+        <button type="button" class="sidebar-theme-btn" data-action="set-theme" data-theme="light" title="Light mode">Light</button>
+        <button type="button" class="sidebar-theme-btn" data-action="set-theme" data-theme="dark" title="Dark mode">Dark</button>
+        <button type="button" class="sidebar-theme-btn" data-action="set-theme" data-theme="system" title="Follow system light/dark preference">Auto</button>
+      </div>
       <div class="sidebar-activity" id="activity" title="What the app is doing now">
         <div class="activity-top-row">
           <span class="dot activity-dot"></span>
@@ -174,6 +196,6 @@
   </div>
   <div id="toast" class="toast" role="status"></div>
   <script src="/static/audio-normalizer-card.js?v=7"></script>
-  <script src="/static/app.js?v=31"></script>
+  <script src="/static/app.js?v=32"></script>
 </body>
 </html>

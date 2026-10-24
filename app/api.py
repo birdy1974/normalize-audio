@@ -239,6 +239,7 @@ def dashboard(engine=Engine):
     return {
         "status": st_now,
         "mode": settings["general"]["mode"],      # off / bulk / force / auto: what the app does on its own
+        "theme": settings["general"].get("theme", "light"),
         "run_mode": run["mode"],                  # the run engine: active / stopped
         "paused": run["paused"],
         "types": run["types"],

@@ -860,4 +860,45 @@ def test_dashboard_duty_progress_bar_pct_and_counts_across_actions(client, cfg, 
         assert elem_id in html_txt
 
 
+def test_light_and_dark_mode_settings_and_gui_assets(client):
+    """GUI provides light, dark, and automatic system theme modes persisted in settings and shell assets."""
+    # Default theme is light
+    st0 = client.get("/api/settings").json()
+    assert st0["general"]["theme"] == "light"
+    assert client.get("/api/dashboard").json()["theme"] == "light"
+
+    # Persist dark and system themes; reject invalid values
+    for valid_theme in ("dark", "system", "light"):
+        r = client.put("/api/settings", json={"general": {"theme": valid_theme}})
+        assert r.status_code == 200
+        assert r.json()["general"]["theme"] == valid_theme
+        assert client.get("/api/dashboard").json()["theme"] == valid_theme
+
+    assert client.put("/api/settings", json={"general": {"theme": "neon"}}).status_code == 400
+
+    # Verify HTML, CSS, and JS light/dark mode support
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "index.html"), "r", encoding="utf-8") as hf:
+        html_txt = hf.read()
+    with open(os.path.join(root, "static", "styles.css"), "r", encoding="utf-8") as cf:
+        css_txt = cf.read()
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as jf:
+        js_txt = jf.read()
+
+    assert 'id="theme-toggle"' in html_txt
+    assert 'id="sidebar-theme"' in html_txt
+    assert 'data-action="set-theme" data-theme="dark"' in html_txt
+    assert 'data-action="set-theme" data-theme="light"' in html_txt
+    assert "audio-normalizer-theme" in html_txt
+
+    assert ':root[data-theme="dark"]' in css_txt
+    assert "color-scheme: dark;" in css_txt
+    assert "--ha-card-background: var(--surface);" in css_txt
+
+    assert "EDIT_COLORS_DARK" in js_txt
+    assert "function applyTheme(" in js_txt
+    assert "function appearanceCard()" in js_txt
+
+
+
 

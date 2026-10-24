@@ -14,7 +14,7 @@ DEFAULT_SETTINGS = {
     #   force like bulk, but a started run checks and normalizes all files in enabled folders again (even if already checked)
     #   auto  new and changed files are found every "scanEvery" minutes and normalized by themselves
     "general": {
-        "dryRun": False, "preserveMtime": True, "mode": "bulk",
+        "dryRun": False, "preserveMtime": True, "mode": "bulk", "theme": "light",
         "trimSilence": False, "silenceLevelPct": 2.0, "silencePeakDb": -40.0,
         "silenceMinDuration": 5.0, "silenceFadeOut": 0.5, "silenceFadeIn": 0.5,
         "coverAuto": False, "coverSources": "both", "discogsToken": "", "useLocalCover": True,
@@ -35,6 +35,7 @@ RANGES = {
     "silenceMinDuration": (0.5, 600.0), "silenceFadeOut": (0.0, 30.0), "silenceFadeIn": (0.0, 30.0),
 }
 MODES = ("off", "bulk", "force", "auto")
+THEMES = ("light", "dark", "system")
 LOSSY_MODES = ("gain", "reencode", "skip")
 WRITE_MODES = ("inplace", "backup", "output")
 ON_CLOSE = ("finish", "pause")
@@ -98,6 +99,10 @@ def _validate(key: str, value):
     if key == "mode":
         if value not in MODES:
             raise ValueError("mode must be off, bulk, force or auto")
+        return value
+    if key == "theme":
+        if value not in THEMES:
+            raise ValueError("theme must be light, dark or system")
         return value
     if key == "lossy":
         if value not in LOSSY_MODES:
