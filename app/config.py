@@ -39,13 +39,19 @@ class Config:
         return self.audio_root if media == "audio" else self.video_root
 
 
+def _default_config_dir(here: str) -> str:
+    if os.path.isdir("/config"):
+        return "/config"
+    return os.path.join(here, "config")
+
+
 def load_config(env=None) -> Config:
     env = os.environ if env is None else env
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return Config(
         audio_root=env.get("AUDIO_ROOT", "/data/audio"),
         video_root=env.get("VIDEO_ROOT", "/data/video"),
-        config_dir=env.get("CONFIG_DIR", "/config"),
+        config_dir=env.get("CONFIG_DIR") or _default_config_dir(here),
         ffmpeg=env.get("FFMPEG_BIN", "ffmpeg"),
         mp3gain=env.get("MP3GAIN_BIN", "mp3gain"),
         aacgain=env.get("AACGAIN_BIN", "aacgain"),

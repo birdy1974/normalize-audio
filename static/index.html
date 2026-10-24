@@ -10,7 +10,7 @@
   <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
   <link rel="manifest" href="/static/site.webmanifest">
   <meta name="theme-color" content="#2f3130">
-  <link rel="stylesheet" href="/static/styles.css?v=19">
+  <link rel="stylesheet" href="/static/styles.css?v=21">
 </head>
 <body>
   <div class="app">
@@ -28,7 +28,7 @@
       </div>
       <nav id="nav" aria-label="Main">
         <a href="#/dashboard" data-route="dashboard" title="Dashboard"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span class="nav-text">Dashboard</span></span></a>
-        <a href="#/directories" data-route="directories" title="Directories"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="nav-text">Directories</span></span></a>
+        <a href="#/directories" data-route="directories" title="Directories"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="nav-text">Directories <span class="count-badge" id="dirsBadge" title="Selected folders / files">0 / 0</span></span></span></a>
         <a href="#/parked" data-route="parked" title="Parked files"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17h.01"/></svg><span class="nav-text">Parked files <span class="count-badge" id="parkedBadge">0</span></span></span></a>
         <a href="#/metadata" data-route="metadata" title="Meta data"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><circle cx="7" cy="7" r="1.5"/></svg><span class="nav-text">Meta data <span class="count-badge" id="metaBadge">0</span></span></span></a>
         <a href="#/schedule" data-route="schedule" title="Schedule"><span><svg class="nav-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg><span class="nav-text">Schedule</span></span></a>
@@ -155,6 +155,6 @@
   </button>
   <div id="toast" class="toast" role="status"></div>
   <script src="/static/audio-normalizer-card.js?v=7"></script>
-  <script src="/static/app.js?v=25"></script>
+  <script src="/static/app.js?v=28"></script>
 </body>
 </html>

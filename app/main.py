@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, api
+from . import __version__, api, waveform
 from . import ffmpeg as ff
 from .config import Config, load_config
 from .db import Database
@@ -18,14 +18,18 @@ from .engine import Engine, FileBusy
 def create_app(cfg: Config | None = None, start_threads: bool = True) -> FastAPI:
     cfg = cfg or load_config()
     db = Database(cfg.db_path)
+    waveform.configure_db(db)
     engine = Engine(cfg, db)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         if start_threads:
             engine.start_threads()
-        yield
-        engine.shutdown()
+        try:
+            yield
+        finally:
+            engine.shutdown()
+            db.checkpoint()
 
     app = FastAPI(title="Audio Normalizer", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg

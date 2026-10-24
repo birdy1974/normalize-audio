@@ -318,7 +318,32 @@ def _normalize_meta_options(raw: dict) -> dict:
         "checkPath": check_path,
         "sources": [s for s in METADATA_SOURCES if sources_map.get(s, True)],
         "sources_map": sources_map,
+        "visible_fields": _norm_vis_fields(raw.get("visible_fields")),
+        "only_diff_rows": bool(raw.get("only_diff_rows", False)),
+        "col_widths": _norm_col_widths(raw.get("col_widths")),
     }
+
+
+def _norm_vis_fields(val) -> list[str]:
+    if isinstance(val, (list, tuple, set)):
+        picked = [f for f in METADATA_FIELDS if f in {str(x) for x in val}]
+        if picked:
+            return picked
+    return list(METADATA_FIELDS)
+
+
+def _norm_col_widths(val) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if isinstance(val, dict):
+        for k, v in val.items():
+            if k in ("pick", "file", "path", "field", "current", "discogs", "musicbrainz", "open", "custom"):
+                try:
+                    n = int(round(float(v)))
+                    if 32 <= n <= 1200:
+                        out[k] = n
+                except (TypeError, ValueError):
+                    pass
+    return out
 
 
 def get_metadata_options(db: Database) -> dict:
@@ -338,6 +363,9 @@ def put_metadata_options(db: Database, patch: dict) -> dict:
             "fields": norm["fields_map"],
             "checkPath": norm["checkPath"],
             "sources": norm["sources_map"],
+            "visible_fields": norm["visible_fields"],
+            "only_diff_rows": norm["only_diff_rows"],
+            "col_widths": norm["col_widths"],
         },
     )
     return norm

@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS metadata_cache (
     payload TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS waveform_cache (
+    cache_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -95,13 +100,17 @@ class Database:
     """A single connection guarded by a lock; the workload is small."""
 
     def __init__(self, path: str):
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10)
+        self._closed = False
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=15)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA busy_timeout=10000")
+            self._conn.execute("PRAGMA wal_autocheckpoint=200")
             self._conn.execute("PRAGMA temp_store=MEMORY")
             self._conn.execute("PRAGMA cache_size=-16000")
             self._conn.executescript(SCHEMA)
@@ -176,3 +185,26 @@ class Database:
 
     def clear_log(self) -> None:
         self.execute("DELETE FROM log")
+
+    def checkpoint(self) -> None:
+        """Flush WAL frames into the main persistent SQLite database file."""
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            try:
+                self._conn.close()
+            finally:
+                self._closed = True

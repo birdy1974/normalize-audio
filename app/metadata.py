@@ -235,7 +235,7 @@ def write_full_tags(
                     id3 = ID3()
                 _apply_id3_updates(id3, tag_updates)
                 id3.update_to_v23()
-                id3.save(tmp, v1=1, v2_version=3)
+                id3.save(tmp, v1=2, v2_version=3)
             elif ext in ("flac", "ogg", "oga", "opus"):
                 audio = FLAC(tmp) if ext == "flac" else mutagen.File(tmp)
                 if audio is None:
@@ -672,6 +672,15 @@ def lookup_online_metadata(
     if cancel and cancel():
         return {}
     if not candidates:
+        if db is not None:
+            try:
+                db.execute(
+                    "INSERT INTO metadata_cache (query_key, payload, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(query_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+                    (query_key, json.dumps({}), time.time()),
+                )
+            except Exception:
+                pass
         return {}
 
     primary = _merge_candidate_list(candidates)
@@ -832,32 +841,49 @@ def compare_file_metadata(
         has_path_diff = bool(is_enabled and check_path and p_val and _values_differ(f, c_val, p_val))
 
         prior_sel = existing_selected.get(f) if (existing_selected and isinstance(existing_selected.get(f), dict)) else None
-        has_custom_diff = False
-        if prior_sel and prior_sel.get("choice") == "custom":
-            c_custom = str(prior_sel.get("value") or "").strip()
-            if f == "cover":
-                has_custom_diff = bool(c_custom)
+        resolved_prior: dict[str, str] | None = None
+        has_selected_diff = False
+        if prior_sel:
+            p_choice = str(prior_sel.get("choice") or "current").strip()
+            p_sval = str(prior_sel.get("value") or "").strip()
+            if p_choice == "online":
+                if d_val and (not p_sval or p_sval == d_val):
+                    resolved_prior = {"choice": "discogs", "value": d_val}
+                elif m_val and (not p_sval or p_sval == m_val):
+                    resolved_prior = {"choice": "musicbrainz", "value": m_val}
+                elif i_val and (not p_sval or p_sval == i_val):
+                    resolved_prior = {"choice": "open", "value": i_val}
+                else:
+                    resolved_prior = {"choice": "online", "value": p_sval or o_val}
+            elif p_choice == "discogs":
+                resolved_prior = {"choice": "discogs", "value": d_val or p_sval}
+            elif p_choice == "musicbrainz":
+                resolved_prior = {"choice": "musicbrainz", "value": m_val or p_sval}
+            elif p_choice == "open":
+                resolved_prior = {"choice": "open", "value": i_val or p_sval}
+            elif p_choice == "path":
+                resolved_prior = {"choice": "path", "value": p_val or p_sval}
+            elif p_choice == "custom":
+                resolved_prior = {"choice": "custom", "value": p_sval}
             else:
-                has_custom_diff = _values_differ(f, c_val, c_custom)
+                resolved_prior = {"choice": "current", "value": c_val}
 
-        is_diff = has_online_diff or has_path_diff or has_custom_diff
+            r_choice = resolved_prior["choice"]
+            r_val = resolved_prior["value"]
+            if r_choice != "current":
+                if f == "cover":
+                    has_selected_diff = bool(r_val)
+                elif r_choice == "custom":
+                    has_selected_diff = _values_differ(f, c_val, r_val)
+                elif r_val:
+                    has_selected_diff = _values_differ(f, c_val, r_val)
+
+        is_diff = has_online_diff or has_path_diff or has_selected_diff
 
         if is_diff:
             diffs.append(f)
-            if prior_sel:
-                p_choice = prior_sel.get("choice", "current")
-                p_sval = str(prior_sel.get("value") or "").strip()
-                if p_choice == "online":
-                    if d_val and p_sval == d_val:
-                        selected[f] = {"choice": "discogs", "value": d_val}
-                    elif m_val and p_sval == m_val:
-                        selected[f] = {"choice": "musicbrainz", "value": m_val}
-                    elif i_val and p_sval == i_val:
-                        selected[f] = {"choice": "open", "value": i_val}
-                    else:
-                        selected[f] = {"choice": "online", "value": p_sval or o_val}
-                else:
-                    selected[f] = prior_sel
+            if resolved_prior is not None:
+                selected[f] = resolved_prior
             elif has_discogs_diff:
                 selected[f] = {"choice": "discogs", "value": d_val}
             elif has_mb_diff:
@@ -871,13 +897,8 @@ def compare_file_metadata(
             else:
                 selected[f] = {"choice": "current", "value": c_val}
         else:
-            if prior_sel and prior_sel.get("choice") in ("custom", "discogs", "musicbrainz", "open") and f == "cover" and prior_sel.get("value"):
-                # Keep user's explicit cover replacement choice even when current cover is already 'present'
-                selected[f] = prior_sel
-                diffs.append(f)
-                is_diff = True
-            elif prior_sel and prior_sel.get("choice") == "custom":
-                selected[f] = prior_sel
+            if resolved_prior is not None:
+                selected[f] = resolved_prior
             else:
                 selected[f] = {"choice": "current", "value": c_val}
 

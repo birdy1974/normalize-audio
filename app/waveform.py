@@ -12,10 +12,12 @@ so zooming into a long file stays quick: ffmpeg seeks to the window.
 from __future__ import annotations
 
 import array
+import json
 import os
 import subprocess
 import sys
 import threading
+import time
 from collections import OrderedDict
 
 from . import ffmpeg as ff
@@ -23,11 +25,54 @@ from . import ffmpeg as ff
 RATE = 8000                    # samples per second used for the picture
 MAX_BUCKETS = 8000
 CACHE_ENTRIES = 48
+PERSIST_WAVEFORM_ENTRIES = 250
 DECODE_TIMEOUT = 300           # seconds before a stuck ffmpeg is killed
 
 _lock = threading.Lock()
 _cache: "OrderedDict[tuple, dict]" = OrderedDict()
 _durations: "OrderedDict[tuple, float]" = OrderedDict()
+_db = None
+
+
+def configure_db(db) -> None:
+    """Attach the persistent SQLite database so waveform peaks and durations survive restarts."""
+    global _db
+    with _lock:
+        _db = db
+
+
+def _db_get(cache_key: str):
+    with _lock:
+        db = _db
+    if db is None:
+        return None
+    try:
+        row = db.one("SELECT payload FROM waveform_cache WHERE cache_key = ?", (cache_key,))
+        if row:
+            return json.loads(row["payload"])
+    except Exception:
+        return None
+    return None
+
+
+def _db_put(cache_key: str, payload) -> None:
+    with _lock:
+        db = _db
+    if db is None:
+        return
+    try:
+        db.execute(
+            "INSERT INTO waveform_cache (cache_key, payload, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+            (cache_key, json.dumps(payload), time.time()),
+        )
+        db.execute(
+            "DELETE FROM waveform_cache WHERE cache_key NOT IN ("
+            "SELECT cache_key FROM waveform_cache ORDER BY updated_at DESC LIMIT ?)",
+            (PERSIST_WAVEFORM_ENTRIES,),
+        )
+    except Exception:
+        pass
 
 
 def _file_duration(ffmpeg_bin: str, path: str, st: os.stat_result) -> float:
@@ -36,6 +81,12 @@ def _file_duration(ffmpeg_bin: str, path: str, st: os.stat_result) -> float:
         if key in _durations:
             _durations.move_to_end(key)
             return _durations[key]
+    db_key = f"dur|{path}|{st.st_mtime_ns}|{st.st_size}"
+    persisted = _db_get(db_key)
+    if isinstance(persisted, (int, float)) and persisted > 0:
+        with _lock:
+            _durations[key] = float(persisted)
+        return float(persisted)
     probe = ff.probe(ffmpeg_bin, path)
     if not probe.duration or probe.duration <= 0:
         raise ValueError("the length of this file is unknown")
@@ -43,6 +94,7 @@ def _file_duration(ffmpeg_bin: str, path: str, st: os.stat_result) -> float:
         _durations[key] = probe.duration
         while len(_durations) > 256:
             _durations.popitem(last=False)
+    _db_put(db_key, probe.duration)
     return probe.duration
 
 
@@ -72,6 +124,14 @@ def peaks(ffmpeg_bin: str, path: str, start: float = 0.0, duration: float | None
         if key in _cache:
             _cache.move_to_end(key)
             return _cache[key]
+    db_key = f"pk|{path}|{st.st_mtime_ns}|{st.st_size}|{round(start, 3)}|{round(window, 3)}|{buckets}"
+    persisted = _db_get(db_key)
+    if isinstance(persisted, dict) and "min" in persisted and "max" in persisted:
+        with _lock:
+            _cache[key] = persisted
+            while len(_cache) > CACHE_ENTRIES:
+                _cache.popitem(last=False)
+        return persisted
 
     lo, hi = _decode(ffmpeg_bin, path, start, window, buckets)
     out = {
@@ -86,6 +146,7 @@ def peaks(ffmpeg_bin: str, path: str, start: float = 0.0, duration: float | None
         _cache[key] = out
         while len(_cache) > CACHE_ENTRIES:
             _cache.popitem(last=False)
+    _db_put(db_key, out)
     return out
 
 

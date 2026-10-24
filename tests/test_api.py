@@ -662,3 +662,85 @@ def test_ha_exposes_the_mode_and_the_scan_times(client, cfg):
     client.put("/api/settings", json={"general": {"mode": "off"}})
     body = client.get("/api/v1/ha/status", headers=headers).json()
     assert body["status"] == "off" and body["mode"] == "off" and body["next_scan"] is None
+
+
+def test_folder_invert_selection(client, cfg):
+    tone(os.path.join(cfg.audio_root, "Alpha", "a.flac"), 0, codec_args=("-c:a", "flac"))
+    tone(os.path.join(cfg.audio_root, "Beta", "b.flac"), 0, codec_args=("-c:a", "flac"))
+    tone(os.path.join(cfg.audio_root, "Gamma", "c.flac"), 0, codec_args=("-c:a", "flac"))
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+
+    # Disable Beta so Alpha=True, Beta=False, Gamma=True
+    assert client.post("/api/folders/toggle", json={"media": "audio", "relpath": "Beta", "enabled": False}).status_code == 200
+    before = {d["relpath"]: d["enabled"] for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+    assert before == {"Alpha": True, "Beta": False, "Gamma": True}
+
+    # Invert once -> Alpha=False, Beta=True, Gamma=False
+    assert client.post("/api/folders/invert", json={"media": "audio"}).status_code == 200
+    inverted = {d["relpath"]: d["enabled"] for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+    assert inverted == {"Alpha": False, "Beta": True, "Gamma": False}
+    dash = client.get("/api/dashboard").json()
+    assert dash["media"]["audio"]["directories_enabled"] == 1
+    assert dash["media"]["audio"]["files_total"] == 1
+
+    # Invert a second time -> exact original selection restored
+    assert client.post("/api/folders/invert", json={"media": "audio"}).status_code == 200
+    restored = {d["relpath"]: d["enabled"] for d in client.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+    assert restored == before
+
+
+def test_internal_databases_persist_across_restarts(cfg):
+    from app import waveform as wf_mod
+
+    p = os.path.join(cfg.audio_root, "PersistAlbum", "01 - Track.flac")
+    tone(p, 0, codec_args=("-c:a", "flac"))
+
+    # First lifecycle: populate folders, waveform cache, metadata options, and settings, then cleanly shut down
+    with TestClient(create_app(cfg, start_threads=False)) as c1:
+        cfg_info = c1.get("/api/config").json()
+        assert cfg_info["persistence"]["persistent"] is True
+        assert cfg_info["persistence"]["db_exists"] is True
+        assert cfg_info["persistence"]["db_path"] == os.path.abspath(cfg.db_path)
+
+        assert c1.post("/api/scan", json={"media": "audio"}).status_code == 200
+        assert c1.post("/api/folders/invert", json={"media": "audio"}).status_code == 200
+        assert c1.put(
+            "/api/metadata/options",
+            json={
+                "visible_fields": ["artist", "album", "year"],
+                "only_diff_rows": True,
+                "col_widths": {"file": 280, "discogs": 210},
+            },
+        ).status_code == 200
+        wf1 = c1.get(
+            "/api/files/waveform",
+            params={"media": "audio", "relpath": "PersistAlbum/01 - Track.flac", "buckets": 64},
+        )
+        assert wf1.status_code == 200
+        peaks_first = wf1.json()
+
+    # Wipe volatile RAM waveform caches to simulate a fresh container/process start
+    with wf_mod._lock:
+        wf_mod._cache.clear()
+        wf_mod._durations.clear()
+
+    # Second lifecycle on the same persistent CONFIG_DIR: everything must be restored from SQLite
+    with TestClient(create_app(cfg, start_threads=False)) as c2:
+        dirs = {d["relpath"]: d["enabled"] for d in c2.get("/api/folders/tree", params={"media": "audio"}).json()["dirs"]}
+        assert dirs == {"PersistAlbum": False}
+
+        meta = c2.get("/api/metadata").json()
+        assert meta["options"]["visible_fields"] == ["artist", "album", "year"]
+        assert meta["options"]["only_diff_rows"] is True
+        assert meta["options"]["col_widths"] == {"file": 280, "discogs": 210}
+
+        # Waveform cache hit directly from persistent SQLite waveform_cache table
+        row = c2.app.state.engine.db.one("SELECT COUNT(*) AS n FROM waveform_cache")
+        assert row["n"] >= 2
+        wf2 = c2.get(
+            "/api/files/waveform",
+            params={"media": "audio", "relpath": "PersistAlbum/01 - Track.flac", "buckets": 64},
+        )
+        assert wf2.status_code == 200
+        assert wf2.json() == peaks_first
+

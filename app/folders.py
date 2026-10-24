@@ -26,6 +26,11 @@ def set_all(db: Database, media: str, enabled: bool) -> None:
     db.execute("UPDATE dirs SET enabled = ? WHERE media = ?", (1 if enabled else 0, media))
 
 
+def invert_all(db: Database, media: str) -> None:
+    """Invert the enabled/disabled selection of all folders for the given media type."""
+    db.execute("UPDATE dirs SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END WHERE media = ?", (media,))
+
+
 def _subtree_files(db: Database, media: str, rel: str) -> int:
     prefix = rel + "/"
     return db.one(
