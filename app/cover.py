@@ -1401,10 +1401,14 @@ def search_covers(
     db=None,
     force_refresh: bool = False,
 ) -> list[dict]:
-    """Search configured sources ('both', 'discogs', or 'open') for cover art candidates."""
+    """Search configured sources ('all', 'both', 'discogs', 'musicbrainz', 'itunes', or 'open') for cover art candidates."""
     gen = settings.get("general", settings)
     source_mode = gen.get("coverSources", "both")
+    include_all = bool(gen.get("coverIncludeAll"))
     token = gen.get("discogsToken", "")
+
+    if source_mode == "local":
+        return []
 
     artist = (artist or "").strip()
     album = (album or "").strip()
@@ -1412,9 +1416,16 @@ def search_covers(
     if not (artist or album or title):
         return []
 
-    # Cache by (source_mode, artist, album) when album is known so all tracks in an album share 1 lookup
+    if source_mode in ("both", "all") and (include_all or source_mode == "all"):
+        eff_key = "all"
+    elif source_mode == "open" and include_all:
+        eff_key = "open_all"
+    else:
+        eff_key = source_mode
+
+    # Cache by (eff_key, artist, album) when album is known so all tracks in an album share 1 lookup
     cache_target = f"{artist.lower()}|{album.lower()}" if album else f"{artist.lower()}||{title.lower()}"
-    query_key = f"{source_mode}|{bool(token)}|{cache_target}"
+    query_key = f"{eff_key}|{bool(token)}|{cache_target}"
 
     if db is not None and not force_refresh:
         row = db.one("SELECT candidates FROM cover_cache WHERE query_key = ?", (query_key,))
@@ -1427,16 +1438,32 @@ def search_covers(
                 pass
 
     results: list[dict] = []
-    if source_mode == "both":
+    if eff_key == "all":
+        f_disc = _HTTP_POOL.submit(_search_discogs, artist, album, title, token)
+        f_mb = _HTTP_POOL.submit(_search_musicbrainz_caa, artist, album, title)
+        f_it = _HTTP_POOL.submit(_search_itunes, artist, album, title)
+        results.extend(f_disc.result())
+        results.extend(f_mb.result())
+        results.extend(f_it.result())
+    elif eff_key == "both":
         f_disc = _HTTP_POOL.submit(_search_discogs, artist, album, title, token)
         f_mb = _HTTP_POOL.submit(_search_musicbrainz_caa, artist, album, title)
         results.extend(f_disc.result())
         results.extend(f_mb.result())
         if not results:
             results.extend(_search_itunes(artist, album, title))
-    elif source_mode == "discogs":
+    elif eff_key == "discogs":
         results.extend(_search_discogs(artist, album, title, token=token))
-    elif source_mode == "open":
+    elif eff_key == "musicbrainz":
+        results.extend(_search_musicbrainz_caa(artist, album, title))
+    elif eff_key == "itunes":
+        results.extend(_search_itunes(artist, album, title))
+    elif eff_key == "open_all":
+        f_mb = _HTTP_POOL.submit(_search_musicbrainz_caa, artist, album, title)
+        f_it = _HTTP_POOL.submit(_search_itunes, artist, album, title)
+        results.extend(f_mb.result())
+        results.extend(f_it.result())
+    elif eff_key == "open":
         results.extend(_search_musicbrainz_caa(artist, album, title))
         if not results:
             results.extend(_search_itunes(artist, album, title))

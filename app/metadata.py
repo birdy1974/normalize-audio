@@ -211,7 +211,13 @@ def write_full_tags(
 
     tag_updates = {k: v for k, v in updates.items() if k != "cover"}
     cover_val = updates.get("cover")
-    has_cover_url = bool(cover_val and str(cover_val).startswith(("http://", "https://", "data:", "local://")))
+    has_cover_url = bool(
+        cover_val
+        and (
+            prefetched_cover is not None
+            or str(cover_val).startswith(("http://", "https://", "data:", "local://", "filecover://"))
+        )
+    )
     if not tag_updates and not has_cover_url:
         return True
 

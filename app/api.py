@@ -101,7 +101,7 @@ class CoverSearchBody(BaseModel):
     artist: str | None = None
     album: str | None = None
     title: str | None = None
-    source: Literal["both", "discogs", "open"] | None = None
+    source: Literal["all", "both", "discogs", "musicbrainz", "itunes", "open", "local"] | None = None
     query_mode: Literal["auto", "file", "metadata"] | None = None
     force: bool = False
 
@@ -485,10 +485,24 @@ def file_local_cover(fid: int, engine=Engine):
         raise HTTPException(404, "audio file not found")
     path = engine.abs_path("audio", row["relpath"])
     local = cover.find_local_cover(path)
-    if not local or not local.get("image_url"):
+    img_url = local.get("image_url") if local else None
+    if not img_url:
+        mrow = engine.db.one("SELECT selected_json FROM file_metadata WHERE file_id = ?", (fid,))
+        if mrow and mrow.get("selected_json"):
+            try:
+                sel = json.loads(mrow["selected_json"])
+                cand = str((sel.get("cover") or {}).get("value") or "")
+                if cand.startswith("local://"):
+                    cand_abs = os.path.realpath(cand[len("local://"):])
+                    audio_root = os.path.realpath(engine.cfg.root("audio"))
+                    if cand_abs.startswith(audio_root + os.sep) and os.path.isfile(cand_abs):
+                        img_url = "local://" + cand_abs
+            except Exception:
+                img_url = None
+    if not img_url:
         raise HTTPException(404, "no local folder cover")
     try:
-        data, mime = cover.download_cover(local["image_url"])
+        data, mime = cover.download_cover(img_url)
     except Exception as exc:
         raise HTTPException(404, "could not read local cover") from exc
     return Response(

@@ -1097,6 +1097,9 @@ def test_metadata_table_multiline_filename_and_combined_current_selected_column(
     assert "return customCell + fieldCell + pathCell + discogsCell + mbCell + openCell;" in js
     # Revert-to-current-tag button is available inside the combined column when another source/custom is selected
     assert 'data-choice="current"' in js and ">↺</button>" in js
+    # No source badge/label is rendered inside the 'Current tag / Selected (✎)' column
+    assert "meta-final-src" not in js
+    assert "finalInfo.srcLabel" not in js
 
     # 3. Detailed list header stays visible while scrolling down; content above header scrolls away
     assert "'page-head-static'" in js
@@ -1104,6 +1107,186 @@ def test_metadata_table_multiline_filename_and_combined_current_selected_column(
     assert "function syncMetaStickyHeader()" in js
     assert "#meta-diff-table thead.is-stuck" in css
     assert "translate3d(0, var(--meta-head-y, 0px), 0)" in css
+
+    # 4. Small directory/folder push button behind values on tab Meta data pushes value to filtered list
+    assert "const FOLDER_PUSH_ICON = '<svg class=\"meta-push-dir-ico\"" in js
+    assert "function renderPushFilteredBtn(fieldKey, fieldLabel, pushVal, isModal)" in js
+    assert "if (isModal) return '';" in js
+    assert "data-action=\"meta-push-filtered\"" in js
+    assert "} else if (a === 'meta-push-filtered') {" in js
+    assert "const visibleFiles = filterAndSortMetaFiles(m.files || [], m.options || {});" in js
+    assert "await queueMetaSelect({ ids: ids, field: field, choice: 'custom', custom_value: val });" in js
+    assert ".meta-push-dir-btn" in css
+    assert ".meta-val-with-push" in css
+
+
+def test_push_value_and_embedded_cover_to_filtered_files_bulk_update(client, cfg):
+    """Verify pushing a parameter value (e.g. year) or an embedded/local cover across a filtered
+    subset of files updates all filtered files in bulk while leaving unfiltered files untouched."""
+    from app import cover as cover_mod
+
+    d1 = os.path.join(cfg.audio_root, "Band - First Album")
+    d2 = os.path.join(cfg.audio_root, "Band - Second Album")
+    d3 = os.path.join(cfg.audio_root, "Unfiltered - Other Album")
+
+    f1 = tone(os.path.join(d1, "01 - One.mp3"), 0)
+    f2 = tone(os.path.join(d2, "01 - Two.mp3"), 0)
+    f3 = tone(os.path.join(d3, "01 - Three.mp3"), 0)
+
+    meta_mod.write_full_tags(f1, {"artist": "Band", "album": "First Album", "title": "One", "year": "1999"})
+    meta_mod.write_full_tags(f2, {"artist": "Band", "album": "Second Album", "title": "Two", "year": "2001"})
+    meta_mod.write_full_tags(f3, {"artist": "Unfiltered", "album": "Other Album", "title": "Three", "year": "1985"})
+
+    # Embed a JPEG cover in f1 and write a local folder cover in d1
+    embedded_jpg = b"\xff\xd8\xff\xe0" + b"\xab" * 512 + b"\xff\xd9"
+    cover_mod.embed_cover(f1, embedded_jpg, mime="image/jpeg")
+    local_jpg_path = os.path.join(d1, "cover.jpg")
+    local_jpg = b"\xff\xd8\xff\xe0" + b"\xcd" * 512 + b"\xff\xd9"
+    with open(local_jpg_path, "wb") as lf:
+        lf.write(local_jpg)
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+
+    rows = {
+        r["relpath"]: r["id"]
+        for r in client.app_state.db.query("SELECT id, relpath FROM files WHERE media='audio'")
+    }
+    id1 = rows["Band - First Album/01 - One.mp3"]
+    id2 = rows["Band - Second Album/01 - Two.mp3"]
+    id3 = rows["Unfiltered - Other Album/01 - Three.mp3"]
+
+    assert client.post("/api/metadata/check", json={"ids": [id1, id2, id3], "use_online": False}).status_code == 200
+
+    # Simulate clicking the folder push button behind year="1999" with filter matching [id1, id2]
+    sel_res = client.post(
+        "/api/metadata/select",
+        json={"ids": [id1, id2], "field": "year", "choice": "custom", "custom_value": "1999"},
+    )
+    assert sel_res.status_code == 200
+    assert sel_res.json()["updated"] == 2
+
+    # Also test cross-folder local:// cover preview fallback on id2 before switching to filecover://
+    client.post(
+        "/api/metadata/select",
+        json={"ids": [id1, id2], "field": "cover", "choice": "custom", "custom_value": f"local://{local_jpg_path}"},
+    ).raise_for_status()
+    preview_res = client.get(f"/api/files/{id2}/local-cover")
+    assert preview_res.status_code == 200
+    assert preview_res.content == local_jpg
+
+    # Push f1's embedded cover (filecover://<id1>) to filtered files [id1, id2]
+    cov_res = client.post(
+        "/api/metadata/select",
+        json={"ids": [id1, id2], "field": "cover", "choice": "custom", "custom_value": f"filecover://{id1}"},
+    )
+    assert cov_res.status_code == 200
+    assert cov_res.json()["updated"] == 2
+
+    # Apply metadata bulk update to selected filtered files [id1, id2]
+    apply_res = client.post("/api/metadata/apply", json={"ids": [id1, id2]}).json()
+    assert apply_res["updated"] >= 1
+    assert apply_res["errors"] == []
+
+    # Verify year="1999" and embedded cover were written to f2, while unfiltered f3 stayed "1985"
+    assert meta_mod.read_full_tags(f1)["year"] == "1999"
+    assert meta_mod.read_full_tags(f2)["year"] == "1999"
+    assert meta_mod.read_full_tags(f3)["year"] == "1985"
+
+    cov2, mime2 = cover_mod.extract_cover(f2)
+    assert cov2 == embedded_jpg
+    assert mime2 == "image/jpeg"
+    assert cover_mod.extract_cover(f3) is None
+
+
+def test_metadata_file_col_cover_button_and_all_sources_popup(client, cfg, monkeypatch):
+    """Verify:
+    1) Tab Meta data 'File & folder' column has a 'Cover' button near 'Update' opening the Cover popup.
+    2) Cover popup search ('all' sources) returns cover arts from Local + Discogs + MusicBrainz + Open (iTunes),
+       lets the user change search values or filter source, and applying updates file_metadata immediately."""
+    import re
+    from app import cover as cover_mod
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as jf:
+        js = jf.read()
+
+    m_actions = re.search(
+        r"meta-row-actions.*?(meta-apply-one.*?open-cover-by-id.*?>Cover</button>.*?open-meta-by-id)",
+        js,
+        re.S,
+    )
+    assert m_actions is not None
+    assert "COVER.source = 'all';" in js
+    assert "['all', 'All sources (Local + Discogs + MusicBrainz + Open)']" in js
+
+    album_dir = os.path.join(cfg.audio_root, "ArtistA - AlbumA")
+    f1 = tone(os.path.join(album_dir, "01 - TrackOne.mp3"), 0)
+    meta_mod.write_full_tags(f1, {"artist": "ArtistA", "album": "AlbumA", "title": "TrackOne"})
+    local_jpg = b"\xff\xd8\xff\xe0" + b"\x99" * 512 + b"\xff\xd9"
+    with open(os.path.join(album_dir, "cover.jpg"), "wb") as lf:
+        lf.write(local_jpg)
+
+    monkeypatch.setattr(
+        cover_mod,
+        "_search_discogs",
+        lambda a, al, t, token="": [
+            {"id": "d1", "source": "Discogs", "title": f"{a} - {al}", "artist": a, "album": al, "year": "2001", "image_url": "https://img/discogs.jpg", "thumb_url": "https://img/discogs.jpg"}
+        ],
+    )
+    monkeypatch.setattr(
+        cover_mod,
+        "_search_musicbrainz_caa",
+        lambda a, al, t: [
+            {"id": "m1", "source": "MusicBrainz", "title": f"{a} - {al}", "artist": a, "album": al, "year": "2001", "image_url": "https://img/mb.jpg", "thumb_url": "https://img/mb.jpg"}
+        ],
+    )
+    monkeypatch.setattr(
+        cover_mod,
+        "_search_itunes",
+        lambda a, al, t: [
+            {"id": "i1", "source": "Open (iTunes)", "title": f"{a} - {al}", "artist": a, "album": al, "year": "2001", "image_url": "https://img/itunes.jpg", "thumb_url": "https://img/itunes.jpg"}
+        ],
+    )
+
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    fid = client.app_state.db.one("SELECT id FROM files WHERE media='audio'")["id"]
+    assert client.post("/api/metadata/check", json={"ids": [fid], "use_online": False}).status_code == 200
+
+    # 1. Default 'all' popup search returns Local + Discogs + MusicBrainz + Open (iTunes)
+    s_all = client.post(f"/api/files/{fid}/cover/search", json={"source": "all"}).json()
+    sources = [c["source"] for c in s_all["candidates"]]
+    assert "Local folder" in sources
+    assert "Discogs" in sources
+    assert "MusicBrainz" in sources
+    assert "Open (iTunes)" in sources
+
+    # 2. User changes search values (artist/album) + source filter ('itunes')
+    s_custom = client.post(
+        f"/api/files/{fid}/cover/search",
+        json={"artist": "CustomArtist", "album": "CustomAlbum", "title": "CustomTitle", "source": "itunes", "force": True},
+    ).json()
+    assert s_custom["artist"] == "CustomArtist"
+    assert s_custom["album"] == "CustomAlbum"
+    assert len(s_custom["candidates"]) == 1
+    assert s_custom["candidates"][0]["source"] == "Open (iTunes)"
+    assert "CustomArtist - CustomAlbum" in s_custom["candidates"][0]["title"]
+
+    # 3. Selecting and applying cover from popup updates file + file_metadata and returns updated_ids
+    chosen_local_url = next(c["image_url"] for c in s_all["candidates"] if c["source"] == "Local folder")
+    app_res = client.post(
+        f"/api/files/{fid}/cover/apply",
+        json={"image_url": chosen_local_url, "scope": "file"},
+    ).json()
+    assert app_res["ok"] is True
+    assert app_res["updated"] == 1
+    assert app_res["updated_ids"] == [fid]
+
+    meta_after = client.get("/api/metadata").json()
+    f_meta = next(x for x in meta_after["files"] if x["id"] == fid)
+    assert f_meta["has_cover"] == 1
+    assert f_meta["fields"]["cover"]["current"] == "present"
+
+
 
 
 

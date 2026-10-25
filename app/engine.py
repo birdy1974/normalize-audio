@@ -1330,19 +1330,61 @@ class Engine:
         q_title = base_title if title is None else title.strip()
 
         st = state.get_settings(self.db)
-        if source_mode in ("both", "discogs", "open"):
-            st = {**st, "general": {**st["general"], "coverSources": source_mode}}
+        gen_override = {**st["general"], "coverIncludeAll": True}
+        if source_mode in ("all", "both", "discogs", "musicbrainz", "itunes", "open", "local"):
+            gen_override["coverSources"] = source_mode
+        st = {**st, "general": gen_override}
 
         candidates = []
-        local = cover.find_local_cover(src)
-        if local:
-            candidates.append(local)
-        online = cover.search_covers(q_artist, q_album, q_title, st, db=self.db, force_refresh=force_refresh)
+        if source_mode in (None, "all", "both", "local"):
+            local = cover.find_local_cover(src)
+            if local:
+                candidates.append(local)
         seen_urls = {c["image_url"] for c in candidates}
-        for c in online:
-            if c["image_url"] not in seen_urls:
-                candidates.append(c)
-                seen_urls.add(c["image_url"])
+
+        # Include any cover candidates already discovered on the Meta data tab for this file
+        if artist is None and album is None and title is None and not force_refresh:
+            mrow = self.db.one("SELECT online_json FROM file_metadata WHERE file_id = ?", (fid,))
+            if mrow and mrow.get("online_json"):
+                try:
+                    om = json.loads(mrow["online_json"] or "{}")
+                    by_src = om.get("by_source") if isinstance(om, dict) else None
+                    if isinstance(by_src, dict):
+                        src_labels = [
+                            ("discogs", "Discogs", ("all", "both", "discogs", None)),
+                            ("musicbrainz", "MusicBrainz", ("all", "both", "musicbrainz", "open", None)),
+                            ("open", "Open (iTunes)", ("all", "both", "itunes", "open", None)),
+                        ]
+                        for sk, slbl, allowed_modes in src_labels:
+                            if source_mode not in allowed_modes:
+                                continue
+                            sobj = by_src.get(sk)
+                            if not isinstance(sobj, dict):
+                                continue
+                            curl = str(sobj.get("cover") or "").strip()
+                            if curl and curl not in seen_urls:
+                                c_art = str(sobj.get("artist") or q_artist or "").strip()
+                                c_alb = str(sobj.get("album") or q_album or q_title or "").strip()
+                                candidates.append({
+                                    "id": f"meta:{sk}:{fid}",
+                                    "source": slbl,
+                                    "title": f"{c_art} - {c_alb}".strip(" -") or slbl,
+                                    "artist": c_art,
+                                    "album": c_alb,
+                                    "year": str(sobj.get("year") or ""),
+                                    "image_url": curl,
+                                    "thumb_url": curl,
+                                })
+                                seen_urls.add(curl)
+                except Exception:
+                    pass
+
+        if source_mode != "local":
+            online = cover.search_covers(q_artist, q_album, q_title, st, db=self.db, force_refresh=force_refresh)
+            for c in online:
+                if c["image_url"] not in seen_urls:
+                    candidates.append(c)
+                    seen_urls.add(c["image_url"])
 
         if not inspected["has_cover"]:
             new_status = "choices" if len(candidates) > 1 else ("not_found" if not candidates else row.get("cover_status") or "missing")
@@ -1419,6 +1461,7 @@ class Engine:
         total = max(1, len(targets))
         self._set_action_progress("apply_cover", "Embedding cover art", 0, total, "")
         updated = 0
+        updated_ids: list[int] = []
         try:
             for idx, r in enumerate(targets):
                 self._set_action_progress("apply_cover", "Embedding cover art", idx, total, r["relpath"])
@@ -1427,6 +1470,7 @@ class Engine:
                 try:
                     self._embed_into_row(r, data, mime, st)
                     updated += 1
+                    updated_ids.append(r["id"])
                 except Exception as exc:
                     self.db.log("error", f"{r['name']}: failed to embed cover ({exc})", "audio")
                 self._set_action_progress("apply_cover", "Embedding cover art", idx + 1, total, r["relpath"])
@@ -1436,7 +1480,7 @@ class Engine:
         label = row["name"] if len(targets) == 1 else f"{row['dir']} ({updated} files)"
         if updated:
             self.db.log("ok", f"Cover art embedded: {label}", "audio")
-        return {"ok": True, "updated": updated, "scope": scope}
+        return {"ok": True, "updated": updated, "updated_ids": updated_ids, "scope": scope}
 
     def skip_cover(self, ids: list[int]) -> dict:
         if not ids:
@@ -2152,7 +2196,7 @@ class Engine:
                         )
                 if f == "cover":
                     # Allow embedding OR replacing cover art whenever a valid cover URL/source is selected
-                    if val and val.startswith(("http://", "https://", "data:", "local://")):
+                    if val and val.startswith(("http://", "https://", "data:", "local://", "filecover://")):
                         updates["cover"] = val
                 elif choice == "custom":
                     if metadata._values_differ(f, str(live_current.get(f) or ""), val):
@@ -2201,12 +2245,24 @@ class Engine:
                     self._backup(src, "audio", r["relpath"])
                 prefetched: tuple[bytes, str] | None = None
                 cov_url = str(updates.get("cover") or "")
-                if cov_url and cov_url.startswith(("http://", "https://", "data:", "local://")):
+                if cov_url and cov_url.startswith(("http://", "https://", "data:", "local://", "filecover://")):
                     if cov_url in cover_downloads:
                         prefetched = cover_downloads[cov_url]
                     else:
                         try:
-                            dl = cover.download_cover(cov_url, token=token)
+                            if cov_url.startswith("filecover://"):
+                                src_fid = int(cov_url[len("filecover://"):].strip())
+                                src_row = self.db.one(
+                                    "SELECT relpath FROM files WHERE id = ? AND media = 'audio'",
+                                    (src_fid,),
+                                )
+                                if not src_row:
+                                    raise ValueError("source audio file for cover not found")
+                                dl = cover.extract_cover(self.abs_path("audio", src_row["relpath"]))
+                                if not dl:
+                                    raise ValueError("source audio file has no embedded cover")
+                            else:
+                                dl = cover.download_cover(cov_url, token=token)
                             if not dl[0] or len(dl[0]) < 16:
                                 raise ValueError("invalid cover image data")
                             cover_downloads[cov_url] = dl
