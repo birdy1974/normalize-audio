@@ -1399,6 +1399,9 @@
   function candThumbUrl(fileId, rawUrl, versionHint) {
     const u = String(rawUrl || '');
     if (!u) return '';
+    if (u.startsWith('filecover://')) {
+      return fileCoverUrl(u.slice('filecover://'.length), versionHint);
+    }
     if (u.startsWith('local://')) {
       const v = String(versionHint || 0) + '-' + String(state.coverBust);
       return '/api/files/' + fileId + '/local-cover?v=' + encodeURIComponent(v);
@@ -3023,6 +3026,23 @@
     return ' draggable="true" data-drag-meta="' + esc(payload) + '"';
   }
 
+  const FOLDER_PUSH_ICON = '<svg class="meta-push-dir-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>';
+
+  function renderPushFilteredBtn(fieldKey, fieldLabel, pushVal, isModal) {
+    if (isModal) return '';
+    const tipVal = fieldKey === 'cover'
+      ? (pushVal ? 'this cover' : '(clear)')
+      : (pushVal ? '"' + pushVal + '"' : '(clear)');
+    const labelText = 'Push ' + fieldLabel + ' ' + tipVal + ' to all files in the filtered list';
+    return '<button type="button" class="meta-edit-btn meta-push-dir-btn"'
+      + ' data-action="meta-push-filtered"'
+      + ' data-field="' + esc(fieldKey) + '"'
+      + ' data-value="' + esc(pushVal) + '"'
+      + ' aria-label="' + esc(labelText) + '"'
+      + ' title="' + esc(labelText) + '">'
+      + FOLDER_PUSH_ICON + '</button>';
+  }
+
   function renderOnlineSourceCell(fileItem, fieldKey, srcKey, srcLabel, rawVal, chosen, pickAct, isModal) {
     const val = String(rawVal || '').trim();
     const dropAttrs = ' data-drop-file="' + fileItem.id + '" data-drop-field="' + fieldKey + '"'
@@ -3030,10 +3050,12 @@
     if (!val) {
       return '<td class="meta-choice-cell"' + dropAttrs + '><span class="muted small">—</span></td>';
     }
+    const fieldLabel = META_FIELD_MAP[fieldKey] || fieldKey;
+    const pushBtn = renderPushFilteredBtn(fieldKey, fieldLabel, val, isModal);
     const dragAttr = makeDragAttr(fileItem.id, fieldKey, srcKey, val, isModal);
     if (fieldKey === 'cover') {
       const thumb = candThumbUrl(fileItem.id, val, fileItem.cover_updated_at || fileItem.checked_at);
-      return '<td class="meta-choice-cell"' + dropAttrs + '>'
+      return '<td class="meta-choice-cell"' + dropAttrs + '><span class="meta-val-with-push">'
         + '<button type="button" class="meta-pill' + (chosen ? ' is-chosen' : '') + '"'
         + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="' + srcKey + '"'
         + ' data-cover-zoom="' + esc(thumb) + '" data-cover-caption="' + esc(srcLabel + ' cover') + '"'
@@ -3041,15 +3063,17 @@
         + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
         + '<span class="meta-radio-dot"></span>'
         + '<img class="meta-cover-mini" src="' + esc(thumb) + '" alt="" loading="lazy">'
-        + '<span class="meta-pill-text">' + esc(srcLabel) + ' cover</span></button></td>';
+        + '<span class="meta-pill-text">' + esc(srcLabel) + ' cover</span></button>'
+        + pushBtn + '</span></td>';
     }
-    return '<td class="meta-choice-cell"' + dropAttrs + '>'
+    return '<td class="meta-choice-cell"' + dropAttrs + '><span class="meta-val-with-push">'
       + '<button type="button" class="meta-pill' + (chosen ? ' is-chosen' : '') + '"'
       + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="' + srcKey + '"'
       + dragAttr + ' title="' + esc(srcLabel + ': ' + val + ' · click to select or drag to another parameter') + '">'
       + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
       + '<span class="meta-radio-dot"></span>'
-      + '<span class="meta-pill-text">' + esc(val) + '</span></button></td>';
+      + '<span class="meta-pill-text">' + esc(val) + '</span></button>'
+      + pushBtn + '</span></td>';
   }
 
   function resolveFinalMetaValue(fieldKey, fieldObj, isDiscogsChosen, isMbChosen, isOpenChosen) {
@@ -3119,18 +3143,24 @@
         covText = hasCov ? 'Present' : 'Missing';
       } else if (finalVal) {
         covUrl = candThumbUrl(fileItem.id, finalVal, fileItem.cover_updated_at || fileItem.checked_at);
-        covText = choice === 'custom' ? 'Custom cover' : (finalInfo.srcLabel + ' cover');
+        covText = 'Selected';
       } else {
         covText = choice === 'custom' ? '(clear)' : 'Missing';
       }
       const cDrag = (choice !== 'current' && finalVal) ? makeDragAttr(fileItem.id, fieldKey, choice, finalVal, isModal) : '';
       const zoomCaption = choice === 'current'
         ? (fileItem.name + ' · Current embedded cover')
-        : (fileItem.name + ' · Selected cover (' + finalInfo.srcLabel + ')');
+        : (fileItem.name + ' · Selected cover');
       const zoomAttrs = covUrl ? ' data-cover-zoom="' + esc(covUrl) + '" data-cover-caption="' + esc(zoomCaption) + '"' : '';
       const covTip = choice === 'current'
         ? ((hasCov ? 'Current embedded cover: Present' : 'No cover currently embedded in file') + ' · click or press ✎ to override')
-        : ('Selected cover (' + finalInfo.srcLabel + ') · Current in file: ' + (hasCov ? 'Present' : 'Missing') + ' · click or press ✎ to override');
+        : ('Selected cover · Current in file: ' + (hasCov ? 'Present' : 'Missing') + ' · click or press ✎ to override');
+      const covPushVal = choice === 'current'
+        ? (hasCov ? 'filecover://' + fileItem.id : null)
+        : (finalVal ? finalVal : (choice === 'custom' ? '' : null));
+      const covPushBtn = covPushVal !== null
+        ? renderPushFilteredBtn(fieldKey, fieldLabel, covPushVal, isModal)
+        : '';
       const revertBtn = choice !== 'current'
         ? '<button type="button" class="meta-edit-btn" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current" title="' + esc('Keep current file cover (' + (hasCov ? 'Present' : 'Missing') + ')') + '">↺</button>'
         : '';
@@ -3140,8 +3170,8 @@
         + zoomAttrs + cDrag + ' title="' + esc(covTip) + '">'
         + (covUrl ? '<img class="meta-cover-mini" src="' + esc(covUrl) + '" alt="" loading="lazy">' : '')
         + '<span class="meta-pill-text">' + esc(covText) + '</span>'
-        + '<span class="meta-final-src">' + esc(finalInfo.srcLabel) + '</span>'
         + '</button>'
+        + covPushBtn
         + revertBtn
         + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Override ' + esc(fieldLabel) + ' value">✎</button>'
         + '</span>';
@@ -3159,9 +3189,12 @@
           + (pathWarn ? ' (differs from folder/file name)' : '')
           + ' · click or press ✎ to edit'
           + (curVal ? ', or drag to another parameter' : ''))
-        : ('Selected ' + fieldLabel + ' (' + finalInfo.srcLabel + '): ' + (finalVal || '(empty)')
+        : ('Selected ' + fieldLabel + ': ' + (finalVal || '(empty)')
           + ' · Current tag in file: ' + (curVal || '(empty)')
           + ' · click or press ✎ to edit');
+      const pushBtn = (finalVal || choice === 'custom')
+        ? renderPushFilteredBtn(fieldKey, fieldLabel, finalVal, isModal)
+        : '';
       const revertBtn = choice !== 'current'
         ? '<button type="button" class="meta-edit-btn" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current" title="' + esc('Revert to current file tag: ' + (curVal || '(empty)')) + '">↺</button>'
         : '';
@@ -3172,8 +3205,8 @@
         + (finalVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
         + '<span class="meta-pill-text">' + dispHtml + '</span>'
         + (showWarn ? '<span class="cover-override-tag" title="Current tag differs from folder/file name">⚠️</span>' : '')
-        + '<span class="meta-final-src">' + esc(finalInfo.srcLabel) + '</span>'
         + '</button>'
+        + pushBtn
         + revertBtn
         + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Override ' + esc(fieldLabel) + ' value (or drop a dragged value here)">✎</button>'
         + '</span>';
@@ -3191,23 +3224,29 @@
       if (pathVal) {
         const dragAttr = makeDragAttr(fileItem.id, fieldKey, 'path', pathVal, isModal);
         const lThumb = candThumbUrl(fileItem.id, pathVal, fileItem.cover_updated_at || fileItem.checked_at);
-        pathInner = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
+        pathInner = '<span class="meta-val-with-push">'
+          + '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
           + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path"'
           + ' data-cover-zoom="' + esc(lThumb) + '" data-cover-caption="' + esc(fileItem.name + ' · Local folder cover') + '"'
           + dragAttr + ' title="Use local folder cover image · drag to copy">'
           + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
           + '<span class="meta-radio-dot"></span>'
           + '<img class="meta-cover-mini" src="' + esc(lThumb) + '" alt="" loading="lazy">'
-          + '<span class="meta-pill-text">Local cover</span></button>';
+          + '<span class="meta-pill-text">Local cover</span></button>'
+          + renderPushFilteredBtn(fieldKey, fieldLabel, pathVal, isModal)
+          + '</span>';
       }
     } else if (pathVal) {
       const dragAttr = makeDragAttr(fileItem.id, fieldKey, 'path', pathVal, isModal);
-      pathInner = '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
+      pathInner = '<span class="meta-val-with-push">'
+        + '<button type="button" class="meta-pill' + (choice === 'path' ? ' is-chosen' : '') + '"'
         + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="path"'
         + dragAttr + ' title="' + esc('Folder/file name: ' + pathVal + ' · click to select or drag to another parameter') + '">'
         + '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>'
         + '<span class="meta-radio-dot"></span>'
-        + '<span class="meta-pill-text">' + esc(pathVal) + '</span></button>';
+        + '<span class="meta-pill-text">' + esc(pathVal) + '</span></button>'
+        + renderPushFilteredBtn(fieldKey, fieldLabel, pathVal, isModal)
+        + '</span>';
     }
     const pathCell = '<td class="meta-choice-cell"' + dropAttrs + '>' + pathInner + '</td>';
 
@@ -3607,6 +3646,7 @@
               + '<div class="meta-badges-line">' + srcTag + overrideBadge + '</div>'
               + '<div class="meta-row-actions">'
               + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + f.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
+              + '<button type="button" class="btn btn-sm" data-action="open-cover-by-id" data-file="' + f.id + '" data-scope="file" title="Search or choose cover art for ' + esc(f.name) + '">Cover</button>'
               + '<button type="button" class="btn btn-sm" data-action="open-meta-by-id" data-file="' + f.id + '" title="Open full metadata popup for this file">Popup</button>'
               + '</div>'
               + '</div>'
@@ -3647,7 +3687,7 @@
       + '<div class="card-head"><div><h2>2 · Metadata differences &amp; selection'
       + tip('Click any pill to select which value to use, drag any value pill onto another parameter row to copy it there, resize columns via header dividers, or use Bulk edit parameters for selected files.')
       + '</h2>'
-      + '<div class="sub">Click a pill to choose it · drag <strong>⋮⋮</strong> pills to copy values across parameters · drag column borders to resize · <strong>Update</strong> writes without changing file timestamps.</div></div></div>'
+      + '<div class="sub">Click a pill to choose it · click the folder icon behind any value to push it to that parameter across the whole filtered list · drag <strong>⋮⋮</strong> pills to copy values across parameters · <strong>Update</strong> writes without changing file timestamps.</div></div></div>'
       + filterBar
       + visBar
       + bulkBar
@@ -4063,9 +4103,12 @@
       : '';
 
     const srcOpts = [
-      ['both', 'Both (Discogs + Open)'],
+      ['all', 'All sources (Local + Discogs + MusicBrainz + Open)'],
       ['discogs', 'Discogs only'],
-      ['open', 'Open sources only'],
+      ['musicbrainz', 'MusicBrainz only'],
+      ['itunes', 'Open (iTunes) only'],
+      ['open', 'Open sources (MusicBrainz + iTunes)'],
+      ['local', 'Local folder only'],
     ].map(([k, lbl]) => '<option value="' + k + '"' + (COVER.source === k ? ' selected' : '') + '>' + lbl + '</option>').join('');
 
     const pathPreview = [COVER.pathArtist, COVER.pathTitle].filter(Boolean).join(' — ') || [COVER.pathArtist, COVER.pathAlbum].filter(Boolean).join(' — ') || 'none';
@@ -4143,7 +4186,8 @@
     COVER.artist = '';
     COVER.album = '';
     COVER.title = '';
-    COVER.source = (state.settings && state.settings.general && state.settings.general.coverSources) || 'both';
+    COVER.source = 'all';
+    COVER.customQuery = false;
     COVER.queryMode = currentSearchFrom();
     COVER.querySource = 'tags';
     COVER.albumFileCount = 1;
@@ -4166,7 +4210,12 @@
 
   async function runCoverModalSearch(force, explicitMode) {
     if (!COVER.open || !COVER.fileId) return;
-    if (explicitMode) COVER.queryMode = explicitMode;
+    if (explicitMode) {
+      COVER.queryMode = explicitMode;
+      COVER.customQuery = false;
+    } else if (force) {
+      COVER.customQuery = true;
+    }
     COVER.loading = true;
     COVER.error = '';
     renderCoverModal();
@@ -4175,7 +4224,7 @@
     try {
       const qm = COVER.queryMode || 'auto';
       const body = { source: COVER.source, query_mode: qm, force: !!force };
-      if (force && !explicitMode) {
+      if ((force && !explicitMode) || COVER.customQuery) {
         body.artist = COVER.artist;
         body.album = COVER.album;
         body.title = COVER.title;
@@ -4233,19 +4282,25 @@
         body.target_ids = COVER.targetIds;
       }
       const r = await api('/files/' + COVER.fileId + '/cover/apply', { method: 'POST', body });
+      const touchedIds = Array.isArray(r.updated_ids) && r.updated_ids.length
+        ? r.updated_ids
+        : [COVER.fileId];
+      touchedIds.forEach((id) => state.metaTouchedFiles.add(Number(id)));
       bumpCoverCache();
       closeCoverModal();
       invalidate('coverParked');
       invalidate('metadata');
       state.browse.stale = true;
+      const onMetaPage = currentRoute() === 'metadata';
       await Promise.all([
         refreshDash(),
         currentRoute() === 'parked' ? loadKey('coverParked') : Promise.resolve(),
-        currentRoute() === 'metadata' ? loadKey('metadata') : Promise.resolve(),
+        onMetaPage ? loadKey('metadata') : Promise.resolve(),
         currentRoute() === 'directories' && state.browse.rel ? loadBrowse(state.browse.rel, true) : Promise.resolve(),
       ]);
       toast('Embedded cover art into ' + r.updated + ' file' + (r.updated === 1 ? '' : 's'));
-      render();
+      if (onMetaPage) renderPreservingMetaScroll();
+      else render();
     } catch (err) {
       COVER.error = err.message;
       toast(err.message);
@@ -4757,7 +4812,20 @@
     } else if (a === 'open-cover-by-id') {
       const fid = Number(el.dataset.file);
       const ids = el.dataset.ids ? el.dataset.ids.split(',').map(Number).filter(Boolean) : null;
-      await openCoverModal(fid, { scope: el.dataset.scope || 'file', targetIds: ids });
+      const mf = (state.metadata && Array.isArray(state.metadata.files) && state.metadata.files.find((x) => x.id === fid))
+        || (state.browse && Array.isArray(state.browse.rows) && state.browse.rows.find((x) => x.id === fid))
+        || null;
+      const hasCov = mf
+        ? (!!mf.has_cover || !!(mf.fields && mf.fields.cover && mf.fields.cover.current === 'present'))
+        : false;
+      await openCoverModal(fid, {
+        name: mf ? (mf.name || '') : '',
+        relpath: mf ? (mf.relpath || '') : '',
+        dir: mf ? (mf.dir || '') : '',
+        hasCover: hasCov,
+        scope: el.dataset.scope || 'file',
+        targetIds: ids,
+      });
     } else if (a === 'cover-close') {
       closeCoverModal();
     } else if (a === 'cover-query-mode') {
@@ -5090,6 +5158,53 @@
       }
       renderPreservingMetaScroll();
       await queueMetaSelect({ ids: [fid], field: field, choice: 'custom', custom_value: val });
+      renderPreservingMetaScroll();
+    } else if (a === 'meta-push-filtered') {
+      const field = el.dataset.field;
+      const val = el.dataset.value !== undefined ? el.dataset.value : '';
+      if (!field) return;
+      const m = state.metadata || {};
+      const visibleFiles = filterAndSortMetaFiles(m.files || [], m.options || {});
+      const ids = visibleFiles.map((f) => f.id);
+      if (!ids.length) {
+        toast('No files in the current filtered list');
+        return;
+      }
+      ensureMetaFieldsVisible([field]);
+      const idSet = new Set(ids);
+      ids.forEach((id) => {
+        delete state.metaEditing[id + ':' + field];
+        state.metaTouchedFiles.add(id);
+      });
+      const mergedSel = new Set(state.metaSel);
+      ids.forEach((id) => mergedSel.add(id));
+      state.metaSel = Array.from(mergedSel);
+      if (Array.isArray(m.files)) {
+        m.files.forEach((item) => {
+          if (!idSet.has(item.id)) return;
+          if (!item.fields) item.fields = {};
+          if (!item.fields[field]) {
+            item.fields[field] = {
+              current: '', path: '', discogs: '', musicbrainz: '', open: '', online: '',
+              choice: 'custom', custom_value: val,
+            };
+          } else {
+            item.fields[field].choice = 'custom';
+            item.fields[field].custom_value = val;
+          }
+        });
+      }
+      renderPreservingMetaScroll();
+      await queueMetaSelect({ ids: ids, field: field, choice: 'custom', custom_value: val });
+      const fieldLabel = META_FIELD_MAP[field] || field;
+      const shownVal = field === 'cover'
+        ? (val ? 'cover' : '(clear)')
+        : (val ? '"' + val + '"' : '(clear)');
+      toast(
+        'Filled ' + fieldLabel + ' with ' + shownVal + ' for all ' + ids.length
+        + ' file' + (ids.length === 1 ? '' : 's') + ' in filtered list · press "Update Selected ('
+        + state.metaSel.length + ')" to write ID3 tags'
+      );
       renderPreservingMetaScroll();
     } else if (a === 'meta-opt-search-from') {
       const mode = el.dataset.mode || 'auto';
@@ -5472,7 +5587,10 @@
       if (k === 'artist') COVER.artist = el.value;
       else if (k === 'album') COVER.album = el.value;
       else if (k === 'title') COVER.title = el.value;
-      else if (k === 'source') COVER.source = el.value;
+      else if (k === 'source') {
+        COVER.source = el.value;
+        if (committed) runCoverModalSearch(false);
+      }
       return;
     }
 
