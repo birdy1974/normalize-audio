@@ -36,6 +36,8 @@
   --error-tint: #f6e5e2;
 
   --badge-bg: rgba(0, 0, 0, .06);
+  --btn-album-bg: #ffffff;
+  --btn-album-hover: #f1f1ef;
   --backdrop: rgba(28, 29, 28, .45);
   --shadow-rail: rgba(0, 0, 0, .08);
   --shadow-modal: rgba(0, 0, 0, .28);
@@ -78,6 +80,8 @@
   --error-tint: #311b19;
 
   --badge-bg: rgba(255, 255, 255, .09);
+  --btn-album-bg: #0c0e0d;
+  --btn-album-hover: #181b1a;
   --backdrop: rgba(0, 0, 0, .68);
   --shadow-rail: rgba(0, 0, 0, .48);
   --shadow-modal: rgba(0, 0, 0, .58);
@@ -323,6 +327,9 @@ pre {
   gap: 16px;
   flex-wrap: wrap;
 }
+.page-head.page-head-static {
+  position: static;
+}
 .page-head .desc { color: var(--muted); max-width: 1180px; margin-top: 6px; }
 .head-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
@@ -386,6 +393,8 @@ pre {
 .btn:disabled { opacity: .4; cursor: not-allowed; }
 .btn-primary { background: var(--accent-solid); border-color: var(--accent-solid); color: #fff; }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn-album { background: var(--btn-album-bg); color: var(--text); border-color: var(--line-strong); }
+.btn-album:hover:not(:disabled) { background: var(--btn-album-hover); border-color: var(--muted); }
 .btn-danger { background: var(--error-solid); border-color: var(--error-solid); color: #fff; }
 .btn-danger:hover:not(:disabled) { background: var(--error-hover); border-color: var(--error-hover); }
 .btn-sm { height: 26px; padding: 0 8px; font-size: 12px; }
@@ -987,8 +996,33 @@ body.has-modal { overflow: hidden; }
 .meta-bulk-item .input { height: 28px; font-size: 12.5px; padding: 0 8px; }
 
 body.is-col-resizing { cursor: col-resize !important; user-select: none !important; }
-table.meta-table { border-collapse: collapse; }
+table.meta-table { border-collapse: separate; border-spacing: 0; }
 table.meta-table.meta-table-resizable { table-layout: fixed; }
+table.meta-table thead th {
+  background: var(--surface);
+  border-bottom: 1.5px solid var(--line-strong);
+}
+#meta-table-wrap {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+#meta-diff-table thead {
+  position: relative;
+  z-index: 15;
+}
+#meta-diff-table thead.is-stuck {
+  transform: translate3d(0, var(--meta-head-y, 0px), 0);
+  will-change: transform;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .10);
+}
+:root[data-theme="dark"] #meta-diff-table thead.is-stuck {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .42);
+}
+#metadata-modal table.meta-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+}
 table.meta-table th, table.meta-table td {
   padding: 6px 8px;
   vertical-align: middle;
@@ -1011,12 +1045,35 @@ table.meta-table th.is-resizable {
 }
 .col-resizer:hover::after, .col-resizer.is-active::after { background: var(--accent); top: 10%; bottom: 10%; width: 3px; }
 
-tr.meta-file-group-start td { border-top: 1.5px solid var(--line-strong); }
-td.meta-file-col { vertical-align: top !important; padding-top: 8px !important; }
+tr.meta-file-group-start:not(:first-child) > td { box-shadow: inset 0 1.5px 0 var(--line-strong); }
+td.meta-file-col {
+  vertical-align: top !important;
+  padding-top: 8px !important;
+  white-space: normal !important;
+  overflow: visible;
+  text-overflow: clip;
+}
 td.meta-pick-col { vertical-align: top !important; padding-top: 9px !important; width: 38px; }
-.meta-file-cell-inner { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow: hidden; }
+.meta-file-cell-inner { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.meta-file-name {
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.35;
+  max-width: 100%;
+}
+.meta-folder-name {
+  display: block;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.3;
+  max-width: 100%;
+}
 .meta-one-line { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
-.meta-badges-line { display: flex; align-items: center; gap: 4px; overflow: hidden; white-space: nowrap; }
+.meta-badges-line { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; white-space: normal; }
+td.meta-file-col .meta-row-actions { margin-left: 0; flex-wrap: wrap; margin-top: 2px; }
 
 .meta-field-name {
   font-size: 12px; font-weight: 600; color: var(--muted);

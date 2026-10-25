@@ -842,6 +842,272 @@ def test_metadata_column_order_header_buttons_enabled_fields_and_selection_stabi
     assert popup_data["fields"]["genre"]["choice"] == "discogs"
 
 
+@pytest.mark.parametrize("ext,codec_args", [
+    ("mp3", ("-c:a", "libmp3lame", "-b:a", "128k")),
+    ("flac", ("-c:a", "flac")),
+    ("m4a", ("-c:a", "aac", "-b:a", "128k")),
+    ("wav", ("-c:a", "pcm_s16le")),
+])
+def test_inplace_padding_write_and_single_pass_cover_avoid_audio_copy(tmp_path, monkeypatch, ext, codec_args):
+    """Option A: initial write reserves 8 KiB padding in a single pass; subsequent tag & cover
+    edits that fit in padding write directly in-place without copying the audio stream."""
+    import shutil as shutil_mod
+    from app import cover as cover_mod
+
+    p = tone(str(tmp_path / f"inplace_test.{ext}"), 0, codec_args=codec_args)
+    fixed_ns = 1_700_123_456_789_123_456
+    os.utime(p, ns=(fixed_ns, fixed_ns))
+
+    jpeg_a = b"\xff\xd8\xff\xe0" + b"\x22" * 512 + b"\xff\xd9"
+    jpeg_b = b"\xff\xd8\xff\xe0" + b"\x33" * 400 + b"\xff\xd9"
+    jpeg_huge = b"\xff\xd8\xff\xe0" + b"\x44" * (24 * 1024) + b"\xff\xd9"
+    monkeypatch.setattr(
+        cover_mod,
+        "download_cover",
+        lambda url, token="": (jpeg_a if "a.jpg" in url else (jpeg_b if "b.jpg" in url else jpeg_huge), "image/jpeg"),
+    )
+
+    real_copy2 = shutil_mod.copy2
+    copy_calls = []
+
+    def tracked_copy2(src, dst, *args, **kwargs):
+        copy_calls.append((src, dst))
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(shutil_mod, "copy2", tracked_copy2)
+
+    # 1. Single-pass text + cover write copies at most ONCE (never twice!)
+    assert meta_mod.write_full_tags(
+        p,
+        {"artist": "Initial Artist", "title": "Initial Title", "album": "Album 1", "cover": "https://img/a.jpg"},
+        preserve_mtime=True,
+    ) is True
+    assert len(copy_calls) <= 1
+    assert os.stat(p).st_mtime_ns == fixed_ns
+
+    # 2. Subsequent text-tag + equal/smaller cover updates fit in reserved 8 KiB padding -> ZERO file copies!
+    copy_calls.clear()
+    st_mid = os.stat(p)
+    assert meta_mod.write_full_tags(
+        p,
+        {
+            "artist": "Updated Artist",
+            "title": "Updated Title",
+            "album": "Updated Album",
+            "year": "2024",
+            "track": "5",
+            "genre": "Synthwave",
+            "cover": "https://img/b.jpg",
+        },
+        preserve_mtime=True,
+    ) is True
+    st_after_inplace = os.stat(p)
+    assert copy_calls == [], f"expected zero shutil.copy2 calls for in-place {ext} save"
+    assert st_after_inplace.st_ino == st_mid.st_ino
+    assert st_after_inplace.st_size == st_mid.st_size
+    assert st_after_inplace.st_mtime_ns == fixed_ns
+
+    tags = meta_mod.read_full_tags(p)
+    assert tags["artist"] == "Updated Artist"
+    assert tags["title"] == "Updated Title"
+    assert tags["year"] == "2024"
+    assert tags["track"] == "5"
+    assert tags["genre"] == "Synthwave"
+    assert tags["cover"] == "present"
+    extracted = cover_mod.extract_cover(p)
+    assert extracted is not None and extracted[0] == jpeg_b
+
+    # 3. Cover exceeding reserved padding cleanly falls back to atomic temp-file resize
+    assert meta_mod.write_full_tags(p, {"cover": "https://img/huge.jpg"}, preserve_mtime=True) is True
+    assert len(copy_calls) == 1
+    assert os.stat(p).st_mtime_ns == fixed_ns
+    extracted_huge = cover_mod.extract_cover(p)
+    assert extracted_huge is not None and extracted_huge[0] == jpeg_huge
+
+
+def test_fast_binary_header_scanner_and_stat_tag_cache(tmp_path, monkeypatch):
+    """Option B: seek-over-cover binary scanner handles UTF-8/UTF-16/Latin-1, numeric TCON fallback,
+    ID3v1 tail fallback, FLAC picture blocks, and invalidates stat-fingerprinted cache on in-place writes."""
+    from mutagen.id3 import ID3, TCON, TIT2, TPE1
+    from app import cover as cover_mod
+
+    # 1. MP3 with UTF-16LE + Latin-1 + numeric TCON "(17)" -> falls back cleanly for numeric genre ("Rock")
+    mp3_num = tone(str(tmp_path / "genre_num.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+    id3 = ID3()
+    id3.add(TPE1(encoding=1, text=["UTF16 Artist"]))
+    id3.add(TIT2(encoding=0, text=["Latin Title"]))
+    id3.add(TCON(encoding=3, text=["(17)"]))
+    id3.save(mp3_num, v2_version=3)
+    cover_mod.invalidate_tag_cache(mp3_num)
+    parsed_num = meta_mod.read_full_tags(mp3_num)
+    assert parsed_num["artist"] == "UTF16 Artist"
+    assert parsed_num["title"] == "Latin Title"
+    assert parsed_num["genre"] == "Rock"
+
+    # 2. FLAC + MP3 fast scanner + cache hit tracking + in-place cache invalidation
+    flac_p = tone(str(tmp_path / "cached.flac"), 0, codec_args=("-c:a", "flac"))
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x55" * 1024 + b"\xff\xd9"
+    cover_mod.embed_cover(flac_p, jpeg, mime="image/jpeg")
+    meta_mod.write_full_tags(flac_p, {"artist": "Cache Artist 1", "title": "Song 1", "genre": "Ambient"})
+
+    real_uncached = cover_mod._read_raw_tags_uncached
+    uncached_calls = []
+
+    def counted_uncached(path, ext, st_size):
+        uncached_calls.append(path)
+        return real_uncached(path, ext, st_size)
+
+    monkeypatch.setattr(cover_mod, "_read_raw_tags_uncached", counted_uncached)
+    cover_mod.invalidate_tag_cache(flac_p)
+
+    # First read populates cache; second read + inspect_audio hit cache with 0 disk parses
+    t1 = meta_mod.read_full_tags(flac_p)
+    t2 = meta_mod.read_full_tags(flac_p)
+    info = cover_mod.inspect_audio(flac_p)
+    assert len(uncached_calls) == 1
+    assert t1["artist"] == t2["artist"] == info["artist"] == "Cache Artist 1"
+    assert info["has_cover"] is True
+
+    # In-place write (preserving mtime and file size!) must invalidate cache immediately
+    meta_mod.write_full_tags(flac_p, {"artist": "Cache Artist 2"}, preserve_mtime=True)
+    t3 = meta_mod.read_full_tags(flac_p)
+    assert t3["artist"] == "Cache Artist 2"
+    assert len(uncached_calls) == 2
+
+
+def test_reentrant_db_tx_concurrent_online_sources_and_album_cover_dedup(client, cfg, tmp_path, monkeypatch):
+    """Option C: SQLite synchronous=NORMAL + re-entrant SAVEPOINT tx(), concurrent multi-source
+    HTTP lookups with deterministic merge order, and single-download cover deduplication across an album."""
+    import time as time_mod
+    from app import cover as cover_mod
+    from app.db import Database
+
+    # 1. SQLite synchronous=NORMAL + nested SAVEPOINT transactions (including db.log inside db.tx)
+    test_db = Database(str(tmp_path / "tx_test.db"))
+    try:
+        sync_val = test_db.one("PRAGMA synchronous")["synchronous"]
+        assert sync_val == 1  # NORMAL
+        with test_db.tx():
+            test_db.set_json("outer", "kept")
+            test_db.log("info", "nested log inside outer transaction", "audio")
+            try:
+                with test_db.tx():
+                    test_db.set_json("inner", "rolled_back")
+                    raise RuntimeError("abort inner savepoint")
+            except RuntimeError:
+                pass
+        assert test_db.get_json("outer") == "kept"
+        assert test_db.get_json("inner") is None
+    finally:
+        test_db.close()
+
+    # 2. Concurrent multi-source lookup_online_metadata (~3x faster than sequential, deterministic priority)
+    def slow_discogs(artist, album, title, track, token="", cancel=None):
+        time_mod.sleep(0.15)
+        return [{"source": "Discogs", "artist": "Discogs Artist", "album": album, "title": title, "year": "1999", "track": track, "genre": "House", "cover": ""}]
+
+    def slow_mb(artist, album, title, track, cancel=None):
+        time_mod.sleep(0.15)
+        return [{"source": "MusicBrainz", "artist": "MB Artist", "album": album, "title": title, "year": "2000", "track": track, "genre": "Electronic", "cover": "https://img/mb.jpg"}]
+
+    def slow_itunes(artist, album, title, track, cancel=None):
+        time_mod.sleep(0.15)
+        return [{"source": "Open (iTunes)", "artist": "Open Artist", "album": album, "title": title, "year": "2001", "track": track, "genre": "Pop", "cover": "https://img/open.jpg"}]
+
+    monkeypatch.setattr(meta_mod, "_lookup_discogs", slow_discogs)
+    monkeypatch.setattr(meta_mod, "_lookup_musicbrainz", slow_mb)
+    monkeypatch.setattr(meta_mod, "_lookup_itunes", slow_itunes)
+
+    t0 = time_mod.perf_counter()
+    merged = meta_mod.lookup_online_metadata("Daft Punk", "Discovery", "One More Time", "1")
+    elapsed = time_mod.perf_counter() - t0
+    assert elapsed < 0.35, f"expected concurrent lookup (<0.35s), took {elapsed:.3f}s"
+    # Deterministic merge order: Discogs wins artist/year/genre, MusicBrainz fills missing cover
+    assert merged["artist"] == "Discogs Artist"
+    assert merged["year"] == "1999"
+    assert merged["cover"] == "https://img/mb.jpg"
+    assert set(merged["by_source"].keys()) == {"discogs", "musicbrainz", "open"}
+
+    # 3. Album metadata apply deduplicates cover download across all tracks in the album
+    album_dir = os.path.join(cfg.audio_root, "DedupBand", "DedupAlbum")
+    for idx in (1, 2, 3):
+        tone(os.path.join(album_dir, f"0{idx} - Song {idx}.mp3"), 0, codec_args=("-c:a", "libmp3lame", "-b:a", "128k"))
+
+    dl_calls = []
+    jpeg_bytes = b"\xff\xd8\xff\xe0" + b"\x77" * 512 + b"\xff\xd9"
+
+    def counted_download(url, token=""):
+        dl_calls.append(url)
+        return jpeg_bytes, "image/jpeg"
+
+    monkeypatch.setattr(cover_mod, "download_cover", counted_download)
+    assert client.post("/api/scan", json={"media": "audio"}).status_code == 200
+    rows = client.get("/api/files", params={"media": "audio", "dir": "DedupBand/DedupAlbum"}).json()["files"]
+    assert len(rows) == 3
+
+    res = client.post(
+        "/api/metadata/apply",
+        json={
+            "ids": [rows[0]["id"]],
+            "scope": "album",
+            "overrides": {
+                "artist": {"choice": "custom", "value": "DedupBand"},
+                "album": {"choice": "custom", "value": "DedupAlbum"},
+                "cover": {"choice": "discogs", "value": "https://img/shared-album.jpg"},
+            },
+        },
+    ).json()
+    assert res["updated"] == 3
+    assert dl_calls == ["https://img/shared-album.jpg"]
+
+
+def test_metadata_table_multiline_filename_and_combined_current_selected_column():
+    """Verify:
+    1) 'File & folder' cell renders full multi-line file names (.meta-file-name with white-space: normal
+       and overflow-wrap: anywhere) instead of single-line ellipsis truncation.
+    2) 'Selected / Custom' and 'Current tag (file)' are combined into a single unified column
+       ('Current tag / Selected (✎)') in both the Meta data tab and the per-file metadata popup.
+    """
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as jf:
+        js = jf.read()
+    with open(os.path.join(root, "static", "styles.css"), "r", encoding="utf-8") as cf:
+        css = cf.read()
+
+    # 1. Complete file name is visible across multiple lines in 'File & folder'
+    assert '<strong class="meta-file-name" title="\' + esc(f.relpath) + \'">\' + esc(f.name) + \'</strong>' in js
+    fn_rule = re.search(r"\.meta-file-name\s*\{([^}]*)\}", css, re.S)
+    assert fn_rule is not None
+    assert "white-space: normal" in fn_rule.group(1)
+    assert "overflow-wrap: anywhere" in fn_rule.group(1)
+    col_rule = re.search(r"td\.meta-file-col\s*\{([^}]*)\}", css, re.S)
+    assert col_rule is not None
+    assert "white-space: normal" in col_rule.group(1)
+
+    # 2. Combined 'Current tag / Selected (✎)' column replaces separate 'current' column
+    spec_block = re.search(r"const META_COL_SPECS = \[(.*?)\];", js, re.S)
+    assert spec_block is not None
+    col_keys = re.findall(r"\['([a-z]+)'", spec_block.group(1))
+    assert col_keys == ["pick", "file", "custom", "field", "path", "discogs", "musicbrainz", "open"]
+    assert "current" not in col_keys
+    assert "Current tag / Selected (✎)" in js
+    assert "Current tag (file)" not in js
+    assert "return customCell + fieldCell + pathCell + discogsCell + mbCell + openCell;" in js
+    # Revert-to-current-tag button is available inside the combined column when another source/custom is selected
+    assert 'data-choice="current"' in js and ">↺</button>" in js
+
+    # 3. Detailed list header stays visible while scrolling down; content above header scrolls away
+    assert "'page-head-static'" in js
+    assert re.search(r"\.page-head\.page-head-static\s*\{\s*position:\s*static;", css)
+    assert "function syncMetaStickyHeader()" in js
+    assert "#meta-diff-table thead.is-stuck" in css
+    assert "translate3d(0, var(--meta-head-y, 0px), 0)" in css
+
+
+
+
 
 
 
