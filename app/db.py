@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS dirs (
     relpath TEXT NOT NULL,
     parent TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    dir_mtime_ns INTEGER NOT NULL DEFAULT 0,
+    dir_ctime_ns INTEGER NOT NULL DEFAULT 0,
+    scanned_ok INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (media, relpath)
 );
 CREATE INDEX IF NOT EXISTS dirs_parent ON dirs(media, parent);
@@ -103,12 +106,14 @@ class Database:
         self.path = os.path.abspath(path)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self._lock = threading.RLock()
+        self._sp_seq = 0
+        self._data_seq = 0
         self._closed = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None, timeout=15)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.execute("PRAGMA wal_autocheckpoint=200")
             self._conn.execute("PRAGMA temp_store=MEMORY")
@@ -130,11 +135,30 @@ class Database:
             ):
                 if col not in cols:
                     self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} {ddl}")
+            dir_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(dirs)").fetchall()}
+            for col, ddl in (
+                ("dir_mtime_ns", "INTEGER NOT NULL DEFAULT 0"),
+                ("dir_ctime_ns", "INTEGER NOT NULL DEFAULT 0"),
+                ("scanned_ok", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if col not in dir_cols:
+                    self._conn.execute(f"ALTER TABLE dirs ADD COLUMN {col} {ddl}")
             self._conn.execute("CREATE INDEX IF NOT EXISTS files_cover_status ON files(media, cover_status)")
+
+    @property
+    def data_seq(self) -> int:
+        return self._data_seq
 
     def query(self, sql: str, args=()) -> list[dict]:
         with self._lock:
             return [dict(r) for r in self._conn.execute(sql, args).fetchall()]
+
+    def query_tuples(self, sql: str, args=()) -> list[tuple]:
+        """Fast raw-tuple fetch avoiding sqlite3.Row and dict per-row allocations on large scans."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.row_factory = None
+            return cur.execute(sql, args).fetchall()
 
     def one(self, sql: str, args=()) -> dict | None:
         rows = self.query(sql, args)
@@ -142,26 +166,45 @@ class Database:
 
     def execute(self, sql: str, args=()) -> int:
         with self._lock:
-            return self._conn.execute(sql, args).rowcount
+            rc = self._conn.execute(sql, args).rowcount
+            self._data_seq += 1
+            return rc
 
     def executemany(self, sql: str, seq) -> None:
         with self._lock:
             self._conn.executemany(sql, seq)
+            self._data_seq += 1
 
     def insert(self, sql: str, args=()) -> int:
         with self._lock:
-            return self._conn.execute(sql, args).lastrowid
+            rowid = self._conn.execute(sql, args).lastrowid
+            self._data_seq += 1
+            return rowid
 
     @contextmanager
     def tx(self):
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield self
-                self._conn.execute("COMMIT")
-            except BaseException:
-                self._conn.execute("ROLLBACK")
-                raise
+            if self._conn.in_transaction:
+                self._sp_seq += 1
+                sp = f"sp_{self._sp_seq}"
+                self._conn.execute(f"SAVEPOINT {sp}")
+                try:
+                    yield self
+                    self._conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    self._data_seq += 1
+                except BaseException:
+                    self._conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    self._conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    raise
+            else:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    yield self
+                    self._conn.execute("COMMIT")
+                    self._data_seq += 1
+                except BaseException:
+                    self._conn.execute("ROLLBACK")
+                    raise
 
     def get_json(self, key: str, default=None):
         row = self.one("SELECT value FROM kv WHERE key = ?", (key,))

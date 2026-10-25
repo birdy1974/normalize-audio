@@ -3,6 +3,7 @@ and lossless cover picture embedding across audio formats."""
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import difflib
 import hashlib
 import json
@@ -11,6 +12,7 @@ import os
 import re
 import shutil
 import struct
+import threading
 import time
 import unicodedata
 from typing import Any
@@ -22,9 +24,65 @@ from mutagen.asf import ASF, ASFByteArrayAttribute
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
 from mutagen.wave import WAVE
 
 log = logging.getLogger("normalizer")
+
+# Shared HTTP connection pool & concurrent lookup executor (reuses TCP + TLS 1.3 sessions)
+_ORIG_HTTPX_GET = httpx.get
+_HTTP_CLIENT: httpx.Client | None = None
+_HTTP_LOCK = threading.Lock()
+_HTTP_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="meta-http")
+
+# Tag padding configuration: retain up to 256 KiB of existing header slack so edits write
+# directly in-place without rewriting multi-MB audio streams; reserve 8 KiB when growing.
+DEFAULT_TAG_PADDING = 8192
+MAX_RETAINED_PADDING = 256 * 1024
+
+
+class _NeedsResize(Exception):
+    """Internal sentinel raised before any disk write when existing tag padding cannot hold the edit."""
+
+
+def smart_padding(info) -> int:
+    if 0 <= info.padding <= MAX_RETAINED_PADDING:
+        return info.padding
+    return DEFAULT_TAG_PADDING
+
+
+def _inplace_only_padding(info) -> int:
+    if 0 <= info.padding <= MAX_RETAINED_PADDING:
+        return info.padding
+    raise _NeedsResize()
+
+
+def http_get(url: str, **kwargs) -> httpx.Response:
+    """Pooled HTTP GET reusing keep-alive & TLS sessions, while honoring monkeypatched httpx.get."""
+    if httpx.get is not _ORIG_HTTPX_GET:
+        return httpx.get(url, **kwargs)
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        with _HTTP_LOCK:
+            if _HTTP_CLIENT is None:
+                _HTTP_CLIENT = httpx.Client(
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                )
+    return _HTTP_CLIENT.get(url, **kwargs)
+
+
+def open_ogg_fast(path: str, ext: str):
+    """Dispatch Ogg/Opus directly to its concrete Mutagen class instead of probing 15+ formats."""
+    if ext == "opus":
+        try:
+            return OggOpus(path)
+        except Exception:
+            return mutagen.File(path)
+    try:
+        return OggVorbis(path)
+    except Exception:
+        return mutagen.File(path)
 
 USER_AGENT = "AudioNormalizer/1.0 (+https://github.com/birdy1974/normalize-audio)"
 LOCAL_COVER_NAMES = (
@@ -74,7 +132,274 @@ def detect_mime(data: bytes, fallback: str = "image/jpeg") -> str:
     return fallback
 
 
-# ------------------------------------------------------------ tag inspection
+# ------------------------------------------------------------ tag inspection & fast header cache
+
+_TAG_CACHE_MAX = 16384
+_TAG_CACHE: dict[str, tuple[tuple[int, int, int, int], dict[str, Any]]] = {}
+_TAG_CACHE_LOCK = threading.Lock()
+
+_WANTED_ID3_FRAMES = {
+    b"TPE1", b"TIT2", b"TALB", b"TPE2", b"TDRC", b"TYER", b"TRCK", b"TCON",
+}
+_WANTED_VORBIS_KEYS = {
+    "artist", "title", "album", "albumartist", "album artist",
+    "date", "year", "tracknumber", "genre",
+}
+
+
+def _empty_raw_tags() -> dict[str, Any]:
+    return {
+        "has_cover": False,
+        "artist": "",
+        "wma_artist": "",
+        "title": "",
+        "album": "",
+        "album_artist": "",
+        "year": "",
+        "track": "",
+        "genre": "",
+    }
+
+
+def invalidate_tag_cache(path: str) -> None:
+    """Evict cached tag entry for `path` immediately after an in-place or temp-file write."""
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        rp = os.path.abspath(path)
+    with _TAG_CACHE_LOCK:
+        _TAG_CACHE.pop(rp, None)
+
+
+def _decode_id3_text_payload(payload: bytes) -> str | None:
+    """Decode standard ID3v2.3/v2.4 text frame payload; return None if exotic encoding needs Mutagen."""
+    if not payload:
+        return ""
+    enc = payload[0]
+    body = payload[1:]
+    if enc == 0:
+        return body.split(b"\x00", 1)[0].decode("latin-1", errors="replace").strip()
+    if enc == 3:
+        return body.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+    if enc == 1:
+        if body.startswith(b"\xff\xfe"):
+            codec, body = "utf-16-le", body[2:]
+        elif body.startswith(b"\xfe\xff"):
+            codec, body = "utf-16-be", body[2:]
+        else:
+            return None
+        for i in range(0, len(body) - 1, 2):
+            if body[i] == 0 and body[i + 1] == 0:
+                body = body[:i]
+                break
+        if len(body) & 1:
+            body = body[:-1]
+        return body.decode(codec, errors="replace").strip()
+    if enc == 2:
+        for i in range(0, len(body) - 1, 2):
+            if body[i] == 0 and body[i + 1] == 0:
+                body = body[:i]
+                break
+        if len(body) & 1:
+            body = body[:-1]
+        return body.decode("utf-16-be", errors="replace").strip()
+    return None
+
+
+def _fast_scan_id3_stream(f, offset: int, max_end: int) -> dict[str, Any] | None:
+    """Scan an ID3v2.3/v2.4 header at `offset`, seeking directly over APIC and binary frames.
+    Returns parsed raw dict, empty dict if no ID3 header at offset, or None to fall back to Mutagen."""
+    f.seek(offset)
+    hdr = f.read(10)
+    if len(hdr) < 10 or hdr[:3] != b"ID3":
+        return {}
+    ver_major = hdr[3]
+    flags = hdr[5]
+    if ver_major not in (3, 4) or flags != 0:
+        return None
+    if (hdr[6] | hdr[7] | hdr[8] | hdr[9]) & 0x80:
+        return None
+    tag_size = (hdr[6] << 21) | (hdr[7] << 14) | (hdr[8] << 7) | hdr[9]
+    end = offset + 10 + tag_size
+    if end > max_end:
+        return None
+
+    has_cover = False
+    frames: dict[bytes, str] = {}
+    pos = offset + 10
+    while pos + 10 <= end:
+        fhdr = f.read(10)
+        if len(fhdr) < 10 or fhdr[0] == 0:
+            # Hit $00 tag padding: stop immediately without reading remaining padding bytes
+            break
+        fid = fhdr[:4]
+        if ver_major == 4:
+            if (fhdr[4] | fhdr[5] | fhdr[6] | fhdr[7]) & 0x80:
+                return None
+            fsz = (fhdr[4] << 21) | (fhdr[5] << 14) | (fhdr[6] << 7) | fhdr[7]
+        else:
+            fsz = struct.unpack(">I", fhdr[4:8])[0]
+        if fsz < 0 or pos + 10 + fsz > end:
+            return None
+        pos += 10 + fsz
+
+        if fid == b"APIC":
+            has_cover = True
+            f.seek(fsz, os.SEEK_CUR)
+        elif fid in _WANTED_ID3_FRAMES:
+            if fhdr[8] != 0 or fhdr[9] != 0:
+                return None
+            if fsz == 0:
+                continue
+            payload = f.read(fsz)
+            if len(payload) < fsz:
+                return None
+            val = _decode_id3_text_payload(payload)
+            if val is None:
+                return None
+            if fid == b"TCON" and val and (val.startswith("(") or val.isdigit() or val in ("RX", "CR")):
+                # Delegate numeric ID3v1 genre references like "(17)" to Mutagen's TCON genre table
+                return None
+            if val:
+                frames[fid] = val
+        else:
+            f.seek(fsz, os.SEEK_CUR)
+
+    out = _empty_raw_tags()
+    out["has_cover"] = has_cover
+    out["artist"] = frames.get(b"TPE1", "")
+    out["title"] = frames.get(b"TIT2", "")
+    out["album"] = frames.get(b"TALB", "")
+    out["album_artist"] = frames.get(b"TPE2", "")
+    out["year"] = frames.get(b"TDRC") or frames.get(b"TYER") or ""
+    out["track"] = frames.get(b"TRCK", "")
+    out["genre"] = frames.get(b"TCON", "")
+    return out
+
+
+def _fast_read_mp3_aac(path: str, st_size: int) -> dict[str, Any] | None:
+    """Fast ID3v2 scanner for MP3/AAC that skips reading embedded APIC cover bytes from disk."""
+    with open(path, "rb") as f:
+        scanned = _fast_scan_id3_stream(f, 0, st_size)
+        if scanned is None:
+            return None
+        if not scanned:
+            if st_size >= 128:
+                f.seek(st_size - 128)
+                if f.read(3) == b"TAG":
+                    return None
+            return _empty_raw_tags()
+
+        # If any ID3v1-capable field is empty in ID3v2, check if an ID3v1 tail actually supplies it
+        if st_size >= 128 and not all(
+            (scanned["title"], scanned["artist"], scanned["album"], scanned["year"], scanned["track"], scanned["genre"])
+        ):
+            f.seek(st_size - 128)
+            v1 = f.read(128)
+            if len(v1) == 128 and v1[:3] == b"TAG":
+                if (
+                    (not scanned["title"] and v1[3:33].rstrip(b"\x00 "))
+                    or (not scanned["artist"] and v1[33:63].rstrip(b"\x00 "))
+                    or (not scanned["album"] and v1[63:93].rstrip(b"\x00 "))
+                    or (not scanned["year"] and v1[93:97].rstrip(b"\x00 "))
+                    or (not scanned["track"] and v1[125] == 0 and v1[126] != 0)
+                    or (not scanned["genre"] and v1[127] != 255)
+                ):
+                    return None
+        return scanned
+
+
+def _fast_read_flac(path: str, st_size: int) -> dict[str, Any] | None:
+    """Fast RFC 9639 FLAC metadata block scanner that seeks directly over PICTURE and PADDING blocks."""
+    with open(path, "rb") as f:
+        if f.read(4) != b"fLaC":
+            return None
+        out = _empty_raw_tags()
+        vtags: dict[str, str] = {}
+        while True:
+            bhdr = f.read(4)
+            if len(bhdr) < 4:
+                return None
+            is_last = (bhdr[0] & 0x80) != 0
+            btype = bhdr[0] & 0x7F
+            blen = (bhdr[1] << 16) | (bhdr[2] << 8) | bhdr[3]
+            if f.tell() + blen > st_size:
+                return None
+            if btype == 6:
+                out["has_cover"] = True
+                f.seek(blen, os.SEEK_CUR)
+            elif btype == 4 and blen >= 8:
+                vc = f.read(blen)
+                if len(vc) < blen:
+                    return None
+                vlen = struct.unpack_from("<I", vc, 0)[0]
+                pos = 4 + vlen
+                if pos + 4 > blen:
+                    return None
+                cnt = struct.unpack_from("<I", vc, pos)[0]
+                pos += 4
+                for _ in range(cnt):
+                    if pos + 4 > blen:
+                        return None
+                    clen = struct.unpack_from("<I", vc, pos)[0]
+                    pos += 4
+                    if pos + clen > blen:
+                        return None
+                    eq = vc.find(b"=", pos, pos + clen)
+                    if eq > pos:
+                        k = vc[pos:eq].decode("ascii", errors="ignore").lower()
+                        if k in ("metadata_block_picture", "coverart"):
+                            if clen > (eq - pos + 1):
+                                out["has_cover"] = True
+                        elif k in _WANTED_VORBIS_KEYS and k not in vtags:
+                            s = vc[eq + 1:pos + clen].decode("utf-8", errors="replace").strip()
+                            if s:
+                                vtags[k] = s
+                    pos += clen
+            else:
+                f.seek(blen, os.SEEK_CUR)
+            if is_last:
+                break
+        out["artist"] = vtags.get("artist", "")
+        out["title"] = vtags.get("title", "")
+        out["album"] = vtags.get("album", "")
+        out["album_artist"] = vtags.get("albumartist") or vtags.get("album artist") or ""
+        out["year"] = vtags.get("date") or vtags.get("year") or ""
+        out["track"] = vtags.get("tracknumber", "")
+        out["genre"] = vtags.get("genre", "")
+        return out
+
+
+def _fast_read_riff_iff_id3(path: str, ext: str, st_size: int) -> dict[str, Any] | None:
+    """Walk top-level RIFF (WAV) or FORM (AIFF) chunk headers, seeking over PCM audio to the ID3 chunk."""
+    with open(path, "rb") as f:
+        hdr = f.read(12)
+        if len(hdr) < 12:
+            return _empty_raw_tags()
+        if ext == "wav":
+            if hdr[:4] != b"RIFF" or hdr[8:12] != b"WAVE":
+                return None
+            endian = "<I"
+        else:
+            if hdr[:4] != b"FORM" or hdr[8:12] not in (b"AIFF", b"AIFC"):
+                return None
+            endian = ">I"
+        while f.tell() + 8 <= st_size:
+            chdr = f.read(8)
+            if len(chdr) < 8:
+                break
+            cid = chdr[:4]
+            csz = struct.unpack(endian, chdr[4:8])[0]
+            pos = f.tell()
+            if cid.lower() == b"id3 ":
+                scanned = _fast_scan_id3_stream(f, pos, min(st_size, pos + csz))
+                return scanned  # dict on success, None on exotic ID3 needing Mutagen
+            skip = csz + (csz & 1)
+            if pos + skip > st_size + 1:
+                return None
+            f.seek(pos + skip)
+        return _empty_raw_tags()
+
 
 def _clean_str(val: Any) -> str:
     if val is None:
@@ -87,107 +412,124 @@ def _clean_str(val: Any) -> str:
     return text
 
 
-def _id3_text(id3: ID3, key: str) -> str:
-    frame = id3.get(key)
-    if not frame or not getattr(frame, "text", None):
-        return ""
-    return _clean_str(frame.text[0])
+def _raw_id3_str(id3: ID3, *keys: str) -> str:
+    for k in keys:
+        frame = id3.get(k)
+        if frame and getattr(frame, "text", None):
+            val = str(frame.text[0]).strip()
+            if val:
+                return val
+    return ""
 
 
-def _vorbis_text(tags: Any, *keys: str) -> str:
+def _raw_vorbis_str(tags: Any, *keys: str) -> str:
     if not tags:
         return ""
     for k in keys:
         v = tags.get(k) or tags.get(k.upper()) or tags.get(k.lower())
         if v:
-            s = _clean_str(v)
+            s = str(v[0] if isinstance(v, (list, tuple)) else v).strip()
             if s:
                 return s
     return ""
 
 
-def inspect_audio(path: str) -> dict:
-    """Read metadata tags and check whether an embedded picture is present.
-    Never modifies the file on disk."""
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    out = {
-        "has_cover": False,
-        "artist": "",
-        "album_artist": "",
-        "album": "",
-        "title": "",
-        "year": "",
-    }
-    if not os.path.isfile(path):
-        return out
+def _read_raw_tags_uncached(path: str, ext: str, st_size: int) -> dict[str, Any]:
+    out = _empty_raw_tags()
     try:
         if ext in ("mp3", "aac"):
+            fast = _fast_read_mp3_aac(path, st_size)
+            if fast is not None:
+                return fast
             try:
                 id3 = ID3(path)
             except ID3NoHeaderError:
                 return out
             out["has_cover"] = bool(id3.getall("APIC"))
-            out["artist"] = _id3_text(id3, "TPE1")
-            out["album_artist"] = _id3_text(id3, "TPE2")
-            out["album"] = _id3_text(id3, "TALB")
-            out["title"] = _id3_text(id3, "TIT2")
-            out["year"] = (_id3_text(id3, "TDRC") or _id3_text(id3, "TYER"))[:4]
+            out["artist"] = _raw_id3_str(id3, "TPE1")
+            out["title"] = _raw_id3_str(id3, "TIT2")
+            out["album"] = _raw_id3_str(id3, "TALB")
+            out["album_artist"] = _raw_id3_str(id3, "TPE2")
+            out["year"] = _raw_id3_str(id3, "TDRC", "TYER")
+            out["track"] = _raw_id3_str(id3, "TRCK")
+            out["genre"] = _raw_id3_str(id3, "TCON")
             return out
 
         if ext == "flac":
+            fast = _fast_read_flac(path, st_size)
+            if fast is not None:
+                return fast
             audio = FLAC(path)
-            out["has_cover"] = bool(audio.pictures)
             tags = audio.tags or {}
-            out["artist"] = _vorbis_text(tags, "artist")
-            out["album_artist"] = _vorbis_text(tags, "albumartist", "album artist")
-            out["album"] = _vorbis_text(tags, "album")
-            out["title"] = _vorbis_text(tags, "title")
-            out["year"] = _vorbis_text(tags, "date", "year")[:4]
+            out["has_cover"] = bool(audio.pictures or tags.get("metadata_block_picture") or tags.get("coverart"))
+            out["artist"] = _raw_vorbis_str(tags, "artist")
+            out["title"] = _raw_vorbis_str(tags, "title")
+            out["album"] = _raw_vorbis_str(tags, "album")
+            out["album_artist"] = _raw_vorbis_str(tags, "albumartist", "album artist")
+            out["year"] = _raw_vorbis_str(tags, "date", "year")
+            out["track"] = _raw_vorbis_str(tags, "tracknumber")
+            out["genre"] = _raw_vorbis_str(tags, "genre")
             return out
 
         if ext == "m4a":
             audio = MP4(path)
             tags = audio.tags or {}
             out["has_cover"] = bool(tags.get("covr"))
-            out["artist"] = _clean_str(tags.get("\xa9ART"))
-            out["album_artist"] = _clean_str(tags.get("aART"))
-            out["album"] = _clean_str(tags.get("\xa9alb"))
-            out["title"] = _clean_str(tags.get("\xa9nam"))
-            out["year"] = _clean_str(tags.get("\xa9day"))[:4]
+            out["artist"] = str((tags.get("\xa9ART") or [""])[0]).strip()
+            out["title"] = str((tags.get("\xa9nam") or [""])[0]).strip()
+            out["album"] = str((tags.get("\xa9alb") or [""])[0]).strip()
+            out["album_artist"] = str((tags.get("aART") or [""])[0]).strip()
+            out["year"] = str((tags.get("\xa9day") or [""])[0]).strip()
+            trkn = tags.get("trkn")
+            if trkn and isinstance(trkn[0], tuple) and trkn[0][0]:
+                out["track"] = str(int(trkn[0][0]))
+            out["genre"] = str((tags.get("\xa9gen") or [""])[0]).strip()
             return out
 
         if ext in ("ogg", "oga", "opus"):
-            audio = mutagen.File(path)
+            audio = open_ogg_fast(path, ext)
             tags = (audio.tags if audio else None) or {}
             out["has_cover"] = bool(tags.get("metadata_block_picture") or tags.get("coverart"))
-            out["artist"] = _vorbis_text(tags, "artist")
-            out["album_artist"] = _vorbis_text(tags, "albumartist", "album artist")
-            out["album"] = _vorbis_text(tags, "album")
-            out["title"] = _vorbis_text(tags, "title")
-            out["year"] = _vorbis_text(tags, "date", "year")[:4]
+            out["artist"] = _raw_vorbis_str(tags, "artist")
+            out["title"] = _raw_vorbis_str(tags, "title")
+            out["album"] = _raw_vorbis_str(tags, "album")
+            out["album_artist"] = _raw_vorbis_str(tags, "albumartist", "album artist")
+            out["year"] = _raw_vorbis_str(tags, "date", "year")
+            out["track"] = _raw_vorbis_str(tags, "tracknumber")
+            out["genre"] = _raw_vorbis_str(tags, "genre")
             return out
 
         if ext in ("wav", "aif", "aiff"):
+            fast = _fast_read_riff_iff_id3(path, ext, st_size)
+            if fast is not None:
+                return fast
             audio = WAVE(path) if ext == "wav" else AIFF(path)
             id3 = audio.tags
             if id3 and isinstance(id3, ID3):
                 out["has_cover"] = bool(id3.getall("APIC"))
-                out["artist"] = _id3_text(id3, "TPE1")
-                out["album_artist"] = _id3_text(id3, "TPE2")
-                out["album"] = _id3_text(id3, "TALB")
-                out["title"] = _id3_text(id3, "TIT2")
-                out["year"] = (_id3_text(id3, "TDRC") or _id3_text(id3, "TYER"))[:4]
+                out["artist"] = _raw_id3_str(id3, "TPE1")
+                out["title"] = _raw_id3_str(id3, "TIT2")
+                out["album"] = _raw_id3_str(id3, "TALB")
+                out["album_artist"] = _raw_id3_str(id3, "TPE2")
+                out["year"] = _raw_id3_str(id3, "TDRC", "TYER")
+                out["track"] = _raw_id3_str(id3, "TRCK")
+                out["genre"] = _raw_id3_str(id3, "TCON")
             return out
 
         if ext == "wma":
             audio = ASF(path)
             tags = audio.tags or {}
             out["has_cover"] = bool(tags.get("WM/Picture"))
-            out["artist"] = _clean_str(tags.get("Author")) or _clean_str(tags.get("WM/AlbumArtist"))
-            out["album_artist"] = _clean_str(tags.get("WM/AlbumArtist"))
-            out["album"] = _clean_str(tags.get("WM/AlbumTitle"))
-            out["title"] = _clean_str(tags.get("Title"))
-            out["year"] = _clean_str(tags.get("WM/Year"))[:4]
+            author = str((tags.get("Author") or [""])[0]).strip()
+            wm_aa = str((tags.get("WM/AlbumArtist") or [""])[0]).strip()
+            out["artist"] = author
+            out["wma_artist"] = _clean_str(author) or _clean_str(wm_aa)
+            out["title"] = str((tags.get("Title") or [""])[0]).strip()
+            out["album"] = str((tags.get("WM/AlbumTitle") or [""])[0]).strip()
+            out["album_artist"] = wm_aa
+            out["year"] = str((tags.get("WM/Year") or [""])[0]).strip()
+            out["track"] = str((tags.get("WM/TrackNumber") or [""])[0]).strip()
+            out["genre"] = str((tags.get("WM/Genre") or [""])[0]).strip()
             return out
 
         audio = mutagen.File(path)
@@ -196,8 +538,53 @@ def inspect_audio(path: str) -> dict:
             if isinstance(tags, ID3):
                 out["has_cover"] = bool(tags.getall("APIC"))
     except Exception as exc:
-        log.debug("inspect_audio failed for %s: %s", path, exc)
+        log.debug("read_raw_tags failed for %s: %s", path, exc)
     return out
+
+
+def read_raw_tags_cached(path: str) -> dict[str, Any]:
+    """Read raw tags + cover presence using stat-verified cache and seek-over-cover fast scanners."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return _empty_raw_tags()
+    if not os.path.isfile(path):
+        return _empty_raw_tags()
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        rp = os.path.abspath(path)
+    sig = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
+    with _TAG_CACHE_LOCK:
+        hit = _TAG_CACHE.get(rp)
+        if hit is not None and hit[0] == sig:
+            return dict(hit[1])
+
+    ext = _audio_ext(path)
+    parsed = _read_raw_tags_uncached(path, ext, st.st_size)
+    with _TAG_CACHE_LOCK:
+        if len(_TAG_CACHE) >= _TAG_CACHE_MAX:
+            # Evict oldest quarter of entries (dict preserves insertion order in Python 3.7+)
+            for k in list(_TAG_CACHE.keys())[: _TAG_CACHE_MAX // 4]:
+                _TAG_CACHE.pop(k, None)
+        _TAG_CACHE[rp] = (sig, dict(parsed))
+    return parsed
+
+
+def inspect_audio(path: str) -> dict:
+    """Read metadata tags and check whether an embedded picture is present.
+    Never modifies the file on disk."""
+    raw = read_raw_tags_cached(path)
+    ext = _audio_ext(path)
+    artist = raw["wma_artist"] if ext == "wma" else _clean_str(raw["artist"])
+    return {
+        "has_cover": bool(raw["has_cover"]),
+        "artist": artist,
+        "album_artist": _clean_str(raw["album_artist"]),
+        "album": _clean_str(raw["album"]),
+        "title": _clean_str(raw["title"]),
+        "year": _clean_str(raw["year"])[:4],
+    }
 
 
 def _audio_ext(path: str, ext_override: str | None = None) -> str:
@@ -248,7 +635,7 @@ def extract_cover(path: str) -> tuple[bytes, str] | None:
             return None
 
         if ext in ("ogg", "oga", "opus"):
-            audio = mutagen.File(path)
+            audio = open_ogg_fast(path, ext)
             tags = (audio.tags if audio else None) or {}
             mbp = tags.get("metadata_block_picture")
             if mbp:
@@ -313,9 +700,127 @@ def _unpack_asf_picture(raw: bytes) -> tuple[bytes, str] | None:
     return img, detect_mime(img, mime)
 
 
+def apply_cover_to_mutagen_obj(ext: str, obj: Any, image_bytes: bytes, actual_mime: str) -> None:
+    """Mutate an already-loaded Mutagen tag/audio object in memory to attach front cover art."""
+    if ext in ("mp3", "aac"):
+        obj.delall("APIC")
+        obj.delall("PIC")
+        obj.add(APIC(encoding=3, mime=actual_mime, type=3, desc="Cover", data=image_bytes))
+    elif ext == "flac":
+        obj.clear_pictures()
+        if obj.tags:
+            for legacy_key in ("metadata_block_picture", "coverart", "coverartmime"):
+                if legacy_key in obj.tags:
+                    del obj.tags[legacy_key]
+        pic = Picture()
+        pic.type = 3
+        pic.mime = actual_mime
+        pic.desc = "Cover"
+        pic.data = image_bytes
+        obj.add_picture(pic)
+    elif ext == "m4a":
+        if obj.tags is None:
+            obj.add_tags()
+        fmt = MP4Cover.FORMAT_PNG if actual_mime == "image/png" else MP4Cover.FORMAT_JPEG
+        obj.tags["covr"] = [MP4Cover(image_bytes, imageformat=fmt)]
+    elif ext in ("ogg", "oga", "opus"):
+        if obj.tags is None:
+            obj.add_tags()
+        for legacy_key in ("coverart", "coverartmime"):
+            if legacy_key in obj.tags:
+                del obj.tags[legacy_key]
+        pic = Picture()
+        pic.type = 3
+        pic.mime = actual_mime
+        pic.desc = "Cover"
+        pic.data = image_bytes
+        obj["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+    elif ext in ("wav", "aif", "aiff"):
+        if obj.tags is None:
+            obj.add_tags()
+        obj.tags.delall("APIC")
+        obj.tags.delall("PIC")
+        obj.tags.add(APIC(encoding=3, mime=actual_mime, type=3, desc="Cover", data=image_bytes))
+    elif ext == "wma":
+        if obj.tags is None:
+            obj.add_tags()
+        packed = _pack_asf_picture(image_bytes, actual_mime)
+        obj.tags["WM/Picture"] = [ASFByteArrayAttribute(packed)]
+    else:
+        raise ValueError(f"embedding cover art is not supported for .{ext} files")
+
+
+def _invoke_mutagen_save(ext: str, obj: Any, target_path: str, *, v1: int, pad_fn) -> None:
+    if ext in ("mp3", "aac"):
+        obj.update_to_v23()
+        obj.save(target_path, v1=v1, v2_version=3, padding=pad_fn)
+    elif ext in ("wav", "aif", "aiff"):
+        if obj.tags is not None:
+            obj.tags.update_to_v23()
+        obj.save(target_path, v2_version=3, padding=pad_fn)
+    elif ext in ("flac", "m4a", "wma"):
+        obj.save(target_path, padding=pad_fn)
+    elif ext in ("ogg", "oga", "opus"):
+        obj.save(target_path, padding=pad_fn)
+    else:
+        raise ValueError(f"saving metadata is not supported for .{ext} files")
+
+
+def save_mutagen_smart(
+    path: str,
+    ext: str,
+    obj: Any,
+    *,
+    can_try_inplace: bool,
+    v1: int = 1,
+    preserve_mtime: bool = True,
+    stat_before: os.stat_result | None = None,
+    op_label: str = "meta",
+) -> None:
+    """Save a mutated Mutagen object in-place when existing header padding fits (zero audio bytes moved);
+    fall back automatically to an atomic sibling temporary file with 8 KiB reserved padding when growing."""
+    if stat_before is None:
+        stat_before = os.stat(path)
+
+    wrote_inplace = False
+    if can_try_inplace:
+        try:
+            _invoke_mutagen_save(ext, obj, path, v1=v1, pad_fn=_inplace_only_padding)
+            wrote_inplace = True
+        except _NeedsResize:
+            wrote_inplace = False
+
+    if not wrote_inplace:
+        folder = os.path.dirname(path) or "."
+        base = os.path.basename(path)
+        tmp = os.path.join(folder, f".{base}.{op_label}-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp.{ext}")
+        shutil.copy2(path, tmp)
+        try:
+            _invoke_mutagen_save(ext, obj, tmp, v1=v1, pad_fn=smart_padding)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    if preserve_mtime:
+        os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+    invalidate_tag_cache(path)
+
+
+def has_id3v2_header(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(3) == b"ID3"
+    except OSError:
+        return False
+
+
 def embed_cover(path: str, image_bytes: bytes, mime: str | None = None,
                 preserve_mtime: bool = True, ext_override: str | None = None) -> None:
-    """Embed front cover art into an audio file safely via a temporary sibling file."""
+    """Embed front cover art into an audio file (in-place when padding fits, atomic temp file otherwise)."""
     if not os.path.isfile(path):
         raise ValueError("audio file not found")
     if not image_bytes or len(image_bytes) < 16:
@@ -323,86 +828,47 @@ def embed_cover(path: str, image_bytes: bytes, mime: str | None = None,
     actual_mime = detect_mime(image_bytes, mime or "image/jpeg")
     ext = _audio_ext(path, ext_override)
     stat_before = os.stat(path)
-    folder = os.path.dirname(path) or "."
     base = os.path.basename(path)
-    tmp = os.path.join(folder, f".{base}.cover-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp.{ext}")
-    shutil.copy2(path, tmp)
-    try:
-        if ext in ("mp3", "aac"):
-            try:
-                id3 = ID3(tmp)
-            except ID3NoHeaderError:
-                id3 = ID3()
-            id3.delall("APIC")
-            id3.delall("PIC")
-            id3.add(APIC(encoding=3, mime=actual_mime, type=3, desc="Cover", data=image_bytes))
-            id3.update_to_v23()
-            id3.save(tmp, v1=1, v2_version=3)
-        elif ext == "flac":
-            audio = FLAC(tmp)
-            audio.clear_pictures()
-            if audio.tags:
-                for legacy_key in ("metadata_block_picture", "coverart", "coverartmime"):
-                    if legacy_key in audio.tags:
-                        del audio.tags[legacy_key]
-            pic = Picture()
-            pic.type = 3
-            pic.mime = actual_mime
-            pic.desc = "Cover"
-            pic.data = image_bytes
-            audio.add_picture(pic)
-            audio.save()
-        elif ext == "m4a":
-            audio = MP4(tmp)
-            if audio.tags is None:
-                audio.add_tags()
-            fmt = MP4Cover.FORMAT_PNG if actual_mime == "image/png" else MP4Cover.FORMAT_JPEG
-            audio.tags["covr"] = [MP4Cover(image_bytes, imageformat=fmt)]
-            audio.save()
-        elif ext in ("ogg", "oga", "opus"):
-            audio = mutagen.File(tmp)
-            if audio is None:
-                raise ValueError(f"unsupported Ogg/Opus file: {base}")
-            if audio.tags is None:
-                audio.add_tags()
-            for legacy_key in ("coverart", "coverartmime"):
-                if legacy_key in audio.tags:
-                    del audio.tags[legacy_key]
-            pic = Picture()
-            pic.type = 3
-            pic.mime = actual_mime
-            pic.desc = "Cover"
-            pic.data = image_bytes
-            audio["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
-            audio.save()
-        elif ext in ("wav", "aif", "aiff"):
-            audio = WAVE(tmp) if ext == "wav" else AIFF(tmp)
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags.delall("APIC")
-            audio.tags.delall("PIC")
-            audio.tags.add(APIC(encoding=3, mime=actual_mime, type=3, desc="Cover", data=image_bytes))
-            audio.tags.update_to_v23()
-            audio.save(v2_version=3)
-        elif ext == "wma":
-            audio = ASF(tmp)
-            if audio.tags is None:
-                audio.add_tags()
-            packed = _pack_asf_picture(image_bytes, actual_mime)
-            audio.tags["WM/Picture"] = [ASFByteArrayAttribute(packed)]
-            audio.save()
-        else:
-            raise ValueError(f"embedding cover art is not supported for .{ext} files")
 
-        os.replace(tmp, path)
-        if preserve_mtime:
-            os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+    can_try_inplace = False
+    if ext in ("mp3", "aac"):
+        had_v2 = has_id3v2_header(path)
+        try:
+            obj: Any = ID3(path)
+        except ID3NoHeaderError:
+            obj = ID3()
+        can_try_inplace = had_v2
+    elif ext == "flac":
+        obj = FLAC(path)
+        can_try_inplace = True
+    elif ext == "m4a":
+        obj = MP4(path)
+        can_try_inplace = True
+    elif ext in ("ogg", "oga", "opus"):
+        obj = open_ogg_fast(path, ext)
+        if obj is None:
+            raise ValueError(f"unsupported Ogg/Opus file: {base}")
+        can_try_inplace = False
+    elif ext in ("wav", "aif", "aiff"):
+        obj = WAVE(path) if ext == "wav" else AIFF(path)
+        can_try_inplace = obj.tags is not None
+    elif ext == "wma":
+        obj = ASF(path)
+        can_try_inplace = True
+    else:
+        raise ValueError(f"embedding cover art is not supported for .{ext} files")
+
+    apply_cover_to_mutagen_obj(ext, obj, image_bytes, actual_mime)
+    save_mutagen_smart(
+        path,
+        ext,
+        obj,
+        can_try_inplace=can_try_inplace,
+        v1=1,
+        preserve_mtime=preserve_mtime,
+        stat_before=stat_before,
+        op_label="cover",
+    )
 
 
 # ------------------------------------------------------------ path vs tag resolution
@@ -698,7 +1164,7 @@ def test_discogs(token: str = "") -> dict:
     """Verify connectivity (and token if given) against the Discogs API."""
     url = "https://api.discogs.com/database/search"
     try:
-        r = httpx.get(
+        r = http_get(
             url,
             params={"q": "Discovery", "type": "master", "per_page": 1},
             headers=_discogs_headers(token),
@@ -735,7 +1201,7 @@ def _search_discogs(artist: str, album: str, title: str, token: str = "") -> lis
 
     for params in queries:
         try:
-            r = httpx.get("https://api.discogs.com/database/search", params=params, headers=headers, timeout=6.0)
+            r = http_get("https://api.discogs.com/database/search", params=params, headers=headers, timeout=6.0)
             if r.status_code != 200:
                 continue
             results = r.json().get("results") or []
@@ -795,7 +1261,7 @@ def _search_musicbrainz_caa(artist: str, album: str, title: str) -> list[dict]:
 
     candidates: list[dict] = []
     try:
-        r = httpx.get(
+        r = http_get(
             "https://musicbrainz.org/ws/2/release-group/",
             params={"query": " AND ".join(q_parts), "fmt": "json", "limit": 5},
             headers=headers,
@@ -818,7 +1284,7 @@ def _search_musicbrainz_caa(artist: str, album: str, title: str) -> list[dict]:
         rg_artist = (ac[0].get("name") if ac and isinstance(ac[0], dict) else artist) or artist
         year = str(g.get("first-release-date") or "")[:4]
         try:
-            caa = httpx.get(
+            caa = http_get(
                 f"https://coverartarchive.org/release-group/{mbid}",
                 headers=headers,
                 follow_redirects=True,
@@ -861,7 +1327,7 @@ def _search_itunes(artist: str, album: str, title: str) -> list[dict]:
     candidates: list[dict] = []
     seen_urls: set[str] = set()
     try:
-        r = httpx.get(
+        r = http_get(
             "https://itunes.apple.com/search",
             params={"term": term, "media": "music", "entity": entity, "limit": 6},
             headers={"User-Agent": USER_AGENT},
@@ -961,13 +1427,17 @@ def search_covers(
                 pass
 
     results: list[dict] = []
-    if source_mode in ("both", "discogs"):
+    if source_mode == "both":
+        f_disc = _HTTP_POOL.submit(_search_discogs, artist, album, title, token)
+        f_mb = _HTTP_POOL.submit(_search_musicbrainz_caa, artist, album, title)
+        results.extend(f_disc.result())
+        results.extend(f_mb.result())
+        if not results:
+            results.extend(_search_itunes(artist, album, title))
+    elif source_mode == "discogs":
         results.extend(_search_discogs(artist, album, title, token=token))
-
-    if source_mode in ("both", "open"):
-        # Query open sources (MusicBrainz/CAA + iTunes fallback)
-        mb = _search_musicbrainz_caa(artist, album, title)
-        results.extend(mb)
+    elif source_mode == "open":
+        results.extend(_search_musicbrainz_caa(artist, album, title))
         if not results:
             results.extend(_search_itunes(artist, album, title))
 
@@ -1011,7 +1481,7 @@ def download_cover(url: str, token: str = "") -> tuple[bytes, str]:
     headers = {"User-Agent": USER_AGENT}
     if "discogs.com" in url and token:
         headers["Authorization"] = f"Discogs token={token.strip()}"
-    r = httpx.get(url, headers=headers, follow_redirects=True, timeout=15.0)
+    r = http_get(url, headers=headers, follow_redirects=True, timeout=15.0)
     if r.status_code != 200 or not r.content:
         raise ValueError(f"failed to download cover image (HTTP {r.status_code})")
     data = r.content

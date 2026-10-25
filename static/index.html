@@ -23,7 +23,7 @@
       } catch (_e) {}
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=25">
+  <link rel="stylesheet" href="/static/styles.css?v=29">
 </head>
 <body>
   <div class="app">
@@ -161,7 +161,7 @@
         <span class="grow"></span>
         <button type="button" class="btn" data-action="cover-close">Cancel</button>
         <button type="button" class="btn btn-primary" data-action="cover-apply" data-scope="file" id="cover-apply-file" disabled>Use for file</button>
-        <button type="button" class="btn" data-action="cover-apply" data-scope="album" id="cover-apply-album" disabled>Use for album</button>
+        <button type="button" class="btn btn-album" data-action="cover-apply" data-scope="album" id="cover-apply-album" disabled>Use for album</button>
       </footer>
     </div>
   </div>
@@ -181,8 +181,8 @@
         <span class="editor-note" id="metadata-modal-note">Timestamp of file will not change</span>
         <span class="grow"></span>
         <button type="button" class="btn" data-action="meta-modal-close">Cancel</button>
-        <button type="button" class="btn" data-action="meta-modal-apply" data-scope="album" id="meta-modal-apply-album">Update album</button>
         <button type="button" class="btn btn-primary" data-action="meta-modal-apply" data-scope="file" id="meta-modal-apply-file">Update file</button>
+        <button type="button" class="btn btn-album" data-action="meta-modal-apply" data-scope="album" id="meta-modal-apply-album">Update album</button>
       </footer>
     </div>
   </div>
@@ -196,6 +196,6 @@
   </div>
   <div id="toast" class="toast" role="status"></div>
   <script src="/static/audio-normalizer-card.js?v=7"></script>
-  <script src="/static/app.js?v=32"></script>
+  <script src="/static/app.js?v=36"></script>
 </body>
 </html>

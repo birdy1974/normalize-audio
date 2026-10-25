@@ -1270,14 +1270,13 @@
   }
 
   const META_VIS_KEY = 'audio-normalizer-meta-vis-fields';
-  const META_COLS_KEY = 'audio-normalizer-meta-cols-v2';
+  const META_COLS_KEY = 'audio-normalizer-meta-cols-v3';
   const DEFAULT_META_COLS = {
     pick: 38,
-    file: 225,
-    custom: 245,
+    file: 270,
+    custom: 255,
     field: 118,
-    path: 180,
-    current: 190,
+    path: 190,
     discogs: 205,
     musicbrainz: 220,
     open: 220,
@@ -1339,6 +1338,8 @@
     media: 'audio',                 // media tab shown on media-specific pages
     dash: null,                     // GET /api/dashboard
     dashKey: '',
+    dashStructKey: '',
+    lastFsSeq: null,
     settings: null,                 // saved settings
     draft: null,                    // settings being edited on the Settings page
     sched: null,                    // GET /api/schedule
@@ -1352,6 +1353,8 @@
     browse: { media: null, rel: null, rows: null, loading: false },
     fileSel: [],                    // selected file ids in the Directories files pane
     scanning: { audio: false, video: false },  // a rescan of the base location is running
+    scanMode: { audio: null, video: null },    // 'quick' | 'full' | 'folder' | null
+    scanTarget: { audio: null, video: null },  // targeted folder relpath when scanMode === 'folder'
     busy: {},                       // what this browser is doing now: id -> { text, secs }
     parked: { audio: null, video: null },  // GET /api/parked
     coverParked: null,              // GET /api/covers/parked (separate cover art pane)
@@ -1499,8 +1502,19 @@
           state.metaOnlyDiffRows = opts.only_diff_rows;
         }
         if (opts.col_widths && typeof opts.col_widths === 'object' && Object.keys(opts.col_widths).length) {
-          state.metaColWidths = Object.assign({}, DEFAULT_META_COLS, opts.col_widths);
+          const hydrated = Object.assign({}, DEFAULT_META_COLS);
+          const isLegacy9Col = Object.prototype.hasOwnProperty.call(opts.col_widths, 'current');
+          Object.keys(DEFAULT_META_COLS).forEach((k) => {
+            const n = Number(opts.col_widths[k]);
+            if (isFinite(n) && n >= 32 && n <= 1200) hydrated[k] = Math.round(n);
+          });
+          if (isLegacy9Col) {
+            hydrated.file = Math.max(hydrated.file, DEFAULT_META_COLS.file);
+            hydrated.custom = Math.max(hydrated.custom, DEFAULT_META_COLS.custom);
+          }
+          state.metaColWidths = hydrated;
           saveStoredMetaCols(state.metaColWidths);
+          if (isLegacy9Col) persistMetaUiPrefs();
         }
       }
       if (state.metadata && state.metadata.meta_checking) {
@@ -1524,26 +1538,63 @@
 
   function invalidate(key) { delete state.loaded[key]; }
 
+  function dashStructureSignature(d) {
+    if (!d) return '';
+    return JSON.stringify({
+      status: d.status,
+      mode: d.mode,
+      run_mode: d.run_mode,
+      paused: d.paused,
+      types: d.types,
+      last_finished: d.last_finished,
+      last_scan: d.last_scan,
+      fs_seq: d.fs_seq,
+      watcher_active: d.watcher_active,
+      approved_pending: d.approved_pending,
+      dry_run: d.dry_run,
+      media: d.media,
+    });
+  }
+
   let dashSeq = 0;
-  async function refreshDash() {
+  async function refreshDash(opts) {
+    const o = opts || {};
     const seq = ++dashSeq;
     const d = await api('/dashboard');
     if (seq < dashSeq) return;
+    const prevFsSeq = state.lastFsSeq;
+    const nextFsSeq = typeof d.fs_seq === 'number' ? d.fs_seq : null;
+    state.lastFsSeq = nextFsSeq;
+    const fsChanged = prevFsSeq !== null && nextFsSeq !== null && nextFsSeq !== prevFsSeq;
     const key = JSON.stringify(d);
+    const structKey = dashStructureSignature(d);
+    const structChanged = structKey !== state.dashStructKey;
     if (key !== state.dashKey) {
       state.dash = d;
       state.dashKey = key;
+      state.dashStructKey = structKey;
       state.loaded.dashboard = true;
-      state.browse.stale = true;
       const route = currentRoute();
       if (route === 'dashboard') {
+        state.browse.stale = true;
         render();
       } else if (route === 'directories') {
         const t = state.media;
-        invalidate('dir:' + t);
-        if (state.selected[t]) loadBrowse(state.selected[t], true);
-        render();
+        const scanActive = !!(d.scanning || state.scanning[t]);
+        if (!o.skipDirReload && !scanActive && (fsChanged || structChanged)) {
+          state.browse.stale = true;
+          invalidate('dir:' + t);
+          const selRel = state.selected[t];
+          await Promise.all([
+            loadKey('dir:' + t),
+            selRel ? loadBrowse(selRel, true) : Promise.resolve(),
+          ]);
+          render();
+        } else if (!scanActive && structChanged) {
+          render();
+        }
       } else {
+        if (structChanged) state.browse.stale = true;
         updateNavBadge();
       }
     }
@@ -1763,8 +1814,10 @@
      time; the tree and the open folder are read again when it finishes. */
   const scans = { audio: null, video: null };     // in-flight rescan per media type
 
-  function scanSummary(t, r) {
-    if (!r) return 'Rescan finished';
+  function scanSummary(t, r, opts) {
+    const o = opts || {};
+    const prefix = o.dir ? ('Rescan (' + o.dir + ')') : (o.full ? 'Full rescan' : 'Rescan');
+    if (!r) return prefix + ' finished';
     if (r.available === false) {
       return MEDIA[t].label + ' base location ' + MEDIA[t].root + ' is not available. Check the mount in docker-compose.yml.';
     }
@@ -1773,17 +1826,28 @@
     if (r.removed) found.push(r.removed + ' removed');
     const n = r.new + r.removed;
     const files = n ? found.join(', ') + ' file' + (n === 1 ? '' : 's') : 'no new or removed files';
-    return 'Rescan: ' + files + ' · ' + fmt(r.folders) + ' folders';
+    return prefix + ': ' + files + ' · ' + fmt(r.folders) + ' folders';
   }
 
-  function scanDirectories(t, notify) {
+  function scanDirectories(t, notify, opts) {
     if (scans[t]) return scans[t];
+    const o = opts || {};
+    const full = !!o.full;
+    const targetDir = o.dir ? String(o.dir) : null;
     state.scanning[t] = true;
-    const busy = startBusy('Scanning ' + MEDIA[t].label.toLowerCase() + ' folders');
-    scans[t] = api('/scan', { method: 'POST', body: { media: t } })
+    state.scanMode[t] = targetDir ? 'folder' : (full ? 'full' : 'quick');
+    state.scanTarget[t] = targetDir;
+    const busyLabel = targetDir
+      ? ('Scanning folder ' + targetDir)
+      : ((full ? 'Full rescanning ' : 'Scanning ') + MEDIA[t].label.toLowerCase() + ' folders');
+    const busy = startBusy(busyLabel);
+    const body = { media: t };
+    if (full) body.full = true;
+    if (targetDir) body.dir = targetDir;
+    scans[t] = api('/scan', { method: 'POST', body: body })
       .then((r) => {
         const res = (r && r[t]) || null;
-        if (notify || (res && res.available === false)) toast(scanSummary(t, res));
+        if (notify || (res && res.available === false)) toast(scanSummary(t, res, o));
         return res;
       })
       .catch((err) => {
@@ -1792,12 +1856,27 @@
       })
       .finally(() => {
         state.scanning[t] = false;
+        state.scanMode[t] = null;
+        state.scanTarget[t] = null;
         scans[t] = null;
         endBusy(busy);
         invalidate('dir:' + t);
-        if (state.browse.media === t) state.browse = { media: null, rel: null, rows: null, loading: false };
-        const done = () => { if (currentRoute() === 'directories') render(); };
-        refreshDash().then(done, done);
+        const onDirs = currentRoute() === 'directories' && state.media === t;
+        const prevSel = state.selected[t];
+        const tasks = [refreshDash({ skipDirReload: true })];
+        if (onDirs) {
+          tasks.push(loadKey('dir:' + t));
+          if (prevSel) tasks.push(loadBrowse(prevSel, true));
+        } else if (state.browse.media === t) {
+          state.browse = { media: null, rel: null, rows: null, loading: false, stale: true };
+        }
+        return Promise.all(tasks).finally(() => {
+          if (currentRoute() === 'directories') {
+            const selNow = state.selected[t];
+            if (selNow && selNow !== prevSel) loadBrowse(selNow, true);
+            render();
+          }
+        });
       });
     return scans[t];
   }
@@ -1888,8 +1967,8 @@
       + '</div>';
   }
 
-  function pageHead(title, desc, actions, withSeg) {
-    return '<header class="page-head"><div><h1>' + title + '</h1>'
+  function pageHead(title, desc, actions, withSeg, extraCls) {
+    return '<header class="page-head' + (extraCls ? ' ' + extraCls : '') + '"><div><h1>' + title + '</h1>'
       + (desc ? '<p class="desc">' + desc + '</p>' : '') + '</div>'
       + '<div class="head-actions">' + (withSeg ? segControl() : '') + (actions || '') + '</div></header>';
   }
@@ -2154,6 +2233,11 @@
         + '<button class="btn btn-sm" data-action="open-album-cover" title="Search and set cover art for this album / folder">Album cover' + selSuffix + '</button>'
         + '<button class="btn btn-sm" data-action="check-meta-dir" title="Check metadata tags for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check meta' + selSuffix + '</button>'
       : '';
+    const scanning = !!state.scanning[t];
+    const folderScanning = scanning && state.scanMode[t] === 'folder' && state.scanTarget[t] === node.rel;
+    const rescanFolderBtn = '<button class="btn btn-sm' + (folderScanning ? ' is-busy' : '') + '" data-action="rescan-folder" data-rel="' + esc(node.rel) + '"'
+      + (scanning ? ' disabled' : '') + ' title="Rescan only ' + esc(node.rel) + ' and its sub-folders">'
+      + (folderScanning ? 'Scanning…' : 'Rescan folder') + '</button>';
     const batchBtns = hasRows
       ? coverBtns
         + '<button class="btn btn-sm" data-action="check-all-files" title="Check level and empty sections for ' + (sel.length ? 'selected files' : 'all files in this folder') + '">Check all' + selSuffix + '</button>'
@@ -2163,7 +2247,7 @@
     const head = '<div class="card-head" style="margin-bottom:8px"><div><h2>' + esc(MEDIA[t].root + '/' + node.rel) + '</h2>'
       + '<div class="sub">' + node.directFiles + ' files directly in this folder · ' + (subtree(node).length - 1) + ' sub-folders'
       + ' · Play listens to the original · Edit fades or cuts a part</div></div>'
-      + '<div class="btns">' + batchBtns
+      + '<div class="btns">' + rescanFolderBtn + batchBtns
       + '<span class="chip' + (node.enabled ? '' : ' is-out') + '">' + (node.enabled ? 'Included' : 'Excluded') + '</span></div></div>'
       + srcBar;
     if (b.loading || b.media !== t || b.rel !== node.rel || !b.rows) {
@@ -2275,12 +2359,18 @@
     const dirs = !tr.roots.length
       ? '<p class="muted">No folders found under the base location. Check the mount in docker-compose.yml, then use Rescan.</p>'
       : '';
+    const quickBusy = scanning && state.scanMode[t] === 'quick';
+    const fullBusy = scanning && state.scanMode[t] === 'full';
+    const watchActive = !!(state.dash && state.dash.watcher_active);
     app().innerHTML = pageHead('Directories',
       'Base location <span class="mono">' + MEDIA[t].root + '</span>, mounted from <span class="mono">' + MEDIA[t].host
       + '</span> in docker-compose.yml. Untick a folder to exclude it. Ticking or unticking applies to its sub-folders too.',
-      '<button class="btn btn-sm' + (scanning ? ' is-busy' : '') + '" data-action="rescan"' + (scanning ? ' disabled' : '') + '>'
-      + (scanning ? 'Scanning…' : 'Rescan') + '</button>'
-      + tip('Updates the folder tree and file list with new and removed files and folders on disk, without resetting files that were already scanned.')
+      '<button class="btn btn-sm' + (quickBusy ? ' is-busy' : '') + '" data-action="rescan"' + (scanning ? ' disabled' : '') + '>'
+      + (quickBusy ? 'Scanning…' : 'Rescan') + '</button>'
+      + '<button class="btn btn-sm' + (fullBusy ? ' is-busy' : '') + '" data-action="rescan-full"' + (scanning ? ' disabled' : '')
+      + ' title="Walk every folder on disk from scratch, ignoring cached folder timestamps">'
+      + (fullBusy ? 'Full rescan…' : 'Full rescan') + '</button>'
+      + tip('Rescan quickly checks only folders whose timestamps changed since the last scan, without resetting already-scanned files. Use Full rescan to walk every folder on disk from scratch.')
       + '<button class="btn btn-sm" data-action="select-all">Select all</button>'
       + '<button class="btn btn-sm" data-action="invert-dirs" title="Invert the enabled/disabled selection of all folders">Invert</button>'
       + '<button class="btn btn-sm" data-action="select-none">Select none</button>'
@@ -2288,6 +2378,7 @@
       + '<button class="btn btn-sm" data-action="collapse-all">Collapse all</button>', true)
       + '<p class="muted" style="margin-bottom:0"><strong style="color:var(--text)">' + m.directories_enabled + ' of ' + m.directories_total
       + '</strong> folders included · ' + fmt(m.files_total) + ' files in scope'
+      + (watchActive ? ' · <span class="dim" title="Live filesystem watcher (inotify) automatically detects added or removed folders">live watch active</span>' : '')
       + (scanning ? ' · <span class="scan-note">looking for new files and folders…</span>' : '') + '</p>'
       + baselinePanel(t)
       + dirs
@@ -2386,8 +2477,8 @@
                 + '<div class="cover-cand-meta"><span class="tag" style="margin:0">' + esc(c.source || 'Source') + '</span>'
                 + '<span>' + esc(c.year || '') + '</span></div>'
                 + '<div class="cover-cand-actions">'
-                + '<button type="button" class="btn btn-sm btn-primary" data-action="cover-apply-cand" data-file="' + g.primary_file_id + '" data-scope="album" data-ids="' + esc(idsStr) + '" data-url="' + esc(c.image_url) + '">Use for album (' + g.file_ids.length + ')</button>'
-                + '<button type="button" class="btn btn-sm" data-action="cover-apply-cand" data-file="' + g.primary_file_id + '" data-scope="file" data-url="' + esc(c.image_url) + '" title="Apply only to ' + esc(g.files[0].name) + '">1 file</button>'
+                + '<button type="button" class="btn btn-sm btn-primary" data-action="cover-apply-cand" data-file="' + g.primary_file_id + '" data-scope="file" data-url="' + esc(c.image_url) + '" title="Apply only to ' + esc(g.files[0].name) + '">1 file</button>'
+                + '<button type="button" class="btn btn-sm btn-album" data-action="cover-apply-cand" data-file="' + g.primary_file_id + '" data-scope="album" data-ids="' + esc(idsStr) + '" data-url="' + esc(c.image_url) + '">Use for album (' + g.file_ids.length + ')</button>'
                 + '</div></div>';
             }).join('');
             const fileNames = g.files.slice(0, 6).map((f) => esc(f.name)).join(' · ')
@@ -2424,7 +2515,7 @@
                 + '<span>' + esc(c.year || '') + '</span></div>'
                 + '<div class="cover-cand-actions">'
                 + '<button type="button" class="btn btn-sm btn-primary" data-action="cover-apply-cand" data-file="' + f.id + '" data-scope="file" data-url="' + esc(c.image_url) + '">Use for file</button>'
-                + '<button type="button" class="btn btn-sm" data-action="cover-apply-cand" data-file="' + f.id + '" data-scope="album" data-url="' + esc(c.image_url) + '">Album</button>'
+                + '<button type="button" class="btn btn-sm btn-album" data-action="cover-apply-cand" data-file="' + f.id + '" data-scope="album" data-url="' + esc(c.image_url) + '">Album</button>'
                 + '</div></div>';
             }).join('');
             return '<div class="cover-album-group">'
@@ -2911,11 +3002,10 @@
 
   const META_COL_SPECS = [
     ['pick', '', 34, false],
-    ['file', 'File & folder', 95, true],
-    ['custom', 'Selected / Custom (✎)', 150, true],
+    ['file', 'File & folder', 140, true],
+    ['custom', 'Current tag / Selected (✎)', 155, true],
     ['field', 'Field', 75, true],
     ['path', 'Folder / file name', 80, true],
-    ['current', 'Current tag (file)', 85, true],
     ['discogs', 'Discogs', 135, true],
     ['musicbrainz', 'MusicBrainz', 145, true],
     ['open', 'Open (iTunes)', 145, true],
@@ -3004,7 +3094,8 @@
     const isMbChosen = choice === 'musicbrainz' || (choice === 'online' && !isDiscogsChosen && !!mbVal && mbVal === onlineVal);
     const isOpenChosen = choice === 'open' || (choice === 'online' && !isDiscogsChosen && !isMbChosen && !!openVal);
 
-    // Col 2 (second place, right after File & folder): Selected / Custom (✎) — shows FINAL selected value & allows override
+    // Col 2 (right after File & folder): unified Current tag / Selected (✎) — shows current tag by default,
+    // or the chosen/custom value when modified, with inline override (✎) and 1-click revert (↺) to current tag
     const finalInfo = resolveFinalMetaValue(fieldKey, fieldObj, isDiscogsChosen, isMbChosen, isOpenChosen);
     const finalVal = finalInfo.val || '';
     const willChange = choice !== 'current' && (fieldKey === 'cover' ? !!finalVal : finalVal !== curVal);
@@ -3020,10 +3111,10 @@
         + '<button type="button" class="meta-edit-btn is-active" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Cancel override edit">✕</button>'
         + '</span>';
     } else if (fieldKey === 'cover') {
+      const hasCov = curVal === 'present' || !!fileItem.has_cover;
       let covUrl = '';
       let covText = '';
       if (choice === 'current') {
-        const hasCov = curVal === 'present' || !!fileItem.has_cover;
         covUrl = hasCov ? fileCoverUrl(fileItem.id, fileItem.cover_updated_at || fileItem.checked_at || 1) : '';
         covText = hasCov ? 'Present' : 'Missing';
       } else if (finalVal) {
@@ -3033,15 +3124,25 @@
         covText = choice === 'custom' ? '(clear)' : 'Missing';
       }
       const cDrag = (choice !== 'current' && finalVal) ? makeDragAttr(fileItem.id, fieldKey, choice, finalVal, isModal) : '';
-      const zoomAttrs = covUrl ? ' data-cover-zoom="' + esc(covUrl) + '" data-cover-caption="' + esc(fileItem.name + ' · Final cover (' + finalInfo.srcLabel + ')') + '"' : '';
+      const zoomCaption = choice === 'current'
+        ? (fileItem.name + ' · Current embedded cover')
+        : (fileItem.name + ' · Selected cover (' + finalInfo.srcLabel + ')');
+      const zoomAttrs = covUrl ? ' data-cover-zoom="' + esc(covUrl) + '" data-cover-caption="' + esc(zoomCaption) + '"' : '';
+      const covTip = choice === 'current'
+        ? ((hasCov ? 'Current embedded cover: Present' : 'No cover currently embedded in file') + ' · click or press ✎ to override')
+        : ('Selected cover (' + finalInfo.srcLabel + ') · Current in file: ' + (hasCov ? 'Present' : 'Missing') + ' · click or press ✎ to override');
+      const revertBtn = choice !== 'current'
+        ? '<button type="button" class="meta-edit-btn" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current" title="' + esc('Keep current file cover (' + (hasCov ? 'Present' : 'Missing') + ')') + '">↺</button>'
+        : '';
       customInner = '<span class="meta-edit-wrap">'
         + '<button type="button" class="meta-pill' + (willChange || choice === 'custom' ? ' is-chosen' : '') + '"'
         + ' data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '"'
-        + zoomAttrs + cDrag + ' title="Final selected cover (' + esc(finalInfo.srcLabel) + ') · click to override">'
+        + zoomAttrs + cDrag + ' title="' + esc(covTip) + '">'
         + (covUrl ? '<img class="meta-cover-mini" src="' + esc(covUrl) + '" alt="" loading="lazy">' : '')
         + '<span class="meta-pill-text">' + esc(covText) + '</span>'
         + '<span class="meta-final-src">' + esc(finalInfo.srcLabel) + '</span>'
         + '</button>'
+        + revertBtn
         + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Override ' + esc(fieldLabel) + ' value">✎</button>'
         + '</span>';
     } else {
@@ -3049,14 +3150,31 @@
       const dispHtml = finalVal
         ? esc(finalVal)
         : (choice === 'custom' ? '<em class="muted">(clear)</em>' : '<em class="muted">(empty)</em>');
+      const showWarn = choice === 'current' && pathWarn;
+      const pillCls = 'meta-pill'
+        + (willChange || choice === 'custom' ? ' is-chosen' : '')
+        + (showWarn ? ' is-warn' : '');
+      const pillTip = choice === 'current'
+        ? ((curVal ? 'Current tag: ' + curVal : 'Current tag is empty')
+          + (pathWarn ? ' (differs from folder/file name)' : '')
+          + ' · click or press ✎ to edit'
+          + (curVal ? ', or drag to another parameter' : ''))
+        : ('Selected ' + fieldLabel + ' (' + finalInfo.srcLabel + '): ' + (finalVal || '(empty)')
+          + ' · Current tag in file: ' + (curVal || '(empty)')
+          + ' · click or press ✎ to edit');
+      const revertBtn = choice !== 'current'
+        ? '<button type="button" class="meta-edit-btn" data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current" title="' + esc('Revert to current file tag: ' + (curVal || '(empty)')) + '">↺</button>'
+        : '';
       customInner = '<span class="meta-edit-wrap">'
-        + '<button type="button" class="meta-pill' + (willChange || choice === 'custom' ? ' is-chosen' : '') + '"'
+        + '<button type="button" class="' + pillCls + '"'
         + ' data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '"'
-        + fDrag + ' title="' + esc('Final ' + fieldLabel + ' (' + finalInfo.srcLabel + '): ' + (finalVal || '(empty)') + ' · click or press ✎ to override') + '">'
+        + fDrag + ' title="' + esc(pillTip) + '">'
         + (finalVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
         + '<span class="meta-pill-text">' + dispHtml + '</span>'
+        + (showWarn ? '<span class="cover-override-tag" title="Current tag differs from folder/file name">⚠️</span>' : '')
         + '<span class="meta-final-src">' + esc(finalInfo.srcLabel) + '</span>'
         + '</button>'
+        + revertBtn
         + '<button type="button" class="meta-edit-btn" data-action="' + editToggleAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" title="Override ' + esc(fieldLabel) + ' value (or drop a dragged value here)">✎</button>'
         + '</span>';
     }
@@ -3093,42 +3211,12 @@
     }
     const pathCell = '<td class="meta-choice-cell"' + dropAttrs + '>' + pathInner + '</td>';
 
-    // Col 5: Current tag (file)
-    let curInner = '';
-    if (fieldKey === 'cover') {
-      const hasCov = curVal === 'present' || !!fileItem.has_cover;
-      const cUrl = hasCov ? fileCoverUrl(fileItem.id, fileItem.cover_updated_at || fileItem.checked_at || 1) : '';
-      const thumb = hasCov
-        ? '<img class="meta-cover-mini" src="' + esc(cUrl) + '" alt="">'
-        : '';
-      curInner = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + '"'
-        + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current"'
-        + (cUrl ? ' data-cover-zoom="' + esc(cUrl) + '" data-cover-caption="' + esc(fileItem.name + ' · Current embedded cover') + '"' : '')
-        + ' title="' + (hasCov ? 'Keep embedded cover art currently in file' : 'No cover currently embedded in file') + '">'
-        + '<span class="meta-radio-dot"></span>' + thumb
-        + '<span class="meta-pill-text">' + (hasCov ? 'Present' : 'Missing') + '</span></button>';
-    } else {
-      const dragAttr = curVal ? makeDragAttr(fileItem.id, fieldKey, 'current', curVal, isModal) : '';
-      const curTip = (curVal ? 'Current tag: ' + curVal : 'Current tag is empty')
-        + (pathWarn ? ' (differs from folder/file name)' : '')
-        + (curVal ? ' · drag to another parameter' : '');
-      curInner = '<button type="button" class="meta-pill' + (choice === 'current' ? ' is-chosen' : '') + (pathWarn ? ' is-warn' : '') + '"'
-        + ' data-action="' + pickAct + '" data-file="' + fileItem.id + '" data-field="' + fieldKey + '" data-choice="current"'
-        + dragAttr + ' title="' + esc(curTip) + '">'
-        + (curVal ? '<span class="meta-drag-grip" aria-hidden="true">⋮⋮</span>' : '')
-        + '<span class="meta-radio-dot"></span>'
-        + '<span class="meta-pill-text">' + (curVal ? esc(curVal) : '<em class="muted">(empty)</em>') + '</span>'
-        + (pathWarn ? '<span class="cover-override-tag" title="Differs from folder/file name">⚠️</span>' : '')
-        + '</button>';
-    }
-    const curCell = '<td class="meta-choice-cell"' + dropAttrs + '>' + curInner + '</td>';
-
-    // Cols 6, 7, 8: Discogs, MusicBrainz, Open (iTunes)
+    // Cols 5, 6, 7: Discogs, MusicBrainz, Open (iTunes)
     const discogsCell = renderOnlineSourceCell(fileItem, fieldKey, 'discogs', 'Discogs', discogsVal, isDiscogsChosen, pickAct, isModal);
     const mbCell = renderOnlineSourceCell(fileItem, fieldKey, 'musicbrainz', 'MusicBrainz', mbVal, isMbChosen, pickAct, isModal);
     const openCell = renderOnlineSourceCell(fileItem, fieldKey, 'open', 'Open (iTunes)', openVal, isOpenChosen, pickAct, isModal);
 
-    return customCell + fieldCell + pathCell + curCell + discogsCell + mbCell + openCell;
+    return customCell + fieldCell + pathCell + discogsCell + mbCell + openCell;
   }
 
   function filterAndSortMetaFiles(files, opts) {
@@ -3514,8 +3602,8 @@
             ? '<td class="pick meta-pick-col" rowspan="' + span + '"><input type="checkbox" data-meta-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
               + '<td class="meta-file-col" rowspan="' + span + '">'
               + '<div class="meta-file-cell-inner">'
-              + '<strong class="meta-one-line" title="' + esc(f.relpath) + '">' + esc(f.name) + '</strong>'
-              + '<span class="small muted mono meta-one-line" title="' + esc(f.dir) + '">' + esc(folderStr) + '</span>'
+              + '<strong class="meta-file-name" title="' + esc(f.relpath) + '">' + esc(f.name) + '</strong>'
+              + '<span class="small muted mono meta-folder-name" title="' + esc(f.dir) + '">' + esc(folderStr) + '</span>'
               + '<div class="meta-badges-line">' + srcTag + overrideBadge + '</div>'
               + '<div class="meta-row-actions">'
               + '<button type="button" class="btn btn-sm btn-primary" data-action="meta-apply-one" data-file="' + f.id + '" title="Write selected metadata to this file without changing its timestamp">Update</button>'
@@ -3546,10 +3634,9 @@
         + '<thead><tr>'
         + '<th class="pick"><input type="checkbox" data-meta-all aria-label="Select all visible files"' + (allOn ? ' checked' : '') + '></th>'
         + '<th class="is-resizable" title="File &amp; folder">File &amp; folder' + resizer('file') + '</th>'
-        + '<th class="is-resizable" title="Selected / Custom (✎)">Selected / Custom (✎)' + tip('Shows the final selected value for each parameter. Click the value or ✎ to override it, or drop a dragged value here.') + resizer('custom') + '</th>'
+        + '<th class="is-resizable" title="Current tag / Selected (✎)">Current tag / Selected (✎)' + tip('Shows the current file tag by default, or the selected/custom value to write. Click the value or ✎ to edit, press ↺ to revert to the current tag, or drop a dragged value here.') + resizer('custom') + '</th>'
         + '<th class="is-resizable" title="Field">Field' + tip('Metadata parameter name. Drop any dragged value pill onto a row to assign it to that parameter.') + resizer('field') + '</th>'
         + '<th class="is-resizable" title="Folder / file name">Folder / file name' + tip('Value parsed from the folder and file name on disk. Click to select, or drag onto another parameter.') + resizer('path') + '</th>'
-        + '<th class="is-resizable" title="Current tag (file)">Current tag (file)' + tip('Value currently stored in the audio file metadata. Click to keep, or drag onto another parameter.') + resizer('current') + '</th>'
         + '<th class="is-resizable" title="Discogs"><div class="meta-th-source"><span class="meta-th-title">Discogs' + tip('Match found on Discogs. Click the button to use Discogs values for enabled (visible) parameters on selected files.') + '</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="discogs"' + bulkSrcDisabled + ' title="Use Discogs column values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">Discogs (' + selCount + ')</button></div>' + resizer('discogs') + '</th>'
         + '<th class="is-resizable" title="MusicBrainz"><div class="meta-th-source"><span class="meta-th-title">MusicBrainz' + tip('Match found on MusicBrainz / Cover Art Archive. Click the button to use MusicBrainz values for enabled (visible) parameters on selected files.') + '</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="musicbrainz"' + bulkSrcDisabled + ' title="Use MusicBrainz column values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">MusicBrainz (' + selCount + ')</button></div>' + resizer('musicbrainz') + '</th>'
         + '<th class="is-resizable" title="Open (iTunes)"><div class="meta-th-source"><span class="meta-th-title">Open (iTunes)' + tip('Match found on Open (iTunes). Click the button to use Open (iTunes) values for enabled (visible) parameters on selected files.') + '</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-bulk-choice" data-choice="open"' + bulkSrcDisabled + ' title="Use Open (iTunes) column values for enabled (visible) parameters on the ' + selCount + ' selected file(s)">Open (iTunes) (' + selCount + ')</button></div>' + resizer('open') + '</th>'
@@ -3572,13 +3659,15 @@
       'Meta data',
       'Check and compare audio file tags in enabled folders against folder/file names, Discogs, MusicBrainz and open sources. File timestamps are preserved.',
       headBtns,
-      false
+      false,
+      'page-head-static'
     ) + optionsCard + diffCard;
     const tw = document.getElementById('meta-table-wrap');
     if (tw && state.metaTableScroll) {
       tw.scrollTop = state.metaTableScroll.top || 0;
       tw.scrollLeft = state.metaTableScroll.left || 0;
     }
+    syncMetaStickyHeader();
   }
 
   /* ------------------------------------------------ per-file metadata modal */
@@ -3670,10 +3759,9 @@
 
       contentHtml = overrideBanner + srcLine
         + '<div class="table-wrap"><table class="meta-table"><thead><tr>'
-        + '<th>Selected / Custom (✎)</th>'
+        + '<th>Current tag / Selected (✎)</th>'
         + '<th>Field</th>'
         + '<th>Folder / file name</th>'
-        + '<th>Current tag (file)</th>'
         + '<th><div class="meta-th-source"><span class="meta-th-title">Discogs</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-modal-bulk" data-choice="discogs">Discogs (1)</button></div></th>'
         + '<th><div class="meta-th-source"><span class="meta-th-title">MusicBrainz</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-modal-bulk" data-choice="musicbrainz">MusicBrainz (1)</button></div></th>'
         + '<th><div class="meta-th-source"><span class="meta-th-title">Open (iTunes)</span><button type="button" class="btn btn-sm meta-th-btn" data-action="meta-modal-bulk" data-choice="open">Open (iTunes) (1)</button></div></th>'
@@ -4231,6 +4319,8 @@
         state.busy = {};
         state.metaChecking = false;
         state.scanning = { audio: false, video: false };
+        state.scanMode = { audio: null, video: null };
+        state.scanTarget = { audio: null, video: null };
         if (state.metadata) state.metadata.meta_checking = false;
         if (state.dash) {
           state.dash.meta_checking = false;
@@ -4335,8 +4425,17 @@
       state.selected[t] = el.dataset.rel;
       render();
     } else if (a === 'rescan') {
-      scanDirectories(t, true);       // the button shows Scanning… until the fresh tree is read
+      scanDirectories(t, true);       // incremental quick scan (Option A + B + D)
       render();
+    } else if (a === 'rescan-full') {
+      scanDirectories(t, true, { full: true });
+      render();
+    } else if (a === 'rescan-folder') {
+      const rel = el.dataset.rel || state.selected[t];
+      if (rel) {
+        scanDirectories(t, true, { dir: rel });
+        render();
+      }
     } else if (a === 'preview') {
       const f = state.browse.rows && state.browse.rows[Number(el.dataset.idx)];
       if (f) playFile(t, f);
@@ -5529,6 +5628,7 @@
       };
     } else if (el.id === 'meta-table-wrap') {
       state.metaTableScroll = { top: el.scrollTop, left: el.scrollLeft };
+      syncMetaStickyHeader();
     }
   }, true);
 
@@ -5576,14 +5676,16 @@
     if (!body) return;
     const rect = tipEl.getBoundingClientRect();
     const inTh = !!tipEl.closest('th, .page-head');
+    const txHost = tipEl.closest('thead.is-stuck');
+    const hostRect = txHost ? txHost.getBoundingClientRect() : { left: 0, top: 0 };
     body.style.position = 'fixed';
     body.style.transform = 'none';
     body.style.zIndex = '200';
     const w = Math.min(320, Math.max(180, body.offsetWidth || 260));
     const left = Math.max(12, Math.min(window.innerWidth - w - 12, Math.round(rect.left + rect.width / 2 - w / 2)));
-    body.style.left = left + 'px';
+    body.style.left = (left - Math.round(hostRect.left)) + 'px';
     if (inTh || rect.top < 100) {
-      body.style.top = Math.round(rect.bottom + 8) + 'px';
+      body.style.top = (Math.round(rect.bottom + 8) - Math.round(hostRect.top)) + 'px';
       body.style.bottom = 'auto';
     } else {
       body.style.bottom = Math.round(window.innerHeight - rect.top + 8) + 'px';
@@ -5945,12 +6047,33 @@
     render();
   });
 
+  function syncMetaStickyHeader() {
+    const tbl = document.getElementById('meta-diff-table');
+    if (!tbl) return;
+    const thead = tbl.querySelector('thead');
+    const tw = document.getElementById('meta-table-wrap');
+    if (!thead || !tw) return;
+    const rect = tw.getBoundingClientRect();
+    const headH = thead.offsetHeight || 40;
+    const maxOffset = Math.max(0, rect.height - headH);
+    const winPush = rect.top < 0 ? Math.round(-rect.top) : 0;
+    const y = Math.min(maxOffset, winPush + Math.round(tw.scrollTop || 0));
+    if (y > 0) {
+      thead.style.setProperty('--meta-head-y', y + 'px');
+      thead.classList.add('is-stuck');
+    } else {
+      thead.style.removeProperty('--meta-head-y');
+      thead.classList.remove('is-stuck');
+    }
+  }
+
   function syncJumpTop() {
     const btn = document.getElementById('jump-top-btn');
-    if (!btn) return;
-    btn.classList.toggle('is-scrolled', window.scrollY > 80);
+    if (btn) btn.classList.toggle('is-scrolled', window.scrollY > 80);
+    syncMetaStickyHeader();
   }
   window.addEventListener('scroll', syncJumpTop, { passive: true });
+  window.addEventListener('resize', syncMetaStickyHeader, { passive: true });
 
   /* ---------------------------------------------------------------- start */
   window.addEventListener('hashchange', () => {

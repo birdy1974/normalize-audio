@@ -74,105 +74,17 @@ def _vorbis_str(tags: Any, *keys: str) -> str:
 
 def read_full_tags(path: str) -> dict[str, Any]:
     """Read all 8 metadata fields from an audio file without modifying it."""
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    out = {
-        "artist": "",
-        "title": "",
-        "album": "",
-        "album_artist": "",
-        "year": "",
-        "track": "",
-        "genre": "",
-        "cover": "",
+    raw = cover.read_raw_tags_cached(path)
+    return {
+        "artist": raw["artist"],
+        "title": raw["title"],
+        "album": raw["album"],
+        "album_artist": raw["album_artist"],
+        "year": _norm_year(raw["year"]),
+        "track": _norm_track(raw["track"]),
+        "genre": raw["genre"],
+        "cover": "present" if raw["has_cover"] else "",
     }
-    if not os.path.isfile(path):
-        return out
-    try:
-        if ext in ("mp3", "aac"):
-            try:
-                id3 = ID3(path)
-            except ID3NoHeaderError:
-                return out
-            out["artist"] = _id3_str(id3, "TPE1")
-            out["title"] = _id3_str(id3, "TIT2")
-            out["album"] = _id3_str(id3, "TALB")
-            out["album_artist"] = _id3_str(id3, "TPE2")
-            out["year"] = _norm_year(_id3_str(id3, "TDRC", "TYER"))
-            out["track"] = _norm_track(_id3_str(id3, "TRCK"))
-            out["genre"] = _id3_str(id3, "TCON")
-            out["cover"] = "present" if id3.getall("APIC") else ""
-            return out
-
-        if ext == "flac":
-            audio = FLAC(path)
-            tags = audio.tags or {}
-            out["artist"] = _vorbis_str(tags, "artist")
-            out["title"] = _vorbis_str(tags, "title")
-            out["album"] = _vorbis_str(tags, "album")
-            out["album_artist"] = _vorbis_str(tags, "albumartist", "album artist")
-            out["year"] = _norm_year(_vorbis_str(tags, "date", "year"))
-            out["track"] = _norm_track(_vorbis_str(tags, "tracknumber"))
-            out["genre"] = _vorbis_str(tags, "genre")
-            out["cover"] = "present" if audio.pictures else ""
-            return out
-
-        if ext == "m4a":
-            audio = MP4(path)
-            tags = audio.tags or {}
-            out["artist"] = str((tags.get("\xa9ART") or [""])[0]).strip()
-            out["title"] = str((tags.get("\xa9nam") or [""])[0]).strip()
-            out["album"] = str((tags.get("\xa9alb") or [""])[0]).strip()
-            out["album_artist"] = str((tags.get("aART") or [""])[0]).strip()
-            out["year"] = _norm_year((tags.get("\xa9day") or [""])[0])
-            trkn = tags.get("trkn")
-            if trkn and isinstance(trkn[0], tuple) and trkn[0][0]:
-                out["track"] = str(int(trkn[0][0]))
-            out["genre"] = str((tags.get("\xa9gen") or [""])[0]).strip()
-            out["cover"] = "present" if tags.get("covr") else ""
-            return out
-
-        if ext in ("ogg", "oga", "opus"):
-            audio = mutagen.File(path)
-            tags = (audio.tags if audio else None) or {}
-            out["artist"] = _vorbis_str(tags, "artist")
-            out["title"] = _vorbis_str(tags, "title")
-            out["album"] = _vorbis_str(tags, "album")
-            out["album_artist"] = _vorbis_str(tags, "albumartist", "album artist")
-            out["year"] = _norm_year(_vorbis_str(tags, "date", "year"))
-            out["track"] = _norm_track(_vorbis_str(tags, "tracknumber"))
-            out["genre"] = _vorbis_str(tags, "genre")
-            out["cover"] = "present" if (tags.get("metadata_block_picture") or tags.get("coverart")) else ""
-            return out
-
-        if ext in ("wav", "aif", "aiff"):
-            audio = WAVE(path) if ext == "wav" else AIFF(path)
-            id3 = audio.tags
-            if id3 and isinstance(id3, ID3):
-                out["artist"] = _id3_str(id3, "TPE1")
-                out["title"] = _id3_str(id3, "TIT2")
-                out["album"] = _id3_str(id3, "TALB")
-                out["album_artist"] = _id3_str(id3, "TPE2")
-                out["year"] = _norm_year(_id3_str(id3, "TDRC", "TYER"))
-                out["track"] = _norm_track(_id3_str(id3, "TRCK"))
-                out["genre"] = _id3_str(id3, "TCON")
-                out["cover"] = "present" if id3.getall("APIC") else ""
-            return out
-
-        if ext == "wma":
-            audio = ASF(path)
-            tags = audio.tags or {}
-            out["artist"] = str((tags.get("Author") or [""])[0]).strip()
-            out["title"] = str((tags.get("Title") or [""])[0]).strip()
-            out["album"] = str((tags.get("WM/AlbumTitle") or [""])[0]).strip()
-            out["album_artist"] = str((tags.get("WM/AlbumArtist") or [""])[0]).strip()
-            out["year"] = _norm_year((tags.get("WM/Year") or [""])[0])
-            out["track"] = _norm_track((tags.get("WM/TrackNumber") or [""])[0])
-            out["genre"] = str((tags.get("WM/Genre") or [""])[0]).strip()
-            out["cover"] = "present" if tags.get("WM/Picture") else ""
-            return out
-    except Exception as exc:
-        log.debug("read_full_tags failed for %s: %s", path, exc)
-    return out
 
 
 class CoverUpdateError(ValueError):
@@ -205,144 +117,175 @@ def _apply_id3_updates(id3: ID3, updates: dict[str, Any]) -> None:
             id3.add(cls(encoding=3, text=[val]))
 
 
+def _apply_text_updates_to_obj(ext: str, obj: Any, tag_updates: dict[str, Any]) -> None:
+    if ext in ("mp3", "aac"):
+        _apply_id3_updates(obj, tag_updates)
+    elif ext in ("flac", "ogg", "oga", "opus"):
+        if obj.tags is None:
+            obj.add_tags()
+        vmap = {
+            "artist": "artist",
+            "title": "title",
+            "album": "album",
+            "album_artist": "albumartist",
+            "year": "date",
+            "track": "tracknumber",
+            "genre": "genre",
+        }
+        for field, vkey in vmap.items():
+            if field in tag_updates:
+                val = str(tag_updates[field] or "").strip()
+                if val:
+                    obj[vkey] = [val]
+                elif vkey in obj:
+                    del obj[vkey]
+                if field == "year" and "year" in obj and vkey != "year":
+                    del obj["year"]
+    elif ext == "m4a":
+        if obj.tags is None:
+            obj.add_tags()
+        mmap = {
+            "artist": "\xa9ART",
+            "title": "\xa9nam",
+            "album": "\xa9alb",
+            "album_artist": "aART",
+            "year": "\xa9day",
+            "genre": "\xa9gen",
+        }
+        for field, mkey in mmap.items():
+            if field in tag_updates:
+                val = str(tag_updates[field] or "").strip()
+                if val:
+                    obj.tags[mkey] = [val]
+                elif mkey in obj.tags:
+                    del obj.tags[mkey]
+        if "track" in tag_updates:
+            tval = _norm_track(tag_updates["track"])
+            if tval and tval.isdigit():
+                existing_total = 0
+                if obj.tags.get("trkn") and isinstance(obj.tags["trkn"][0], tuple):
+                    existing_total = obj.tags["trkn"][0][1]
+                obj.tags["trkn"] = [(int(tval), existing_total)]
+            elif "trkn" in obj.tags:
+                del obj.tags["trkn"]
+    elif ext in ("wav", "aif", "aiff"):
+        if obj.tags is None:
+            obj.add_tags()
+        _apply_id3_updates(obj.tags, tag_updates)
+    elif ext == "wma":
+        if obj.tags is None:
+            obj.add_tags()
+        amap = {
+            "artist": "Author",
+            "title": "Title",
+            "album": "WM/AlbumTitle",
+            "album_artist": "WM/AlbumArtist",
+            "year": "WM/Year",
+            "track": "WM/TrackNumber",
+            "genre": "WM/Genre",
+        }
+        for field, akey in amap.items():
+            if field in tag_updates:
+                val = str(tag_updates[field] or "").strip()
+                if val:
+                    obj.tags[akey] = [ASFUnicodeAttribute(val)]
+                elif akey in obj.tags:
+                    del obj.tags[akey]
+
+
 def write_full_tags(
     path: str,
     updates: dict[str, Any],
     *,
     discogs_token: str = "",
     preserve_mtime: bool = True,
+    prefetched_cover: tuple[bytes, str] | None = None,
 ) -> bool:
-    """Write selected metadata fields (and optional cover URL) into an audio file.
-    Always preserves the original file timestamps (atime and mtime) on disk when preserve_mtime=True."""
+    """Write selected metadata fields (and optional cover URL) into an audio file in a single pass.
+    Writes in-place when existing tag padding fits; falls back to an atomic sibling temp file with
+    8 KiB reserved padding otherwise. Preserves original file timestamps when preserve_mtime=True."""
     if not os.path.isfile(path):
         raise ValueError("audio file not found")
     if not updates:
         return False
 
+    tag_updates = {k: v for k, v in updates.items() if k != "cover"}
+    cover_val = updates.get("cover")
+    has_cover_url = bool(cover_val and str(cover_val).startswith(("http://", "https://", "data:", "local://")))
+    if not tag_updates and not has_cover_url:
+        return True
+
+    cover_bytes: bytes | None = None
+    cover_mime = "image/jpeg"
+    cover_error: Exception | None = None
+    if has_cover_url:
+        try:
+            if prefetched_cover is not None:
+                data, mime = prefetched_cover
+            else:
+                data, mime = cover.download_cover(str(cover_val), token=discogs_token)
+            if not data or len(data) < 16:
+                raise ValueError("invalid cover image data")
+            cover_bytes = data
+            cover_mime = cover.detect_mime(data, mime or "image/jpeg")
+        except Exception as exc:
+            if not tag_updates:
+                raise
+            cover_error = exc
+
     stat_before = os.stat(path)
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    folder = os.path.dirname(path) or "."
     base = os.path.basename(path)
-    tmp = os.path.join(folder, f".{base}.meta-{os.getpid()}-{int(time.time() * 1000)}.nrm-tmp.{ext}")
-    shutil.copy2(path, tmp)
-    try:
-        tag_updates = {k: v for k, v in updates.items() if k != "cover"}
-        if tag_updates:
-            if ext in ("mp3", "aac"):
-                try:
-                    id3 = ID3(tmp)
-                except ID3NoHeaderError:
-                    id3 = ID3()
-                _apply_id3_updates(id3, tag_updates)
-                id3.update_to_v23()
-                id3.save(tmp, v1=2, v2_version=3)
-            elif ext in ("flac", "ogg", "oga", "opus"):
-                audio = FLAC(tmp) if ext == "flac" else mutagen.File(tmp)
-                if audio is None:
-                    raise ValueError(f"unsupported audio format: {base}")
-                if audio.tags is None:
-                    audio.add_tags()
-                vmap = {
-                    "artist": "artist",
-                    "title": "title",
-                    "album": "album",
-                    "album_artist": "albumartist",
-                    "year": "date",
-                    "track": "tracknumber",
-                    "genre": "genre",
-                }
-                for field, vkey in vmap.items():
-                    if field in tag_updates:
-                        val = str(tag_updates[field] or "").strip()
-                        if val:
-                            audio[vkey] = [val]
-                        elif vkey in audio:
-                            del audio[vkey]
-                        if field == "year" and "year" in audio and vkey != "year":
-                            del audio["year"]
-                audio.save()
-            elif ext == "m4a":
-                audio = MP4(tmp)
-                if audio.tags is None:
-                    audio.add_tags()
-                mmap = {
-                    "artist": "\xa9ART",
-                    "title": "\xa9nam",
-                    "album": "\xa9alb",
-                    "album_artist": "aART",
-                    "year": "\xa9day",
-                    "genre": "\xa9gen",
-                }
-                for field, mkey in mmap.items():
-                    if field in tag_updates:
-                        val = str(tag_updates[field] or "").strip()
-                        if val:
-                            audio.tags[mkey] = [val]
-                        elif mkey in audio.tags:
-                            del audio.tags[mkey]
-                if "track" in tag_updates:
-                    tval = _norm_track(tag_updates["track"])
-                    if tval and tval.isdigit():
-                        existing_total = 0
-                        if audio.tags.get("trkn") and isinstance(audio.tags["trkn"][0], tuple):
-                            existing_total = audio.tags["trkn"][0][1]
-                        audio.tags["trkn"] = [(int(tval), existing_total)]
-                    elif "trkn" in audio.tags:
-                        del audio.tags["trkn"]
-                audio.save()
-            elif ext in ("wav", "aif", "aiff"):
-                audio = WAVE(tmp) if ext == "wav" else AIFF(tmp)
-                if audio.tags is None:
-                    audio.add_tags()
-                _apply_id3_updates(audio.tags, tag_updates)
-                audio.tags.update_to_v23()
-                audio.save(v2_version=3)
-            elif ext == "wma":
-                audio = ASF(tmp)
-                if audio.tags is None:
-                    audio.add_tags()
-                amap = {
-                    "artist": "Author",
-                    "title": "Title",
-                    "album": "WM/AlbumTitle",
-                    "album_artist": "WM/AlbumArtist",
-                    "year": "WM/Year",
-                    "track": "WM/TrackNumber",
-                    "genre": "WM/Genre",
-                }
-                for field, akey in amap.items():
-                    if field in tag_updates:
-                        val = str(tag_updates[field] or "").strip()
-                        if val:
-                            audio.tags[akey] = [ASFUnicodeAttribute(val)]
-                        elif akey in audio.tags:
-                            del audio.tags[akey]
-                audio.save()
 
-        cover_val = updates.get("cover")
-        cover_error: Exception | None = None
-        if cover_val and str(cover_val).startswith(("http://", "https://", "data:", "local://")):
-            try:
-                data, mime = cover.download_cover(str(cover_val), token=discogs_token)
-                cover.embed_cover(tmp, data, mime=mime, preserve_mtime=False, ext_override=ext)
-            except Exception as exc:
-                if not tag_updates:
-                    raise
-                cover_error = exc
-
-        os.replace(tmp, path)
-        if preserve_mtime:
-            # Strictly preserve the file's original timestamp on disk
-            os.utime(path, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
-        if cover_error is not None:
-            raise CoverUpdateError(f"tags updated, but cover art failed ({cover_error})", tags_written=True) from cover_error
+    can_try_inplace = False
+    obj: Any = None
+    if ext in ("mp3", "aac"):
+        had_v2 = cover.has_id3v2_header(path)
+        try:
+            obj = ID3(path)
+        except ID3NoHeaderError:
+            obj = ID3()
+        can_try_inplace = had_v2
+    elif ext == "flac":
+        obj = FLAC(path)
+        can_try_inplace = True
+    elif ext in ("ogg", "oga", "opus"):
+        obj = cover.open_ogg_fast(path, ext)
+        if obj is None:
+            raise ValueError(f"unsupported audio format: {base}")
+        can_try_inplace = False
+    elif ext == "m4a":
+        obj = MP4(path)
+        can_try_inplace = True
+    elif ext in ("wav", "aif", "aiff"):
+        obj = WAVE(path) if ext == "wav" else AIFF(path)
+        can_try_inplace = obj.tags is not None
+    elif ext == "wma":
+        obj = ASF(path)
+        can_try_inplace = True
+    elif cover_bytes is not None:
+        raise ValueError(f"embedding cover art is not supported for .{ext} files")
+    else:
         return True
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+
+    if tag_updates:
+        _apply_text_updates_to_obj(ext, obj, tag_updates)
+    if cover_bytes is not None:
+        cover.apply_cover_to_mutagen_obj(ext, obj, cover_bytes, cover_mime)
+
+    cover.save_mutagen_smart(
+        path,
+        ext,
+        obj,
+        can_try_inplace=can_try_inplace,
+        v1=2 if tag_updates else 1,
+        preserve_mtime=preserve_mtime,
+        stat_before=stat_before,
+        op_label="meta",
+    )
+    if cover_error is not None:
+        raise CoverUpdateError(f"tags updated, but cover art failed ({cover_error})", tags_written=True) from cover_error
+    return True
 
 
 # ------------------------------------------------------------ path metadata parsing
@@ -410,7 +353,7 @@ def _lookup_discogs(artist: str, album: str, title: str, track: str, token: str 
         if cancel and cancel():
             return matches
         try:
-            r = httpx.get("https://api.discogs.com/database/search", params=params, headers=headers, timeout=6.0)
+            r = cover.http_get("https://api.discogs.com/database/search", params=params, headers=headers, timeout=6.0)
             if r.status_code != 200:
                 continue
             results = r.json().get("results") or []
@@ -460,7 +403,7 @@ def _caa_front_url(rg_id: str | None, rel_id: str | None, headers: dict[str, str
         endpoints.append(f"https://coverartarchive.org/release/{rel_id}")
     for url in endpoints:
         try:
-            r = httpx.get(url, headers=headers, follow_redirects=True, timeout=3.5)
+            r = cover.http_get(url, headers=headers, follow_redirects=True, timeout=3.5)
             if r.status_code != 200:
                 continue
             images = r.json().get("images") or []
@@ -488,7 +431,7 @@ def _lookup_musicbrainz(artist: str, album: str, title: str, track: str, cancel=
     if not q_parts:
         return []
     try:
-        r = httpx.get(
+        r = cover.http_get(
             "https://musicbrainz.org/ws/2/recording/",
             params={"query": " AND ".join(q_parts), "fmt": "json", "limit": 4},
             headers=headers,
@@ -554,7 +497,7 @@ def _lookup_itunes(artist: str, album: str, title: str, track: str, cancel=None)
         return []
     entity = "song" if title else "album"
     try:
-        r = httpx.get(
+        r = cover.http_get(
             "https://itunes.apple.com/search",
             params={"term": term, "media": "music", "entity": entity, "limit": 4},
             headers={"User-Agent": cover.USER_AGENT},
@@ -653,21 +596,27 @@ def lookup_online_metadata(
     by_source: dict[str, dict[str, Any]] = {}
     candidates: list[dict] = []
 
+    tasks: list[tuple[str, Any]] = []
     if sources_cfg.get("discogs") and not (cancel and cancel()):
-        d_cands = _lookup_discogs(artist, album, title, track, token=token, cancel=cancel)
-        if d_cands:
-            by_source["discogs"] = _merge_candidate_list(d_cands)
-            candidates.extend(d_cands)
+        tasks.append(("discogs", lambda: _lookup_discogs(artist, album, title, track, token=token, cancel=cancel)))
     if sources_cfg.get("musicbrainz") and not (cancel and cancel()):
-        m_cands = _lookup_musicbrainz(artist, album, title, track, cancel=cancel)
-        if m_cands:
-            by_source["musicbrainz"] = _merge_candidate_list(m_cands)
-            candidates.extend(m_cands)
+        tasks.append(("musicbrainz", lambda: _lookup_musicbrainz(artist, album, title, track, cancel=cancel)))
     if sources_cfg.get("open") and not (cancel and cancel()):
-        o_cands = _lookup_itunes(artist, album, title, track, cancel=cancel)
-        if o_cands:
-            by_source["open"] = _merge_candidate_list(o_cands)
-            candidates.extend(o_cands)
+        tasks.append(("open", lambda: _lookup_itunes(artist, album, title, track, cancel=cancel)))
+
+    if len(tasks) == 1:
+        src_name, fn = tasks[0]
+        src_cands = fn()
+        if src_cands:
+            by_source[src_name] = _merge_candidate_list(src_cands)
+            candidates.extend(src_cands)
+    elif len(tasks) > 1:
+        futures = [(src_name, cover._HTTP_POOL.submit(fn)) for src_name, fn in tasks]
+        for src_name, fut in futures:
+            src_cands = fut.result()
+            if src_cands:
+                by_source[src_name] = _merge_candidate_list(src_cands)
+                candidates.extend(src_cands)
 
     if cancel and cancel():
         return {}

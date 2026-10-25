@@ -492,5 +492,45 @@ def test_cover_modal_buttons_hover_zoom_and_global_search_from(client, cfg, monk
     assert seen_queries[-1] == ("DirBand", "DirAlbum", "DirTrack")
 
 
+def test_all_file_vs_album_apply_buttons_file_green_album_white_or_black():
+    """Every file-vs-album apply button pair uses green (btn-primary) for file and white/black (btn-album) for album."""
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "static", "index.html"), "r", encoding="utf-8") as hf:
+        html_txt = hf.read()
+    with open(os.path.join(root, "static", "app.js"), "r", encoding="utf-8") as jf:
+        js_txt = jf.read()
+    with open(os.path.join(root, "static", "styles.css"), "r", encoding="utf-8") as cf:
+        css_txt = cf.read()
+
+    # 1. Cover modal & Metadata modal footers in index.html
+    for file_id, album_id in (
+        ("cover-apply-file", "cover-apply-album"),
+        ("meta-modal-apply-file", "meta-modal-apply-album"),
+    ):
+        m_file = re.search(rf'<button[^>]*id="{file_id}"[^>]*>', html_txt)
+        m_album = re.search(rf'<button[^>]*id="{album_id}"[^>]*>', html_txt)
+        assert m_file and "btn-primary" in m_file.group(0) and "btn-album" not in m_file.group(0)
+        assert m_album and "btn-album" in m_album.group(0) and "btn-primary" not in m_album.group(0)
+
+    # 2. Parked Cover Art pane (both Per album and Per file modes) in static/app.js
+    cand_btns = re.findall(r'<button[^>]*data-action="cover-apply-cand"[^>]*>', js_txt)
+    assert len(cand_btns) == 4  # 2 in Per-album mode + 2 in Per-file mode
+    file_cand_btns = [b for b in cand_btns if 'data-scope="file"' in b]
+    album_cand_btns = [b for b in cand_btns if 'data-scope="album"' in b]
+    assert len(file_cand_btns) == 2 and len(album_cand_btns) == 2
+    for b in file_cand_btns:
+        assert "btn-primary" in b and "btn-album" not in b
+    for b in album_cand_btns:
+        assert "btn-album" in b and "btn-primary" not in b
+
+    # 3. CSS white in light mode (#ffffff) and black in dark mode (#0c0e0d)
+    assert "--btn-album-bg: #ffffff;" in css_txt
+    assert "--btn-album-bg: #0c0e0d;" in css_txt
+    assert ".btn-album { background: var(--btn-album-bg);" in css_txt
+
+
+
 
 

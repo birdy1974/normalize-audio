@@ -4,7 +4,9 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import threading
 from typing import Literal
+import weakref
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
@@ -49,6 +51,8 @@ class FolderInvert(BaseModel):
 
 class ScanBody(BaseModel):
     media: Literal["audio", "video"] | None = None
+    full: bool = False
+    dir: str | None = None
 
 
 class MeasureBody(BaseModel):
@@ -255,6 +259,8 @@ def dashboard(engine=Engine):
         "approved_done": approved_done,
         "approved_total": approved_total,
         "scanning": engine.scanning(),
+        "fs_seq": engine.fs_seq(),
+        "watcher_active": bool(engine.watcher.active),
         "meta_checking": engine.is_metadata_checking(),
         "meta_progress": engine.get_metadata_progress(),
         "action_progress": engine.get_action_progress(),
@@ -303,20 +309,49 @@ def log_clear(engine=Engine):
 @router.post("/scan")
 def scan(body: ScanBody | None = None, engine=Engine):
     media = body.media if body else None
-    return engine.scan_now(media)
+    full = bool(body.full) if body else False
+    target_dir = body.dir if body else None
+    if target_dir and not media:
+        raise HTTPException(400, "media is required when scanning a specific folder")
+    if not full and target_dir is None:
+        return engine.scan_now(media) if media is not None else engine.scan_now()
+    return engine.scan_now(media, full=full, target_dir=target_dir)
 
 
 # ------------------------------------------------------------ folders
+
+_tree_cache_lock = threading.Lock()
+_tree_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
 
 @router.get("/folders/tree")
 def folder_tree(media: str = "audio", engine=Engine):
     """Every folder of one media type in one call (flat list; the UI builds the tree)."""
     _media_check(media)
     db = engine.db
-    dirs = db.query("SELECT relpath, parent, enabled FROM dirs WHERE media = ? AND relpath != '.' "
-                    "ORDER BY relpath", (media,))
-    direct = {r["dir"]: r["n"] for r in db.query(
-        "SELECT dir, COUNT(*) AS n FROM files WHERE media = ? GROUP BY dir", (media,))}
+    seq_before = getattr(db, "data_seq", None)
+    if seq_before is not None:
+        with _tree_cache_lock:
+            per_db = _tree_cache.get(db)
+            cached = per_db.get(media) if per_db else None
+        if cached is not None and cached[0] == seq_before:
+            return cached[1]
+
+    with db._lock:
+        seq = getattr(db, "data_seq", None)
+        dirs = db.query_tuples(
+            "SELECT relpath, parent, enabled FROM dirs WHERE media = ? AND relpath != '.' ORDER BY relpath",
+            (media,),
+        )
+        direct = {
+            r[0]: r[1]
+            for r in db.query_tuples(
+                "SELECT dir, COUNT(*) FROM files WHERE media = ? GROUP BY dir",
+                (media,),
+            )
+        }
+        seq_after = getattr(db, "data_seq", None)
+
     subtree: dict[str, int] = {}
     for rel, n in direct.items():
         if rel == "." or not n:
@@ -327,10 +362,14 @@ def folder_tree(media: str = "audio", engine=Engine):
             if "/" not in here:
                 break
             here = here.rsplit("/", 1)[0]
-    out = [{"relpath": d["relpath"], "name": d["relpath"].rsplit("/", 1)[-1], "parent": d["parent"],
-            "enabled": bool(d["enabled"]), "direct_files": direct.get(d["relpath"], 0),
-            "files": subtree.get(d["relpath"], 0)} for d in dirs]
-    return {"media": media, "dirs": out, "root_files": direct.get(".", 0)}
+    out = [{"relpath": relp, "name": relp.rsplit("/", 1)[-1], "parent": parent,
+            "enabled": bool(en), "direct_files": direct.get(relp, 0),
+            "files": subtree.get(relp, 0)} for relp, parent, en in dirs]
+    payload = {"media": media, "dirs": out, "root_files": direct.get(".", 0)}
+    if seq is not None and seq == seq_after:
+        with _tree_cache_lock:
+            _tree_cache.setdefault(db, {})[media] = (seq_after, payload)
+    return payload
 
 
 @router.get("/folders")
