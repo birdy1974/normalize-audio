@@ -749,5 +749,50 @@ def test_normalization_run_saves_check_results_for_files_pane(lib):
     assert r_chg["gain_db"] is not None and r_chg["method"] == "volume"
 
 
+def test_dynamic_track_minus_19_6_lufs_with_minus_3_ceiling_and_peak_limiter(lib):
+    cfg, engine, db = lib
+    # Dynamic signal (~ -19.6 LUFS integrated, ~ -0.1..-0.5 dBTP true peak)
+    expr = "aevalsrc=0.148*sin(2*PI*440*t)+0.84*sin(2*PI*1000*t)*lt(mod(t\\,2.0)\\,0.03):d=8:s=44100"
+    make(os.path.join(cfg.audio_root, "dyn.mp3"), "-f", "lavfi", "-i", expr, "-c:a", "libmp3lame", "-b:a", "192k")
+    make(os.path.join(cfg.audio_root, "dyn.flac"), "-f", "lavfi", "-i", expr, "-c:a", "flac")
+    state.put_settings(db, {
+        "audio": {"target": -14.0, "truePeak": -3.0, "hysteresis": 0.5, "threshold": 9.0, "peakLimiter": False},
+    })
+    engine.scan_now("audio")
+
+    # Without peak limiter, linear gain is blocked by -3.0 dBTP ceiling
+    m1 = engine.measure("audio", "dyn.mp3")
+    assert -20.5 <= m1["lufs"] <= -18.5
+    assert m1["peak_capped"] is True
+    assert m1["gain_db"] == 0.0
+    assert m1["raw_gain_db"] > 4.0
+    exe_capped = engine.execute_files("audio", ids=[row(db, "dyn.mp3")["id"]])
+    assert exe_capped == {"executed": 1, "changed": 0}
+
+    # Enabling peakLimiter normalizes both MP3 and FLAC to ~ -14.0 LUFS while respecting -3.0 dBTP ceiling
+    state.put_settings(db, {"audio": {"peakLimiter": True}})
+    exe_lim = engine.execute_files("audio", dir_rel=".")
+    assert exe_lim == {"executed": 2, "changed": 2}
+
+    for name in ("dyn.mp3", "dyn.flac"):
+        m2 = engine.measure("audio", name)
+        assert abs(m2["lufs"] - (-14.0)) <= 0.8, f"{name} lufs={m2['lufs']}"
+        assert m2["true_peak"] <= -2.9, f"{name} true_peak={m2['true_peak']}"
+        assert row(db, name)["method"] == "loudnorm"
+
+
+def test_execute_files_approves_newly_parked_files_in_one_click(lib):
+    cfg, engine, db = lib
+    # Large change (> threshold) would normally park during _check; explicit Execute applies it in 1 click
+    tone(os.path.join(cfg.audio_root, "quiet.flac"), -18, codec_args=("-c:a", "flac"))
+    set_settings(db, target=-14.0, truePeak=-1.0, threshold=2.0, override=False)
+    engine.scan_now("audio")
+
+    exe = engine.execute_files("audio", ids=[row(db, "quiet.flac")["id"]])
+    assert exe == {"executed": 1, "changed": 1}
+    assert row(db, "quiet.flac")["status"] == "changed"
+
+
+
 
 

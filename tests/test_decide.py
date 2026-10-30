@@ -78,3 +78,24 @@ def test_video_lossy_audio_is_reencoded_at_same_bitrate():
 
 def test_unsupported_codec_is_error():
     assert d(family=None).action == "error"
+
+
+def test_true_peak_ceiling_blocks_linear_gain_at_minus_3_dbtp():
+    # Exact user scenario: -19.6 LUFS, target -14.0, ceiling -3.0 dBTP, hysteresis 0.5, threshold 9.0
+    x = d(measured=-19.6, true_peak=-1.2, target=-14.0, ceiling=-3.0, hysteresis=0.5, threshold=9.0,
+          peak_limiter=False)
+    assert (x.action, x.gain, x.capped) == ("ok", 0.0, True)
+
+
+def test_peak_limiter_enables_loudnorm_when_linear_gain_capped():
+    x = d(measured=-19.6, true_peak=-1.2, target=-14.0, ceiling=-3.0, hysteresis=0.5, threshold=9.0,
+          peak_limiter=True)
+    assert (x.action, x.gain, x.method, x.capped) == ("apply", 5.6, "loudnorm", True)
+
+    parked = d(measured=-25.0, true_peak=-1.2, target=-14.0, ceiling=-3.0, hysteresis=0.5, threshold=9.0,
+               override=False, peak_limiter=True)
+    assert (parked.action, parked.reason, parked.method, parked.gain) == ("park", "large_change", "loudnorm", 11.0)
+
+    skipped = d(measured=-19.6, true_peak=-1.2, target=-14.0, ceiling=-3.0, strategy="skip", peak_limiter=True)
+    assert (skipped.action, skipped.reason) == ("skip", "lossy_skipped")
+
