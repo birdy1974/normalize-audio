@@ -764,7 +764,37 @@ def check_batch(body: FilesBatchBody, engine=Engine):
 @router.post("/files/execute-batch")
 def execute_batch(body: FilesBatchBody, engine=Engine):
     _media_check(body.media)
-    return engine.execute_files(body.media, ids=body.ids or None, dir_rel=body.dir)
+    res = engine.execute_files(body.media, ids=body.ids or None, dir_rel=body.dir)
+    if res.get("executed", 0) > 0 and res.get("changed", 0) == 0:
+        st = state.get_settings(engine.db)
+        cfg_m = st[body.media]
+        if st["general"].get("dryRun"):
+            res = {**res, "note": "Dry run is on — turn off Dry run in Settings to write changes."}
+        elif cfg_m.get("writeMode") == "output":
+            res = {**res, "note": f"Write mode is separate output folder ({cfg_m['outputDir']})."}
+        else:
+            rows = engine._target_rows(body.media, body.ids or None, body.dir)
+            hyst = cfg_m.get("hysteresis", 0.5)
+            ceil = cfg_m["truePeak"]
+            tgt = cfg_m["target"]
+            peak_blocked = [
+                r for r in rows
+                if r.get("lufs") is not None and r.get("true_peak") is not None
+                and (tgt - r["lufs"]) > hyst and (ceil - r["true_peak"]) < (tgt - r["lufs"])
+            ]
+            if peak_blocked:
+                ex = peak_blocked[0]
+                res = {
+                    **res,
+                    "note": (
+                        f"Gain capped by True-peak ceiling ({ceil:.1f} dBTP): {ex['name']} is at "
+                        f"{ex['lufs']:.1f} LUFS with true peak {ex['true_peak']:.1f} dBTP. "
+                        f"Raise True-peak ceiling (e.g. −1.0 dBTP) or enable True-peak limiter in Settings."
+                    ),
+                }
+            elif any(r.get("reason") == "lossy_skipped" for r in rows):
+                res = {**res, "note": "Lossy audio handling is set to 'Skip lossy files' in Settings."}
+    return res
 
 
 @router.get("/files/info")

@@ -13,6 +13,7 @@
   const fmtDb = (n) => (n >= 0 ? '+' : '−') + Math.abs(n).toFixed(1) + ' dB';
   const fmtDbN = (n) => (n === null || n === undefined ? '—' : fmtDb(n));
   const fmtLufs = (n) => (n === null || n === undefined ? '—' : Number(n).toFixed(1) + ' LUFS');
+  const fmtTp = (n) => (n === null || n === undefined ? '—' : (n >= 0 ? '+' : '−') + Math.abs(Number(n)).toFixed(1) + ' dBTP');
   const clone = (o) => JSON.parse(JSON.stringify(o));
   const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   const ALL = ['audio', 'video'];
@@ -30,7 +31,7 @@
   };
   const METHOD_LABEL = {
     volume: 'lossless gain', mp3gain: 'gain only (mp3gain)', aacgain: 'gain only (aacgain)',
-    reencode: 're-encode, same bitrate',
+    reencode: 're-encode, same bitrate', loudnorm: 'true-peak limiter',
   };
   const MODE_LABEL = { off: 'Off', bulk: 'Bulk', force: 'Force', auto: 'Automatic' };
   const MODE_SHORT = {
@@ -52,8 +53,8 @@
       silenceMinDuration: 5.0, silenceFadeOut: 0.5, silenceFadeIn: 0.5,
       coverAuto: false, coverSources: 'both', discogsToken: '', useLocalCover: true,
     },
-    audio: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
-    video: { target: -16, truePeak: -1, hysteresis: 0.5, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
+    audio: { target: -16, truePeak: -1, peakLimiter: false, hysteresis: 0.5, threshold: 6, override: false, lossy: 'gain', writeMode: 'inplace', outputDir: '/data/normalized-audio' },
+    video: { target: -16, truePeak: -1, peakLimiter: false, hysteresis: 0.5, threshold: 6, override: false, writeMode: 'inplace', outputDir: '/data/normalized-video' },
   };
 
   /* ----------------------------------------------------------------- theme */
@@ -2063,6 +2064,9 @@
         + (d.types[t] ? ' checked' : '') + (typesLocked ? ' disabled' : '') + '> ' + MEDIA[t].label + '</label>').join('')
       + (noTypes ? '<span class="warn-text">Select at least one type to start.</span>' : '')
       + '</div>'
+      + (d.status === 'waiting_window'
+        ? '<div class="notice">Schedule window is currently closed: files are queued, and normalization will begin during active hours on the <a class="inline-link" href="#/schedule">Schedule</a> tab — or open <a class="inline-link" href="#/directories">Directories</a> and click <strong>Execute</strong> to normalize immediately.</div>'
+        : '')
       + (d.dry_run ? '<div class="notice info">Dry run is on: files are checked, nothing is written.</div>' : '')
       + '</section>';
   }
@@ -2138,18 +2142,29 @@
       html += '<div class="measure is-busy"><span class="working" aria-hidden="true"></span>'
         + '<span>Measuring <strong>' + esc(m.name) + '</strong> … (integrated loudness, EBU R128, file not changed)</span></div>';
     } else if (m) {
+      const cfgM = state.settings[t] || {};
       const v = baselineValue(m.lufs);
-      const chg = m.gain_db !== undefined ? m.gain_db : round1(target - m.lufs);
+      const rawChg = m.raw_gain_db !== undefined ? m.raw_gain_db : round1(target - m.lufs);
+      const chg = m.gain_db !== undefined ? m.gain_db : rawChg;
       const emp = m.silent_sections ? m.silent_sections + ' (' + Number(m.silent_duration || 0).toFixed(1) + ' s)' : 'none';
       html += '<div class="measure">'
         + '<div><div class="stat-label">Checked file</div><strong>' + esc(m.name) + '</strong></div>'
         + '<div><div class="stat-label">Integrated loudness</div><strong>' + m.lufs.toFixed(1) + ' LUFS</strong></div>'
         + '<div><div class="stat-label">True peak</div><strong>' + Number(m.tp).toFixed(1) + ' dBTP</strong></div>'
-        + '<div><div class="stat-label">Change needed at target ' + Number(target).toFixed(1) + '</div><strong>' + fmtDb(round1(chg)) + '</strong></div>'
+        + '<div><div class="stat-label">Change applied at target ' + Number(target).toFixed(1) + '</div><strong>' + fmtDb(round1(chg)) + '</strong></div>'
         + '<div><div class="stat-label">Empty sections</div><strong>' + esc(emp) + '</strong></div>'
         + '<span class="grow"></span>'
         + '<button class="btn btn-primary" data-action="use-baseline">Use ' + v.toFixed(1) + ' LUFS as target' + (v !== Math.round(m.lufs * 2) / 2 ? ' (slider limit)' : '') + '</button>'
         + '<button class="btn" data-action="measure-close">Dismiss</button></div>';
+      if (m.peak_capped) {
+        html += '<div class="notice">'
+          + '<strong>Linear gain blocked by True-peak ceiling (' + Number(cfgM.truePeak ?? -1).toFixed(1) + ' dBTP):</strong> '
+          + 'Reaching ' + Number(target).toFixed(1) + ' LUFS from ' + m.lufs.toFixed(1) + ' LUFS needs <strong>' + fmtDb(round1(rawChg)) + '</strong>, '
+          + 'which would push this file\'s true peak (' + Number(m.tp).toFixed(1) + ' dBTP) above ' + Number(cfgM.truePeak ?? -1).toFixed(1) + ' dBTP. '
+          + 'To normalize this file to ' + Number(target).toFixed(1) + ' LUFS, raise <strong>True-peak ceiling</strong> (e.g. −1.0 dBTP) or enable '
+          + '<strong>Use true-peak limiter</strong> in <a class="inline-link" href="#/settings">Settings → Level</a>.'
+          + '</div>';
+      }
     }
     return html;
   }
@@ -2285,13 +2300,27 @@
       const check = checking
         ? '<span class="row-busy"><span class="working" aria-hidden="true"></span>Checking…</span>'
         : '<button class="btn btn-sm" data-action="check-level" data-idx="' + i + '">Check level</button>';
+      const cfgM = (state.settings && state.settings[t]) || {};
+      const rawNeed = (f.lufs !== null && f.lufs !== undefined && cfgM.target !== undefined) ? (cfgM.target - f.lufs) : null;
+      const room = (f.true_peak !== null && f.true_peak !== undefined && cfgM.truePeak !== undefined) ? (cfgM.truePeak - f.true_peak) : null;
+      const isPeakCapped = rawNeed !== null && room !== null && !cfgM.peakLimiter
+        && rawNeed > (cfgM.hysteresis ?? 0.5) && room < rawNeed - 0.05 && f.status !== 'changed';
+      const capBadge = isPeakCapped
+        ? ' <span class="cover-override-tag" title="' + esc(
+          'Needs ' + fmtDb(round1(rawNeed)) + ' to reach ' + Number(cfgM.target).toFixed(1) + ' LUFS, '
+          + 'but true peak (' + Number(f.true_peak).toFixed(1) + ' dBTP) hits the '
+          + Number(cfgM.truePeak).toFixed(1) + ' dBTP True-peak ceiling (max linear gain '
+          + fmtDb(round1(Math.max(0, room))) + '). Enable True-peak limiter or raise True-peak ceiling in Settings.'
+        ) + '">peak cap</span>'
+        : '';
       const cls = [checking ? 'is-busy-row' : playing ? 'is-playing-row' : '', on ? 'row-sel' : ''].filter(Boolean).join(' ');
       return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>'
         + '<td class="pick"><input type="checkbox" data-file-check="' + f.id + '" aria-label="Select ' + esc(f.name) + '"' + (on ? ' checked' : '') + '></td>'
         + '<td class="file-cell">' + esc(f.name) + '</td><td class="mono">' + esc(ext) + '</td>'
         + (t === 'audio' ? '<td class="cover-cell">' + coverLabel(f, i) + '</td>' : '')
         + '<td class="num">' + fmtLufs(f.lufs) + '</td>'
-        + '<td class="num">' + fmtDbN(f.gain_db) + '</td>'
+        + '<td class="num">' + fmtTp(f.true_peak) + '</td>'
+        + '<td class="num">' + fmtDbN(f.gain_db) + capBadge + '</td>'
         + '<td>' + emptyLabel(f) + '</td>'
         + '<td>' + esc(METHOD_LABEL[f.method] || f.method || '—') + '</td>'
         + '<td>' + statusLabel(f.status) + '</td>'
@@ -2306,6 +2335,8 @@
         : '')
       + '<th class="num">Level'
       + tip('Integrated loudness of the whole file (EBU R128), measured without changing the file. Check level measures one file again.')
+      + '</th><th class="num">Peak'
+      + tip('Measured maximum inter-sample True Peak (dBTP). Linear gain cannot boost a file past the True-peak ceiling unless True-peak limiter is enabled in Settings.')
       + '</th><th class="num">Change</th><th>Empty'
       + tip('Long silent ("no sound") sections detected in the file based on the thresholds in Settings.')
       + '</th><th>Method</th><th>Status</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
@@ -2694,6 +2725,9 @@
       + tip('Prevents distortion (clipping) when boosting quiet files. Higher numbers (closer to 0, such as −1.0 dBTP) allow louder peaks so quiet music can be turned up further; lower numbers (more negative, such as −6.0 dBTP) leave more headroom and keep boosted files quieter.') + '</label>'
       + '<div class="slider-row"><input id="tp-' + t + '" type="range" min="-6" max="-1" step="0.1" value="' + cfg.truePeak + '" data-scope="' + t + '" data-setting="truePeak">'
       + '<div class="val"><span data-out="' + t + '.truePeak">' + Number(cfg.truePeak).toFixed(1) + '</span> dBTP</div></div>'
+      + '<label class="check" style="margin-top:8px;padding-bottom:0"><input class="switch" type="checkbox" data-scope="' + t + '" data-setting="peakLimiter"' + (cfg.peakLimiter ? ' checked' : '') + '>'
+      + '<span><strong>Use true-peak limiter when needed to reach target loudness</strong>'
+      + tip('When off (default), pure linear gain stops as soon as a file\'s highest transient hits the True-peak ceiling — so dynamic tracks (e.g. −19.6 LUFS with peaks near −1 dBTP under a −3.0 dBTP ceiling) stay quiet. When on, two-pass EBU R128 loudness normalization gently limits only those peaks (re-encoding the audio stream) so the file reaches the target loudness without exceeding the True-peak ceiling.') + '</span></label>'
       + '</div>'
       + '<div class="field"><label class="lbl" for="hys-' + t + '">Hysteresis (no-change bandwidth)'
       + tip('If a file\'s loudness is already within ± this bandwidth around the target, its audio level is not changed. Higher numbers (up to 6.0 dB) leave files that are already fairly close to the target untouched; lower numbers (down to 0.0 dB) adjust even small volume differences so files match the target more tightly.') + '</label>'
@@ -4444,6 +4478,9 @@
       try {
         await api('/run/' + action, { method: 'POST' });
         await refreshDash();
+        if (action === 'start' && state.dash && state.dash.status === 'waiting_window') {
+          toast('Queued: Schedule window is currently closed (check Schedule tab, or use Execute in Directories)');
+        }
         if (action === 'start' || (state.dash && state.dash.status === 'running')) {
           watchApprovedWork();
         }
@@ -4648,8 +4685,13 @@
         state.measure = {
           media: t, relpath: f.relpath, name: r.name, state: 'done',
           lufs: r.lufs, tp: r.true_peak, gain_db: r.gain_db,
+          raw_gain_db: r.raw_gain_db, peak_capped: !!r.peak_capped,
           silent_sections: r.silent_sections, silent_duration: r.silent_duration,
         };
+        if (r.peak_capped) {
+          toast('Gain capped at ' + fmtDb(round1(r.gain_db)) + ' by True-peak ceiling ('
+                + Number(r.true_peak).toFixed(1) + ' dBTP peak)');
+        }
       } catch (err) {
         state.measure = null;
         toast(err.message);
@@ -4689,7 +4731,8 @@
       render();
       try {
         const r = await api('/files/execute-batch', { method: 'POST', body: { media: t, ids: ids, dir: b.rel } });
-        toast('Executed ' + r.executed + ' file' + (r.executed === 1 ? '' : 's') + ' (' + r.changed + ' changed)');
+        toast('Executed ' + r.executed + ' file' + (r.executed === 1 ? '' : 's') + ' (' + r.changed + ' changed)'
+              + (r.note ? ' — ' + r.note : ''));
         await refreshDash();
       } catch (err) {
         toast(err.message);

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import array
+import json
 import math
 import os
 import re
@@ -104,6 +105,7 @@ class Probe:
     duration: float | None     # seconds
     audio_streams: int
     video_streams: int         # real video streams (cover art not counted)
+    sample_rate: int | None = None
 
 
 _AUDIO = re.compile(r"Stream #\d+:\d+.*?: Audio: ([A-Za-z0-9_]+)")
@@ -116,12 +118,14 @@ def _parse_probe(err: str) -> Probe:
     lines = head.splitlines()
     audio = [ln for ln in lines if re.search(r"Stream #\d+:\d+.*: Audio:", ln)]
     video = [ln for ln in lines if re.search(r"Stream #\d+:\d+.*: Video:", ln) and "attached pic" not in ln]
-    codec = kbps = fmt = None
+    codec = kbps = fmt = sr = None
     if audio:
         first = audio[0]
         codec = _AUDIO.search(first).group(1)
         m = re.search(r"(\d+) kb/s", first)
         kbps = int(m.group(1)) if m else None
+        m_sr = re.search(r"(\d+)\s*Hz", first)
+        sr = int(m_sr.group(1)) if m_sr else None
         fmt = next((t.strip() for t in first.split(", ") if _FMT.match(t.strip())), None)
         fmt = _FMT.match(fmt).group(1) if fmt else None
     dur = None
@@ -130,7 +134,7 @@ def _parse_probe(err: str) -> Probe:
         dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
     if not audio:
         raise ToolError("no audio stream found")
-    return Probe(codec, kbps, fmt, dur, len(audio), len(video))
+    return Probe(codec, kbps, fmt, dur, len(audio), len(video), sr)
 
 
 def probe(ffmpeg: str, path: str, cancel: Cancel = None) -> Probe:
@@ -415,38 +419,83 @@ def temp_path(path: str) -> str:
     return os.path.join(folder, f".{stem}.nrm-tmp{'.' + ext if ext else ''}")
 
 
+_LOUDNORM_JSON = re.compile(r"\{\s*\"input_i\".*?\}", re.S)
+
+
+def _trim_filter_parts(kept: list[tuple[float, float, bool, bool]],
+                       fade_in: float, fade_out: float) -> tuple[list[str], str]:
+    parts: list[str] = []
+    for idx, (s, e, cut_before, cut_after) in enumerate(kept):
+        seg_len = max(0.01, e - s)
+        chain = [f"atrim=start={s:.3f}:end={e:.3f}", "asetpts=PTS-STARTPTS"]
+        fi = min(max(0.0, float(fade_in)), seg_len * 0.5 if cut_after and fade_out > 0 else seg_len) if cut_before else 0.0
+        fo = min(max(0.0, float(fade_out)), seg_len * 0.5 if cut_before and fade_in > 0 else seg_len) if cut_after else 0.0
+        if fi >= 0.01:
+            chain.append(f"afade=t=in:st=0:d={fi:.3f}")
+        if fo >= 0.01:
+            chain.append(f"afade=t=out:st={max(0.0, seg_len - fo):.3f}:d={fo:.3f}")
+        parts.append(f"[0:a:0]{','.join(chain)}[s{idx}]")
+    if len(kept) == 1:
+        return parts, "[s0]"
+    inputs = "".join(f"[s{i}]" for i in range(len(kept)))
+    parts.append(f"{inputs}concat=n={len(kept)}:v=0:a=1[cat]")
+    return parts, "[cat]"
+
+
+def _measure_loudnorm_stats(ffmpeg: str, src: str, *, target: float, eff_tp: float,
+                            kept: list[tuple[float, float, bool, bool]],
+                            fade_in: float, fade_out: float,
+                            cancel: Cancel = None) -> dict | None:
+    ln_base = f"loudnorm=I={target:.2f}:TP={eff_tp:.2f}:LRA=20:print_format=json"
+    if kept:
+        parts, label = _trim_filter_parts(kept, fade_in, fade_out)
+        parts.append(f"{label}{ln_base}[ln]")
+        cmd = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-i", src,
+               "-filter_complex", ";".join(parts), "-map", "[ln]", "-f", "null", "-"]
+    else:
+        cmd = [ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-i", src,
+               "-map", "0:a:0", "-af", ln_base, "-f", "null", "-"]
+    rc, err = run_tool(cmd, cancel)
+    if rc != 0:
+        return None
+    matches = _LOUDNORM_JSON.findall(err)
+    if not matches:
+        return None
+    try:
+        data = json.loads(matches[-1])
+        if "-inf" in (str(data.get("input_i", "")), str(data.get("input_thresh", ""))):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+_AUDIO_NO_MUX_PIC = frozenset({"wav", "ogg", "opus", "wma"})
+
+
 def transcode_args(src: str, dst: str, *, ext: str, probe_: Probe, family: str, method: str,
                    gain: float, kbps: int | None, cuts: list[tuple[float, float]] | None = None,
-                   fade_in: float = 0.0, fade_out: float = 0.0) -> list[str]:
-    """ffmpeg command: audio gain (volume filter) and optional silence removal; video/subtitles copied."""
+                   fade_in: float = 0.0, fade_out: float = 0.0,
+                   loudnorm_filter: str | None = None,
+                   include_video: bool = True) -> list[str]:
+    """ffmpeg command: audio gain (volume or EBU R128 loudnorm) and optional silence removal; video/subtitles copied."""
     kept = kept_segments(probe_.duration or 0.0, cuts) if cuts and probe_.duration else []
+    audio_filter = loudnorm_filter if method == "loudnorm" and loudnorm_filter else f"volume={gain:.2f}dB"
     if kept and cuts:
-        parts: list[str] = []
-        for idx, (s, e, cut_before, cut_after) in enumerate(kept):
-            seg_len = max(0.01, e - s)
-            chain = [f"atrim=start={s:.3f}:end={e:.3f}", "asetpts=PTS-STARTPTS"]
-            fi = min(max(0.0, float(fade_in)), seg_len * 0.5 if cut_after and fade_out > 0 else seg_len) if cut_before else 0.0
-            fo = min(max(0.0, float(fade_out)), seg_len * 0.5 if cut_before and fade_in > 0 else seg_len) if cut_after else 0.0
-            if fi >= 0.01:
-                chain.append(f"afade=t=in:st=0:d={fi:.3f}")
-            if fo >= 0.01:
-                chain.append(f"afade=t=out:st={max(0.0, seg_len - fo):.3f}:d={fo:.3f}")
-            parts.append(f"[0:a:0]{','.join(chain)}[s{idx}]")
-        if len(kept) == 1:
-            label = "[s0]"
-        else:
-            inputs = "".join(f"[s{i}]" for i in range(len(kept)))
-            parts.append(f"{inputs}concat=n={len(kept)}:v=0:a=1[cat]")
-            label = "[cat]"
-        if abs(gain) >= 0.05:
-            parts.append(f"{label}volume={gain:.2f}dB[out]")
+        parts, label = _trim_filter_parts(kept, fade_in, fade_out)
+        if method == "loudnorm" or abs(gain) >= 0.05:
+            parts.append(f"{label}{audio_filter}[out]")
             label = "[out]"
         args = ["-filter_complex", ";".join(parts), "-map", label, "-map_metadata", "0", "-map_chapters", "-1"]
     else:
-        args = ["-map", "0:a", "-map", "0:v?", "-c:v", "copy", "-map_metadata", "0"]
+        copy_vid = include_video and (probe_.video_streams > 0 or ext.lower() not in _AUDIO_NO_MUX_PIC)
+        args = ["-map", "0:a"]
+        if copy_vid:
+            args += ["-map", "0:v?", "-c:v", "copy"]
+        args += ["-map_metadata", "0"]
         if ext == "mkv":
             args += ["-map", "0:s?", "-c:s", "copy"]
-    if method == "volume":
+    if method == "volume" or (method == "loudnorm" and family == "lossless"):
         codec = probe_.codec
         args += ["-c:a", codec]
         if codec == "flac":
@@ -455,17 +504,49 @@ def transcode_args(src: str, dst: str, *, ext: str, probe_: Probe, family: str, 
         bitrate = kbps or DEFAULT_KBPS.get(family, 192)
         args += ["-c:a", ENCODER[family], "-b:a", f"{bitrate}k"]
     if not (kept and cuts):
-        args += ["-af", f"volume={gain:.2f}dB"]
+        args += ["-af", audio_filter]
     return ["-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src, *args, dst]
 
 
 def transcode(ffmpeg: str, src: str, dst: str, *, ext: str, probe_: Probe, family: str, method: str,
               gain: float, kbps: int | None, cancel: Cancel = None,
               cuts: list[tuple[float, float]] | None = None,
-              fade_in: float = 0.0, fade_out: float = 0.0) -> None:
+              fade_in: float = 0.0, fade_out: float = 0.0,
+              target_lufs: float | None = None,
+              true_peak_ceiling: float | None = None) -> None:
+    loudnorm_filter: str | None = None
+    kept = kept_segments(probe_.duration or 0.0, cuts) if cuts and probe_.duration else []
+    if method == "loudnorm":
+        eff_target = float(target_lufs if target_lufs is not None else -14.0)
+        ceil = float(true_peak_ceiling if true_peak_ceiling is not None else -1.0)
+        eff_tp = max(-9.0, ceil - 0.35)
+        lim_lin = 10.0 ** (max(-12.0, ceil - 0.2) / 20.0)
+        sr = probe_.sample_rate or 44100
+        ln_stats = _measure_loudnorm_stats(
+            ffmpeg, src, target=eff_target, eff_tp=eff_tp,
+            kept=kept if (kept and cuts) else [],
+            fade_in=fade_in, fade_out=fade_out, cancel=cancel,
+        )
+        if ln_stats:
+            ln_core = (
+                f"loudnorm=I={eff_target:.2f}:TP={eff_tp:.2f}:LRA=20:"
+                f"measured_I={ln_stats['input_i']}:measured_TP={ln_stats['input_tp']}:"
+                f"measured_LRA={ln_stats['input_lra']}:measured_thresh={ln_stats['input_thresh']}:"
+                f"offset={ln_stats['target_offset']}:linear=true"
+            )
+        else:
+            ln_core = f"loudnorm=I={eff_target:.2f}:TP={eff_tp:.2f}:LRA=20"
+        loudnorm_filter = f"{ln_core},aresample={sr},alimiter=limit={lim_lin:.6f}:level=false"
     cmd = [ffmpeg, *transcode_args(src, dst, ext=ext, probe_=probe_, family=family, method=method,
-                                   gain=gain, kbps=kbps, cuts=cuts, fade_in=fade_in, fade_out=fade_out)]
+                                   gain=gain, kbps=kbps, cuts=cuts, fade_in=fade_in, fade_out=fade_out,
+                                   loudnorm_filter=loudnorm_filter, include_video=True)]
     rc, err = run_tool(cmd, cancel)
+    if rc != 0 and probe_.video_streams == 0 and not (kept and cuts):
+        # Retry audio-only if an embedded cover picture stream had corrupt container/header data
+        cmd_audio = [ffmpeg, *transcode_args(src, dst, ext=ext, probe_=probe_, family=family, method=method,
+                                             gain=gain, kbps=kbps, cuts=cuts, fade_in=fade_in, fade_out=fade_out,
+                                             loudnorm_filter=loudnorm_filter, include_video=False)]
+        rc, err = run_tool(cmd_audio, cancel)
     if rc != 0:
         raise ToolError("encoding failed: " + _tail(err))
 
@@ -533,13 +614,31 @@ def edit(ffmpeg: str, src: str, dst: str, *, probe_: Probe, duration: float,
         raise ToolError("editing failed: " + _tail(err))
 
 
+_COVER_CODEC_ERR = re.compile(
+    r"^\[(?:"
+    r"(?:mjpeg|png|webp|bmp|gif|tiff|ljpeg|jpegls|jpeg2000|ppm|pgm|pbm|swscaler)"
+    r"|vist#\d+:\d+/(?:mjpeg|png|webp|bmp|gif|tiff|ljpeg|jpegls|jpeg2000|ppm|pgm|pbm)"
+    r")\s*@[^\]]+\]",
+    re.I,
+)
+
+
+def _audio_verify_errors(err: str) -> str:
+    """Ignore non-fatal FFmpeg probe complaints from embedded cover-art images (e.g. MJPEG APP/EXIF)."""
+    return "\n".join(
+        ln for ln in err.splitlines()
+        if ln.strip() and not _COVER_CODEC_ERR.match(ln.strip())
+    )
+
+
 def verify_edit(ffmpeg: str, path: str, source: Probe, expected_duration: float,
                 cancel: Cancel = None) -> None:
     """The edited file must decode without errors and have the length the edit asks for."""
     rc, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
                         "-map", "0:a", "-f", "null", "-"], cancel)
-    if rc != 0 or err.strip():
-        raise ToolError("verification failed: " + _tail(err))
+    audio_err = _audio_verify_errors(err)
+    if rc != 0 or audio_err:
+        raise ToolError("verification failed: " + _tail(audio_err or err))
     out = probe(ffmpeg, path, cancel)
     if out.audio_streams != 1:
         raise ToolError("verification failed: audio stream count changed")
@@ -555,8 +654,9 @@ def verify(ffmpeg: str, path: str, source: Probe, cancel: Cancel = None,
     """The new file must decode without errors and match the expected length and streams."""
     rc, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
                         "-map", "0:a", "-f", "null", "-"], cancel)
-    if rc != 0 or err.strip():
-        raise ToolError("verification failed: " + _tail(err))
+    audio_err = _audio_verify_errors(err)
+    if rc != 0 or audio_err:
+        raise ToolError("verification failed: " + _tail(audio_err or err))
     out = probe(ffmpeg, path, cancel)
     if expected_duration is None and out.audio_streams != source.audio_streams:
         raise ToolError("verification failed: audio stream count changed")

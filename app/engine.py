@@ -721,10 +721,11 @@ class Engine:
                 (lufs, true_peak, now_ts, probe.codec, family, fid))
             return
         strategy = cfg_m.get("lossy", "reencode") if media == "audio" else "reencode"
+        hyst = cfg_m.get("hysteresis", 0.5)
         d = decide(media=media, ext=row["ext"], family=family, measured=lufs, true_peak=true_peak,
                    target=cfg_m["target"], ceiling=cfg_m["truePeak"], threshold=cfg_m["threshold"],
                    override=cfg_m["override"], strategy=strategy, tools=self.tools,
-                   hysteresis=cfg_m.get("hysteresis", 0.5))
+                   hysteresis=hyst, peak_limiter=bool(cfg_m.get("peakLimiter", False)))
         if d.action == "error":
             raise ff.ToolError(f"unsupported audio codec '{probe.codec}'")
         all_cuts = raw_cuts if d.action != "skip" else []
@@ -746,6 +747,15 @@ class Engine:
                                 f" ({d.gain:+.1f} dB{extra})", media)
             return
         if d.action == "ok":
+            raw_gain = round(cfg_m["target"] - lufs, 2)
+            if d.capped and raw_gain > hyst:
+                self.db.log(
+                    "warn",
+                    f"{row['name']}: {lufs:.1f} LUFS needs {raw_gain:+.1f} dB for {cfg_m['target']:.1f} LUFS, "
+                    f"but true peak {true_peak:.1f} dBTP hits ceiling {cfg_m['truePeak']:.1f} dBTP "
+                    f"(allowed {d.gain:+.1f} dB)",
+                    media,
+                )
             if cuts:
                 eff_method = "volume" if family == "lossless" else "reencode"
                 self._apply(row, cfg_m, st, eff_method, 0.0, probe, family, cancel, cuts=cuts)
@@ -794,21 +804,27 @@ class Engine:
         cfg_m = st[media]
         if row["gain_db"] is None:
             raise ff.ToolError("no gain stored for this file; check it again")
-        gain = round(row["gain_db"] + (row["adjust_db"] or 0.0), 2)
+        eff_method = row["method"] or "reencode"
+        adjust = float(row["adjust_db"] or 0.0)
+        gain = round(row["gain_db"] + adjust, 2)
         src = self.abs_path(media, row["relpath"])
         probe = ff.probe(self.cfg.ffmpeg, src, cancel)
         family = row["family"] or audio_family(probe.codec)
-        room = cfg_m["truePeak"] - row["true_peak"] if row["true_peak"] is not None else None
-        if gain > 0 and room is not None and gain > room:
-            gain = round(max(0.0, room), 2)
-            self.db.log("warn", f"{row['name']}: gain limited to keep the true peak under {cfg_m['truePeak']:.1f} dBTP",
-                        media)
+        target_override = round(cfg_m["target"] + adjust, 2) if eff_method == "loudnorm" else None
+        if eff_method != "loudnorm":
+            room = cfg_m["truePeak"] - row["true_peak"] if row["true_peak"] is not None else None
+            if gain > 0 and room is not None and gain > room:
+                gain = round(max(0.0, room), 2)
+                self.db.log("warn", f"{row['name']}: gain limited to keep the true peak under {cfg_m['truePeak']:.1f} dBTP",
+                            media)
         cuts = self._silent_cuts(media, src, row["lufs"] if row["lufs"] is not None else -16.0,
                                  probe, st["general"], cancel)
-        self._apply(row, cfg_m, st, row["method"] or "reencode", gain, probe, family, cancel, cuts=cuts)
+        self._apply(row, cfg_m, st, eff_method, gain, probe, family, cancel, cuts=cuts,
+                    target_override=target_override)
 
     def _apply(self, row, cfg_m, st, method, gain, probe, family, cancel,
-               cuts: list[tuple[float, float]] | None = None) -> None:
+               cuts: list[tuple[float, float]] | None = None,
+               target_override: float | None = None) -> None:
         media, fid, rel, name, ext = row["media"], row["id"], row["relpath"], row["name"], row["ext"]
         kept = ff.kept_segments(probe.duration or 0.0, cuts) if cuts and probe.duration else []
         has_cuts = bool(kept and cuts)
@@ -833,17 +849,25 @@ class Engine:
                 steps = math.floor(gain / 1.5) if gain > 0 else round(gain / 1.5)
                 if steps == 0:
                     self.db.execute("UPDATE files SET status = 'ok', gain_db = ? WHERE id = ?", (gain, fid))
+                    self.db.log(
+                        "warn",
+                        f"{name}: allowed gain {gain:+.1f} dB is smaller than one 1.5 dB {method} step; unchanged",
+                        media,
+                    )
                     return
                 applied = round(steps * 1.5, 2)
                 shutil.copy2(src, tmp)
                 ff.gain_tool(getattr(self.cfg, method), tmp, steps, cancel)
             else:
                 kbps = probe.kbps or DEFAULT_KBPS.get(family, 192)
+                eff_target = target_override if target_override is not None else cfg_m["target"]
                 ff.transcode(self.cfg.ffmpeg, src, tmp, ext=ext, probe_=probe, family=family,
                              method=method, gain=applied, kbps=kbps, cancel=cancel,
                              cuts=cuts if has_cuts else None,
                              fade_in=gen.get("silenceFadeIn", 0.5),
-                             fade_out=gen.get("silenceFadeOut", 0.5))
+                             fade_out=gen.get("silenceFadeOut", 0.5),
+                             target_lufs=eff_target,
+                             true_peak_ceiling=cfg_m["truePeak"])
             expected_dur = sum(e - s for s, e, _, _ in kept) if has_cuts else None
             ff.verify(self.cfg.ffmpeg, tmp, probe, cancel, expected_duration=expected_dur)
             self._commit(src, tmp, final, media, rel, mode, st["general"]["preserveMtime"])
@@ -1021,18 +1045,22 @@ class Engine:
             family = audio_family(probe.codec)
             ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
             strategy = cfg_m.get("lossy", "reencode") if media == "audio" else "reencode"
+            hyst = cfg_m.get("hysteresis", 0.5)
             d = decide(media=media, ext=ext, family=family, measured=lufs, true_peak=true_peak,
                        target=cfg_m["target"], ceiling=cfg_m["truePeak"], threshold=cfg_m["threshold"],
                        override=cfg_m["override"], strategy=strategy, tools=self.tools,
-                       hysteresis=cfg_m.get("hysteresis", 0.5))
+                       hysteresis=hyst, peak_limiter=bool(cfg_m.get("peakLimiter", False)))
+            raw_gain_db = round(cfg_m["target"] - lufs, 2)
             gain_db = 0.0 if d.action == "ok" else d.gain
+            peak_capped = bool(d.capped and d.method != "loudnorm" and raw_gain_db > hyst)
             sil_count = len(cuts)
             sil_dur = round(sum(ce - cs for cs, ce in cuts), 2)
             self.db.execute(
-                "UPDATE files SET lufs = ?, true_peak = ?, gain_db = ?, method = ?, "
+                "UPDATE files SET lufs = ?, true_peak = ?, gain_db = ?, "
+                "method = CASE WHEN status = 'changed' AND ? = 'ok' THEN COALESCE(method, ?) ELSE ? END, "
                 "silent_sections = ?, silent_duration = ?, measured_at = ?, codec = ?, family = ? "
                 "WHERE media = ? AND relpath = ? AND status != 'processing'",
-                (lufs, true_peak, gain_db, d.method, sil_count, sil_dur, time.time(),
+                (lufs, true_peak, gain_db, d.action, d.method, d.method, sil_count, sil_dur, time.time(),
                  probe.codec, family, media, rel),
             )
             if media == "audio":
@@ -1042,12 +1070,18 @@ class Engine:
                         self.check_file_cover(row, st, online=True)
                     else:
                         self.inspect_file_cover(row)
+            cap_note = (
+                f", linear gain capped from {raw_gain_db:+.1f} dB to {d.gain:+.1f} dB by {cfg_m['truePeak']:.1f} dBTP ceiling"
+                if peak_capped else ""
+            )
             self.db.log("info", f"Level checked: {name} {lufs:.1f} LUFS, true peak {true_peak:.1f} dBTP"
+                                + cap_note
                                 + (f", {sil_count} empty section(s) ({sil_dur:.1f} s)" if sil_count else ""), media)
             if standalone:
                 self._set_action_progress("measure_one", "Checking level", 1, 1, rel)
             return {"name": name, "relpath": rel, "lufs": lufs, "true_peak": true_peak,
-                    "gain_db": gain_db, "silent_sections": sil_count, "silent_duration": sil_dur,
+                    "gain_db": gain_db, "raw_gain_db": raw_gain_db, "peak_capped": peak_capped,
+                    "silent_sections": sil_count, "silent_duration": sil_dur,
                     "codec": probe.codec}
         finally:
             if standalone:
@@ -1107,6 +1141,8 @@ class Engine:
         cancel = self._new_cancel()
         rows = self._target_rows(media, ids, dir_rel)
         total = max(1, len(rows))
+        st = state.get_settings(self.db)
+        dry_run = bool(st["general"].get("dryRun"))
         self._set_action_progress("execute_files", "Executing normalization", 0, total, "")
         executed = 0
         changed = 0
@@ -1128,8 +1164,16 @@ class Engine:
                 if cancel():
                     stopped = True
                     break
+                after = self.db.one("SELECT status, gain_db FROM files WHERE id = ?", (fid,))
+                # Explicit Execute in Directories approves newly parked files directly in 1 click
+                if after and after["status"] == "parked" and after["gain_db"] is not None and not dry_run:
+                    self.db.execute("UPDATE files SET status = 'approved' WHERE id = ?", (fid,))
+                    self._process(fid, extra_cancel=cancel)
+                    if cancel():
+                        stopped = True
+                        break
+                    after = self.db.one("SELECT status, gain_db FROM files WHERE id = ?", (fid,))
                 executed += 1
-                after = self.db.one("SELECT status FROM files WHERE id = ?", (fid,))
                 if after and after["status"] == "changed":
                     changed += 1
                 self._set_action_progress("execute_files", "Executing normalization", idx + 1, total, r["relpath"])

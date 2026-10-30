@@ -749,5 +749,109 @@ def test_normalization_run_saves_check_results_for_files_pane(lib):
     assert r_chg["gain_db"] is not None and r_chg["method"] == "volume"
 
 
+def test_dynamic_track_minus_19_6_lufs_with_minus_3_ceiling_and_peak_limiter(lib):
+    cfg, engine, db = lib
+    # Dynamic signal (~ -19.6 LUFS integrated, ~ -0.1..-0.5 dBTP true peak)
+    expr = "aevalsrc=0.148*sin(2*PI*440*t)+0.84*sin(2*PI*1000*t)*lt(mod(t\\,2.0)\\,0.03):d=8:s=44100"
+    make(os.path.join(cfg.audio_root, "dyn.mp3"), "-f", "lavfi", "-i", expr, "-c:a", "libmp3lame", "-b:a", "192k")
+    make(os.path.join(cfg.audio_root, "dyn.flac"), "-f", "lavfi", "-i", expr, "-c:a", "flac")
+    state.put_settings(db, {
+        "audio": {"target": -14.0, "truePeak": -3.0, "hysteresis": 0.5, "threshold": 9.0, "peakLimiter": False},
+    })
+    engine.scan_now("audio")
+
+    # Without peak limiter, linear gain is blocked by -3.0 dBTP ceiling
+    m1 = engine.measure("audio", "dyn.mp3")
+    assert -20.5 <= m1["lufs"] <= -18.5
+    assert m1["peak_capped"] is True
+    assert m1["gain_db"] == 0.0
+    assert m1["raw_gain_db"] > 4.0
+    exe_capped = engine.execute_files("audio", ids=[row(db, "dyn.mp3")["id"]])
+    assert exe_capped == {"executed": 1, "changed": 0}
+
+    # Enabling peakLimiter normalizes both MP3 and FLAC to ~ -14.0 LUFS while respecting -3.0 dBTP ceiling
+    state.put_settings(db, {"audio": {"peakLimiter": True}})
+    exe_lim = engine.execute_files("audio", dir_rel=".")
+    assert exe_lim == {"executed": 2, "changed": 2}
+
+    for name in ("dyn.mp3", "dyn.flac"):
+        m2 = engine.measure("audio", name)
+        assert abs(m2["lufs"] - (-14.0)) <= 0.8, f"{name} lufs={m2['lufs']}"
+        assert m2["true_peak"] <= -2.9, f"{name} true_peak={m2['true_peak']}"
+        assert row(db, name)["method"] == "loudnorm"
+
+
+def test_execute_files_approves_newly_parked_files_in_one_click(lib):
+    cfg, engine, db = lib
+    # Large change (> threshold) would normally park during _check; explicit Execute applies it in 1 click
+    tone(os.path.join(cfg.audio_root, "quiet.flac"), -18, codec_args=("-c:a", "flac"))
+    set_settings(db, target=-14.0, truePeak=-1.0, threshold=2.0, override=False)
+    engine.scan_now("audio")
+
+    exe = engine.execute_files("audio", ids=[row(db, "quiet.flac")["id"]])
+    assert exe == {"executed": 1, "changed": 1}
+    assert row(db, "quiet.flac")["status"] == "changed"
+
+
+def test_embedded_mjpeg_bad_app_fields_does_not_fail_verification(lib, tmp_path):
+    from mutagen.flac import FLAC, Picture
+    from mutagen.id3 import APIC, ID3
+    from mutagen.wave import WAVE
+
+    cfg, engine, db = lib
+    jpg = str(tmp_path / "cover.jpg")
+    make(jpg, "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=0.1", "-frames:v", "1")
+    raw = open(jpg, "rb").read()
+    # Exact JPEG APP0 segment that makes FFmpeg emit:
+    # "[mjpeg @ ...] unable to decode APP fields: Invalid data found when processing input"
+    quirky_jpg = raw[:2] + b"\xff\xe0\xff\xffJFIF\x00" + raw[2:]
+
+    mp3 = tone(os.path.join(cfg.audio_root, "bad_app.mp3"), -8)
+    tags = ID3(mp3)
+    tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=quirky_jpg))
+    tags.save(mp3)
+
+    flac = tone(os.path.join(cfg.audio_root, "bad_app.flac"), -8, codec_args=("-c:a", "flac"))
+    fl = FLAC(flac)
+    pic = Picture()
+    pic.data = quirky_jpg
+    pic.type = 3
+    pic.mime = "image/jpeg"
+    fl.add_picture(pic)
+    fl.save()
+
+    # Broken/truncated APIC cover image + WAV with ID3 APIC cover image
+    broken_mp3 = tone(os.path.join(cfg.audio_root, "broken_apic.mp3"), -8)
+    btags = ID3(broken_mp3)
+    btags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=b"\xff\xd8\xff\xe0\x00\x10BROKEN"))
+    btags.save(broken_mp3)
+
+    wav = tone(os.path.join(cfg.audio_root, "cover.wav"), -8, codec_args=("-c:a", "pcm_s16le"))
+    w = WAVE(wav)
+    w.add_tags()
+    w.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=raw))
+    w.save()
+
+    set_settings(db, target=-14.0, truePeak=-1.0, threshold=12.0, lossy="reencode")
+    engine.scan_now("audio")
+    exe = engine.execute_files("audio", dir_rel=".")
+    assert exe == {"executed": 4, "changed": 4}
+    for name in ("bad_app.mp3", "bad_app.flac", "broken_apic.mp3", "cover.wav"):
+        assert row(db, name)["status"] == "changed", f"{name}: {row(db, name)}"
+
+    # Real audio stream corruption must still fail ff.verify
+    corrupt_mp3 = str(tmp_path / "corrupt_audio.mp3")
+    make(corrupt_mp3, "-f", "lavfi", "-i", "anoisesrc=d=2:c=pink:a=0.5", "-c:a", "libmp3lame")
+    pr = ff.probe(FFMPEG, corrupt_mp3)
+    data = bytearray(open(corrupt_mp3, "rb").read())
+    mid = len(data) // 2
+    data[mid:mid + 512] = b"\x00" * 512
+    open(corrupt_mp3, "wb").write(data)
+    with pytest.raises(ff.ToolError, match="verification failed"):
+        ff.verify(FFMPEG, corrupt_mp3, pr)
+
+
+
+
 
 

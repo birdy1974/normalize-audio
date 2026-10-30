@@ -20,11 +20,11 @@ DEFAULT_SETTINGS = {
         "coverAuto": False, "coverSources": "both", "discogsToken": "", "useLocalCover": True,
     },
     "audio": {
-        "target": -16.0, "truePeak": -1.0, "hysteresis": 0.5, "threshold": 6.0, "override": False,
+        "target": -16.0, "truePeak": -1.0, "peakLimiter": False, "hysteresis": 0.5, "threshold": 6.0, "override": False,
         "lossy": "gain", "writeMode": "inplace", "outputDir": "/data/normalized-audio",
     },
     "video": {
-        "target": -16.0, "truePeak": -1.0, "hysteresis": 0.5, "threshold": 6.0, "override": False,
+        "target": -16.0, "truePeak": -1.0, "peakLimiter": False, "hysteresis": 0.5, "threshold": 6.0, "override": False,
         "writeMode": "inplace", "outputDir": "/data/normalized-video",
     },
 }
@@ -88,7 +88,7 @@ def _validate(key: str, value):
         if not lo <= number <= hi:
             raise ValueError(f"{key} must be between {lo:g} and {hi:g}")
         return round(number, 1)
-    if key in ("override", "dryRun", "preserveMtime", "trimSilence", "coverAuto", "useLocalCover"):
+    if key in ("override", "dryRun", "preserveMtime", "trimSilence", "coverAuto", "useLocalCover", "peakLimiter"):
         return bool(value)
     if key == "coverSources":
         if value not in COVER_SOURCES:
