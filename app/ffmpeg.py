@@ -470,10 +470,14 @@ def _measure_loudnorm_stats(ffmpeg: str, src: str, *, target: float, eff_tp: flo
         return None
 
 
+_AUDIO_NO_MUX_PIC = frozenset({"wav", "ogg", "opus", "wma"})
+
+
 def transcode_args(src: str, dst: str, *, ext: str, probe_: Probe, family: str, method: str,
                    gain: float, kbps: int | None, cuts: list[tuple[float, float]] | None = None,
                    fade_in: float = 0.0, fade_out: float = 0.0,
-                   loudnorm_filter: str | None = None) -> list[str]:
+                   loudnorm_filter: str | None = None,
+                   include_video: bool = True) -> list[str]:
     """ffmpeg command: audio gain (volume or EBU R128 loudnorm) and optional silence removal; video/subtitles copied."""
     kept = kept_segments(probe_.duration or 0.0, cuts) if cuts and probe_.duration else []
     audio_filter = loudnorm_filter if method == "loudnorm" and loudnorm_filter else f"volume={gain:.2f}dB"
@@ -484,7 +488,11 @@ def transcode_args(src: str, dst: str, *, ext: str, probe_: Probe, family: str, 
             label = "[out]"
         args = ["-filter_complex", ";".join(parts), "-map", label, "-map_metadata", "0", "-map_chapters", "-1"]
     else:
-        args = ["-map", "0:a", "-map", "0:v?", "-c:v", "copy", "-map_metadata", "0"]
+        copy_vid = include_video and (probe_.video_streams > 0 or ext.lower() not in _AUDIO_NO_MUX_PIC)
+        args = ["-map", "0:a"]
+        if copy_vid:
+            args += ["-map", "0:v?", "-c:v", "copy"]
+        args += ["-map_metadata", "0"]
         if ext == "mkv":
             args += ["-map", "0:s?", "-c:s", "copy"]
     if method == "volume" or (method == "loudnorm" and family == "lossless"):
@@ -507,8 +515,8 @@ def transcode(ffmpeg: str, src: str, dst: str, *, ext: str, probe_: Probe, famil
               target_lufs: float | None = None,
               true_peak_ceiling: float | None = None) -> None:
     loudnorm_filter: str | None = None
+    kept = kept_segments(probe_.duration or 0.0, cuts) if cuts and probe_.duration else []
     if method == "loudnorm":
-        kept = kept_segments(probe_.duration or 0.0, cuts) if cuts and probe_.duration else []
         eff_target = float(target_lufs if target_lufs is not None else -14.0)
         ceil = float(true_peak_ceiling if true_peak_ceiling is not None else -1.0)
         eff_tp = max(-9.0, ceil - 0.35)
@@ -531,8 +539,14 @@ def transcode(ffmpeg: str, src: str, dst: str, *, ext: str, probe_: Probe, famil
         loudnorm_filter = f"{ln_core},aresample={sr},alimiter=limit={lim_lin:.6f}:level=false"
     cmd = [ffmpeg, *transcode_args(src, dst, ext=ext, probe_=probe_, family=family, method=method,
                                    gain=gain, kbps=kbps, cuts=cuts, fade_in=fade_in, fade_out=fade_out,
-                                   loudnorm_filter=loudnorm_filter)]
+                                   loudnorm_filter=loudnorm_filter, include_video=True)]
     rc, err = run_tool(cmd, cancel)
+    if rc != 0 and probe_.video_streams == 0 and not (kept and cuts):
+        # Retry audio-only if an embedded cover picture stream had corrupt container/header data
+        cmd_audio = [ffmpeg, *transcode_args(src, dst, ext=ext, probe_=probe_, family=family, method=method,
+                                             gain=gain, kbps=kbps, cuts=cuts, fade_in=fade_in, fade_out=fade_out,
+                                             loudnorm_filter=loudnorm_filter, include_video=False)]
+        rc, err = run_tool(cmd_audio, cancel)
     if rc != 0:
         raise ToolError("encoding failed: " + _tail(err))
 
@@ -600,13 +614,31 @@ def edit(ffmpeg: str, src: str, dst: str, *, probe_: Probe, duration: float,
         raise ToolError("editing failed: " + _tail(err))
 
 
+_COVER_CODEC_ERR = re.compile(
+    r"^\[(?:"
+    r"(?:mjpeg|png|webp|bmp|gif|tiff|ljpeg|jpegls|jpeg2000|ppm|pgm|pbm|swscaler)"
+    r"|vist#\d+:\d+/(?:mjpeg|png|webp|bmp|gif|tiff|ljpeg|jpegls|jpeg2000|ppm|pgm|pbm)"
+    r")\s*@[^\]]+\]",
+    re.I,
+)
+
+
+def _audio_verify_errors(err: str) -> str:
+    """Ignore non-fatal FFmpeg probe complaints from embedded cover-art images (e.g. MJPEG APP/EXIF)."""
+    return "\n".join(
+        ln for ln in err.splitlines()
+        if ln.strip() and not _COVER_CODEC_ERR.match(ln.strip())
+    )
+
+
 def verify_edit(ffmpeg: str, path: str, source: Probe, expected_duration: float,
                 cancel: Cancel = None) -> None:
     """The edited file must decode without errors and have the length the edit asks for."""
     rc, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
                         "-map", "0:a", "-f", "null", "-"], cancel)
-    if rc != 0 or err.strip():
-        raise ToolError("verification failed: " + _tail(err))
+    audio_err = _audio_verify_errors(err)
+    if rc != 0 or audio_err:
+        raise ToolError("verification failed: " + _tail(audio_err or err))
     out = probe(ffmpeg, path, cancel)
     if out.audio_streams != 1:
         raise ToolError("verification failed: audio stream count changed")
@@ -622,8 +654,9 @@ def verify(ffmpeg: str, path: str, source: Probe, cancel: Cancel = None,
     """The new file must decode without errors and match the expected length and streams."""
     rc, err = run_tool([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path,
                         "-map", "0:a", "-f", "null", "-"], cancel)
-    if rc != 0 or err.strip():
-        raise ToolError("verification failed: " + _tail(err))
+    audio_err = _audio_verify_errors(err)
+    if rc != 0 or audio_err:
+        raise ToolError("verification failed: " + _tail(audio_err or err))
     out = probe(ffmpeg, path, cancel)
     if expected_duration is None and out.audio_streams != source.audio_streams:
         raise ToolError("verification failed: audio stream count changed")

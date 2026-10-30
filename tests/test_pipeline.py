@@ -793,6 +793,65 @@ def test_execute_files_approves_newly_parked_files_in_one_click(lib):
     assert row(db, "quiet.flac")["status"] == "changed"
 
 
+def test_embedded_mjpeg_bad_app_fields_does_not_fail_verification(lib, tmp_path):
+    from mutagen.flac import FLAC, Picture
+    from mutagen.id3 import APIC, ID3
+    from mutagen.wave import WAVE
+
+    cfg, engine, db = lib
+    jpg = str(tmp_path / "cover.jpg")
+    make(jpg, "-f", "lavfi", "-i", "color=c=blue:s=64x64:d=0.1", "-frames:v", "1")
+    raw = open(jpg, "rb").read()
+    # Exact JPEG APP0 segment that makes FFmpeg emit:
+    # "[mjpeg @ ...] unable to decode APP fields: Invalid data found when processing input"
+    quirky_jpg = raw[:2] + b"\xff\xe0\xff\xffJFIF\x00" + raw[2:]
+
+    mp3 = tone(os.path.join(cfg.audio_root, "bad_app.mp3"), -8)
+    tags = ID3(mp3)
+    tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=quirky_jpg))
+    tags.save(mp3)
+
+    flac = tone(os.path.join(cfg.audio_root, "bad_app.flac"), -8, codec_args=("-c:a", "flac"))
+    fl = FLAC(flac)
+    pic = Picture()
+    pic.data = quirky_jpg
+    pic.type = 3
+    pic.mime = "image/jpeg"
+    fl.add_picture(pic)
+    fl.save()
+
+    # Broken/truncated APIC cover image + WAV with ID3 APIC cover image
+    broken_mp3 = tone(os.path.join(cfg.audio_root, "broken_apic.mp3"), -8)
+    btags = ID3(broken_mp3)
+    btags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=b"\xff\xd8\xff\xe0\x00\x10BROKEN"))
+    btags.save(broken_mp3)
+
+    wav = tone(os.path.join(cfg.audio_root, "cover.wav"), -8, codec_args=("-c:a", "pcm_s16le"))
+    w = WAVE(wav)
+    w.add_tags()
+    w.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=raw))
+    w.save()
+
+    set_settings(db, target=-14.0, truePeak=-1.0, threshold=12.0, lossy="reencode")
+    engine.scan_now("audio")
+    exe = engine.execute_files("audio", dir_rel=".")
+    assert exe == {"executed": 4, "changed": 4}
+    for name in ("bad_app.mp3", "bad_app.flac", "broken_apic.mp3", "cover.wav"):
+        assert row(db, name)["status"] == "changed", f"{name}: {row(db, name)}"
+
+    # Real audio stream corruption must still fail ff.verify
+    corrupt_mp3 = str(tmp_path / "corrupt_audio.mp3")
+    make(corrupt_mp3, "-f", "lavfi", "-i", "anoisesrc=d=2:c=pink:a=0.5", "-c:a", "libmp3lame")
+    pr = ff.probe(FFMPEG, corrupt_mp3)
+    data = bytearray(open(corrupt_mp3, "rb").read())
+    mid = len(data) // 2
+    data[mid:mid + 512] = b"\x00" * 512
+    open(corrupt_mp3, "wb").write(data)
+    with pytest.raises(ff.ToolError, match="verification failed"):
+        ff.verify(FFMPEG, corrupt_mp3, pr)
+
+
+
 
 
 
